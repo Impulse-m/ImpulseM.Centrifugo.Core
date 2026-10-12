@@ -1641,7 +1641,7 @@ func TestNodeCheckPositionMapWithMedium(t *testing.T) {
 	mediumMu.Unlock()
 	require.NotNil(t, medium)
 	medium.mu.Lock()
-	lastPosition := medium.lastPosition
+	lastPosition := medium.position.lastPosition
 	medium.mu.Unlock()
 	require.Equal(t, streamPos, lastPosition)
 }

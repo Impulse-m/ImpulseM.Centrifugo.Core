@@ -83,19 +83,19 @@ func (p *positionTestMedium) checkAt(t *testing.T, client StreamPosition, posTim
 func (p *positionTestMedium) hasRegress() bool {
 	p.medium.mu.Lock()
 	defer p.medium.mu.Unlock()
-	return p.medium.hasRegress
+	return p.medium.position.hasRegress
 }
 
 func (p *positionTestMedium) lastPos() StreamPosition {
 	p.medium.mu.Lock()
 	defer p.medium.mu.Unlock()
-	return p.medium.lastPosition
+	return p.medium.position.lastPosition
 }
 
 func (p *positionTestMedium) hasSuspect() bool {
 	p.medium.mu.Lock()
 	defer p.medium.mu.Unlock()
-	return p.medium.hasSuspect
+	return p.medium.position.hasSuspect
 }
 
 func TestSharedPositionSyncLaggingClientDetectedWithinOwnInterval(t *testing.T) {
@@ -182,7 +182,7 @@ func TestChannelMediumLastPositionMonotoneAfterMarker(t *testing.T) {
 	lastOffset := func() uint64 {
 		p.medium.mu.Lock()
 		defer p.medium.mu.Unlock()
-		return p.medium.lastPosition.Offset
+		return p.medium.position.lastPosition.Offset
 	}
 	// A publication still in flight when the marker fired must not move the Node position back.
 	p.publish(testPos(8))
