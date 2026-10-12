@@ -46,6 +46,11 @@ func newPositionTestMedium(t *testing.T) *positionTestMedium {
 	}
 	p.medium = setupChannelMedium(t, ChannelMediumOptions{SharedPositionSync: true}, node)
 	p.medium.nowFn = func() time.Time { return p.clock }
+	// The medium stamped its last check with the real clock on creation, slightly after p.clock was taken.
+	// Restamp it with the test clock, so one tick is exactly one check interval.
+	p.medium.mu.Lock()
+	p.medium.positionCheckTime = p.clock.UnixNano()
+	p.medium.mu.Unlock()
 	return p
 }
 
