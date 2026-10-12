@@ -42,6 +42,7 @@ type metrics struct {
 	transportMessagesReceived     *prometheus.CounterVec
 	transportMessagesReceivedSize *prometheus.CounterVec
 	tagsFilterDroppedCount        *prometheus.CounterVec
+	singleflightMergedCount       *prometheus.CounterVec
 
 	messagesReceivedCountPublication prometheus.Counter
 	messagesReceivedCountJoin        prometheus.Counter
@@ -337,6 +338,17 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		Help:      "Number of publications dropped due to tags filtering.",
 	}, []string{"channel_namespace"})
 
+	m.singleflightMergedCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "node",
+		Name:      "singleflight_merged_total",
+		Help:      "Number of calls served by a shared in-flight request when UseSingleFlight is enabled.",
+	}, []string{"op"})
+
+	m.singleflightMergedCount.WithLabelValues("history").Add(0)
+	m.singleflightMergedCount.WithLabelValues("presence").Add(0)
+	m.singleflightMergedCount.WithLabelValues("presence_stats").Add(0)
+
 	m.pubSubLagHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Subsystem: "node",
@@ -433,6 +445,7 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		m.transportMessagesReceived,
 		m.transportMessagesReceivedSize,
 		m.tagsFilterDroppedCount,
+		m.singleflightMergedCount,
 		m.buildInfoGauge,
 		m.surveyDurationSummary,
 		m.pubSubLagHistogram,
@@ -831,6 +844,10 @@ func (m *metrics) observeSurveyDuration(op string, d time.Duration) {
 
 type tagsFilterDroppedLabels struct {
 	ChannelNamespace string
+}
+
+func (m *metrics) incSingleflightMerged(op string) {
+	m.singleflightMergedCount.WithLabelValues(op).Inc()
 }
 
 func (m *metrics) incTagsFilterDropped(ch string, count int) {

@@ -1292,9 +1292,12 @@ func (n *Node) Presence(ch string) (PresenceResult, error) {
 	}
 	n.metrics.incActionCount("presence", ch)
 	if n.config.UseSingleFlight {
-		result, err, _ := presenceGroup.Do(ch, func() (any, error) {
+		result, err, shared := presenceGroup.Do(ch, func() (any, error) {
 			return n.presence(ch, presenceManager)
 		})
+		if shared {
+			n.metrics.incSingleflightMerged("presence")
+		}
 		return result.(PresenceResult), err
 	}
 	return n.presence(ch, presenceManager)
@@ -1380,9 +1383,12 @@ func (n *Node) PresenceStats(ch string) (PresenceStatsResult, error) {
 	}
 	n.metrics.incActionCount("presence_stats", ch)
 	if n.config.UseSingleFlight {
-		result, err, _ := presenceStatsGroup.Do(ch, func() (any, error) {
+		result, err, shared := presenceStatsGroup.Do(ch, func() (any, error) {
 			return n.presenceStats(ch, presenceManager)
 		})
+		if shared {
+			n.metrics.incSingleflightMerged("presence_stats")
+		}
 		return result.(PresenceStatsResult), err
 	}
 	return n.presenceStats(ch, presenceManager)
@@ -1456,9 +1462,12 @@ func (n *Node) History(ch string, opts ...HistoryOption) (HistoryResult, error) 
 		builder.WriteString(historyOpts.MetaTTL.String())
 		key := builder.String()
 
-		result, err, _ := historyGroup.Do(key, func() (any, error) {
+		result, err, shared := historyGroup.Do(key, func() (any, error) {
 			return n.history(ch, historyOpts)
 		})
+		if shared {
+			n.metrics.incSingleflightMerged("history")
+		}
 		return result.(HistoryResult), err
 	}
 	return n.history(ch, historyOpts)
