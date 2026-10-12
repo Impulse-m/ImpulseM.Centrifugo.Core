@@ -43,6 +43,8 @@ type metrics struct {
 	transportMessagesReceivedSize *prometheus.CounterVec
 	tagsFilterDroppedCount        *prometheus.CounterVec
 	singleflightMergedCount       *prometheus.CounterVec
+	channelMediumsGauge           prometheus.Gauge
+	positionChecksCount           *prometheus.CounterVec
 
 	messagesReceivedCountPublication prometheus.Counter
 	messagesReceivedCountJoin        prometheus.Counter
@@ -349,6 +351,26 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 	m.singleflightMergedCount.WithLabelValues("presence").Add(0)
 	m.singleflightMergedCount.WithLabelValues("presence_stats").Add(0)
 
+	m.channelMediumsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "node",
+		Name:      "channel_mediums",
+		Help:      "Number of channel mediums currently active on the node.",
+	})
+
+	m.positionChecksCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "node",
+		Name:      "position_checks_total",
+		Help:      "Number of client channel position checks by result. Shared is true when the check was done by the channel medium for all channel subscribers.",
+	}, []string{"result", "shared"})
+
+	for _, result := range []string{"valid", "invalid", "error"} {
+		for _, shared := range []string{"true", "false"} {
+			m.positionChecksCount.WithLabelValues(result, shared).Add(0)
+		}
+	}
+
 	m.pubSubLagHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Subsystem: "node",
@@ -446,6 +468,8 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		m.transportMessagesReceivedSize,
 		m.tagsFilterDroppedCount,
 		m.singleflightMergedCount,
+		m.channelMediumsGauge,
+		m.positionChecksCount,
 		m.buildInfoGauge,
 		m.surveyDurationSummary,
 		m.pubSubLagHistogram,
@@ -848,6 +872,18 @@ type tagsFilterDroppedLabels struct {
 
 func (m *metrics) incSingleflightMerged(op string) {
 	m.singleflightMergedCount.WithLabelValues(op).Inc()
+}
+
+func (m *metrics) incChannelMediums() {
+	m.channelMediumsGauge.Inc()
+}
+
+func (m *metrics) decChannelMediums() {
+	m.channelMediumsGauge.Dec()
+}
+
+func (m *metrics) incPositionChecks(result string, shared bool) {
+	m.positionChecksCount.WithLabelValues(result, strconv.FormatBool(shared)).Inc()
 }
 
 func (m *metrics) incTagsFilterDropped(ch string, count int) {

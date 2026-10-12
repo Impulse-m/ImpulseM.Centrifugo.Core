@@ -192,3 +192,98 @@ func TestChannelMediumPositionSyncRetry(t *testing.T) {
 		require.Fail(t, "streamTopLatestPubFunc was not called")
 	}
 }
+
+func TestChannelMediumCheckPositionDecision(t *testing.T) {
+	base := time.Now()
+	clock := base
+	originalGetter := channelMediumTimeNow
+	channelMediumTimeNow = func() time.Time {
+		return clock
+	}
+	t.Cleanup(func() {
+		channelMediumTimeNow = originalGetter
+	})
+
+	var testCases = []struct {
+		name           string
+		broadcast      bool
+		broadcastPos   StreamPosition
+		streamTop      StreamPosition
+		clientPosition StreamPosition
+		expectValid    bool
+		expectMarker   bool
+	}{
+		{
+			name:           "nothing broadcast yet, client behind",
+			broadcast:      false,
+			streamTop:      StreamPosition{Offset: 5, Epoch: "e"},
+			clientPosition: StreamPosition{Offset: 3, Epoch: "e"},
+			expectValid:    false,
+			expectMarker:   false,
+		},
+		{
+			name:           "node in sync, only client behind",
+			broadcast:      true,
+			broadcastPos:   StreamPosition{Offset: 5, Epoch: "e"},
+			streamTop:      StreamPosition{Offset: 5, Epoch: "e"},
+			clientPosition: StreamPosition{Offset: 3, Epoch: "e"},
+			expectValid:    false,
+			expectMarker:   false,
+		},
+		{
+			name:           "medium behind stream",
+			broadcast:      true,
+			broadcastPos:   StreamPosition{Offset: 4, Epoch: "e"},
+			streamTop:      StreamPosition{Offset: 5, Epoch: "e"},
+			clientPosition: StreamPosition{Offset: 4, Epoch: "e"},
+			expectValid:    false,
+			expectMarker:   true,
+		},
+		{
+			name:           "epoch changed after last broadcast",
+			broadcast:      true,
+			broadcastPos:   StreamPosition{Offset: 5, Epoch: "e1"},
+			streamTop:      StreamPosition{Offset: 5, Epoch: "e2"},
+			clientPosition: StreamPosition{Offset: 5, Epoch: "e1"},
+			expectValid:    false,
+			expectMarker:   true,
+		},
+		{
+			name:           "client up to date, medium behind stream",
+			broadcast:      true,
+			broadcastPos:   StreamPosition{Offset: 4, Epoch: "e"},
+			streamTop:      StreamPosition{Offset: 5, Epoch: "e"},
+			clientPosition: StreamPosition{Offset: 5, Epoch: "e"},
+			expectValid:    true,
+			expectMarker:   false,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			markers := 0
+			node := &mockNode{
+				handlePublicationFunc: func(_ string, _ StreamPosition, pub, _, _ *Publication) error {
+					if pub.Offset == math.MaxUint64 {
+						markers++
+					}
+					return nil
+				},
+				streamTopFunc: func(_ string, _ time.Duration) (StreamPosition, error) {
+					return tt.streamTop, nil
+				},
+			}
+			clock = base
+			medium := setupChannelMedium(t, ChannelMediumOptions{SharedPositionSync: true}, node)
+			if tt.broadcast {
+				medium.broadcastPublication(&Publication{Offset: tt.broadcastPos.Offset}, tt.broadcastPos, false, nil)
+			}
+			clock = base.Add(time.Hour)
+			checked, validPosition, err := medium.CheckPosition(time.Second, tt.clientPosition, time.Second)
+			require.NoError(t, err)
+			require.True(t, checked)
+			require.Equal(t, tt.expectValid, validPosition)
+			require.Equal(t, tt.expectMarker, markers > 0)
+		})
+	}
+}

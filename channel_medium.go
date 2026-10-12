@@ -9,8 +9,7 @@ import (
 	"github.com/centrifugal/centrifuge/internal/timers"
 )
 
-// ChannelMediumOptions is an EXPERIMENTAL way to enable using a channel medium layer in Centrifuge.
-// Note, channel medium layer is very unstable at the moment – do not use it in production!
+// ChannelMediumOptions configures an optional channel medium layer in Centrifuge.
 // Channel medium layer is an optional per-channel intermediary between Broker PUB/SUB and Client
 // connections. This intermediary layer may be used for various per-channel tweaks and optimizations.
 // Channel medium comes with memory overhead depending on ChannelMediumOptions. At the same time, it
@@ -33,6 +32,7 @@ type ChannelMediumOptions struct {
 	// and also opens a road for broadcast tweaks – such as BroadcastDelay and delta between several
 	// publications (deltas require both BroadcastDelay and KeepLatestPublication to be enabled). This costs
 	// additional goroutine.
+	// EXPERIMENTAL: the writer goroutine is not stopped by close() – known goroutine leak, not fixed yet.
 	enableQueue bool
 	// QueueMaxSize is a maximum size of the queue used in channel medium (in bytes). If zero, 16MB default
 	// is used. If max size reached, new publications will be dropped.
@@ -72,6 +72,10 @@ type channelMedium struct {
 	latestPublication *Publication
 	// positionCheckTime is a time (Unix Nanoseconds) when last position check was performed.
 	positionCheckTime int64
+	// lastPosition is a StreamPosition of the last publication handed to the Node by this medium.
+	// Only valid when hasLastPosition is true. Both fields are protected by mu.
+	lastPosition    StreamPosition
+	hasLastPosition bool
 }
 
 type nodeSubset interface {
@@ -165,6 +169,14 @@ func (c *channelMedium) broadcast(qp queuedPub) {
 	if qp.isInsufficientState {
 		prevPub = nil
 	}
+	if !qp.isInsufficientState {
+		// Record position before handing publication to the Node: a position check running concurrently
+		// with this broadcast must not treat the medium as behind because of the in-flight publication.
+		c.mu.Lock()
+		c.lastPosition = spToBroadcast
+		c.hasLastPosition = true
+		c.mu.Unlock()
+	}
 	_ = c.node.handlePublication(c.channel, spToBroadcast, pubToBroadcast, prevPub, localPrevPub)
 	if useLocalLatestPub {
 		c.latestPublication = qp.pub
@@ -224,7 +236,19 @@ func (c *channelMedium) waitSendPub(delay time.Duration) bool {
 	return true
 }
 
-func (c *channelMedium) CheckPosition(historyMetaTTL time.Duration, clientPosition StreamPosition, checkDelay time.Duration) bool {
+// CheckPosition checks position of a single client against the channel stream top. At most one check is
+// performed per checkDelay for the whole channel, so checked is false when this call was skipped. When
+// checked is true and err is nil, validPosition tells whether client position matches the stream top.
+//
+// Decision for an invalid client position, given the stream top and the last position broadcast by this medium:
+//   - no publication was broadcast by this medium yet (unknown state): only this client is marked, no broadcast.
+//     Medium state can't be verified, so marking every subscriber would be a guess. Marking only this client
+//     is always safe, since every client is also checked individually.
+//   - stream top equals the last broadcast position: the node is in sync with the stream, only this client is
+//     behind. It is marked individually, no broadcast.
+//   - otherwise the medium itself is behind the stream (missed publication or a different epoch). Insufficient
+//     state is broadcast to all channel subscribers on this node.
+func (c *channelMedium) CheckPosition(historyMetaTTL time.Duration, clientPosition StreamPosition, checkDelay time.Duration) (checked bool, validPosition bool, err error) {
 	nowUnixNano := channelMediumTimeNow().UnixNano()
 	c.mu.Lock()
 	needCheckPosition := nowUnixNano-c.positionCheckTime >= checkDelay.Nanoseconds()
@@ -233,36 +257,35 @@ func (c *channelMedium) CheckPosition(historyMetaTTL time.Duration, clientPositi
 	}
 	c.mu.Unlock()
 	if !needCheckPosition {
-		return true
+		return false, true, nil
 	}
-	_, validPosition, err := c.checkPositionWithRetry(historyMetaTTL, clientPosition)
+	streamTop, err := c.checkPositionWithRetry(historyMetaTTL, clientPosition)
 	if err != nil {
 		// Position will be checked again later.
-		return true
+		return true, false, err
 	}
-	if !validPosition {
-		c.broadcastInsufficientState()
-	}
-	return validPosition
-}
-
-func (c *channelMedium) checkPositionWithRetry(historyMetaTTL time.Duration, clientPosition StreamPosition) (StreamPosition, bool, error) {
-	sp, validPosition, err := c.checkPositionOnce(historyMetaTTL, clientPosition)
-	if err != nil || !validPosition {
-		return c.checkPositionOnce(historyMetaTTL, clientPosition)
-	}
-	return sp, validPosition, err
-}
-
-func (c *channelMedium) checkPositionOnce(historyMetaTTL time.Duration, clientPosition StreamPosition) (StreamPosition, bool, error) {
-	streamTop, err := c.node.streamTop(c.channel, historyMetaTTL)
-	if err != nil {
-		return StreamPosition{}, false, err
+	if streamTop == clientPosition {
+		return true, true, nil
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	isValidPosition := streamTop.Epoch == clientPosition.Epoch && clientPosition.Offset == streamTop.Offset
-	return streamTop, isValidPosition, nil
+	lastPosition := c.lastPosition
+	hasLastPosition := c.hasLastPosition
+	c.mu.Unlock()
+	if !hasLastPosition || streamTop == lastPosition {
+		return true, false, nil
+	}
+	c.broadcastInsufficientState()
+	return true, false, nil
+}
+
+// checkPositionWithRetry fetches stream top. It retries once when the result does not match client position
+// to absorb a publication racing with the check.
+func (c *channelMedium) checkPositionWithRetry(historyMetaTTL time.Duration, clientPosition StreamPosition) (StreamPosition, error) {
+	streamTop, err := c.node.streamTop(c.channel, historyMetaTTL)
+	if err != nil || streamTop != clientPosition {
+		streamTop, err = c.node.streamTop(c.channel, historyMetaTTL)
+	}
+	return streamTop, err
 }
 
 func (c *channelMedium) close() {

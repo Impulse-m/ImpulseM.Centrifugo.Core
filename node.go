@@ -1063,18 +1063,28 @@ func (n *Node) addSubscription(ch string, sub subInfo) (int64, error) {
 		return 0, err
 	}
 	if first {
+		createdMedium := false
 		if n.config.GetChannelMediumOptions != nil {
 			mediumOptions := n.config.GetChannelMediumOptions(ch)
 			if mediumOptions.isMediumEnabled() {
-				medium, err := newChannelMedium(ch, n, mediumOptions)
-				if err != nil {
-					_, _ = n.hub.removeSub(ch, sub.client)
-					return 0, err
-				}
+				// Medium may still exist here if its teardown is pending in subDissolver. Keep it: it has been
+				// receiving all channel publications so far, replacing it would leak the old medium.
 				mediumMu := n.mediumLock(ch)
 				mediumMu.Lock()
-				n.mediums[ch] = medium
+				_, exists := n.mediums[ch]
 				mediumMu.Unlock()
+				if !exists {
+					medium, err := newChannelMedium(ch, n, mediumOptions)
+					if err != nil {
+						_, _ = n.hub.removeSub(ch, sub.client)
+						return 0, err
+					}
+					mediumMu.Lock()
+					n.mediums[ch] = medium
+					mediumMu.Unlock()
+					n.metrics.incChannelMediums()
+					createdMedium = true
+				}
 			}
 		}
 
@@ -1082,13 +1092,14 @@ func (n *Node) addSubscription(ch string, sub subInfo) (int64, error) {
 		err := n.getBroker(ch).Subscribe(ch)
 		if err != nil {
 			_, _ = n.hub.removeSub(ch, sub.client)
-			if n.config.GetChannelMediumOptions != nil {
+			if createdMedium {
 				mediumMu := n.mediumLock(ch)
 				mediumMu.Lock()
 				medium, ok := n.mediums[ch]
 				if ok {
 					medium.close()
 					delete(n.mediums, ch)
+					n.metrics.decChannelMediums()
 				}
 				mediumMu.Unlock()
 			}
@@ -1136,6 +1147,7 @@ func (n *Node) removeSubscription(ch string, c *Client) error {
 					if ok {
 						medium.close()
 						delete(n.mediums, ch)
+						n.metrics.decChannelMediums()
 					}
 					mediumMu.Unlock()
 				}
@@ -1541,7 +1553,7 @@ func (n *Node) streamTop(ch string, historyMetaTTL time.Duration) (StreamPositio
 }
 
 func (n *Node) checkPosition(ch string, clientPosition StreamPosition, historyMetaTTL time.Duration) (bool, error) {
-	mu := n.subLock(ch)
+	mu := n.mediumLock(ch)
 	mu.Lock()
 	medium, ok := n.mediums[ch]
 	mu.Unlock()
@@ -1549,13 +1561,34 @@ func (n *Node) checkPosition(ch string, clientPosition StreamPosition, historyMe
 		// No medium for channel or position sync disabled – we then check position over Broker.
 		streamTop, err := n.streamTop(ch, historyMetaTTL)
 		if err != nil {
+			n.metrics.incPositionChecks("error", false)
 			// Will be checked later.
 			return false, err
 		}
-		return streamTop.Epoch == clientPosition.Epoch && clientPosition.Offset == streamTop.Offset, nil
+		validPosition := streamTop.Epoch == clientPosition.Epoch && clientPosition.Offset == streamTop.Offset
+		n.metrics.incPositionChecks(positionCheckResult(validPosition), false)
+		return validPosition, nil
 	}
-	validPosition := medium.CheckPosition(historyMetaTTL, clientPosition, n.config.ClientChannelPositionCheckDelay)
+	checked, validPosition, err := medium.CheckPosition(historyMetaTTL, clientPosition, n.config.ClientChannelPositionCheckDelay)
+	if err != nil {
+		n.metrics.incPositionChecks("error", true)
+		// Will be checked later.
+		return false, err
+	}
+	if !checked {
+		// Check was skipped, another check for the channel was performed within checkDelay.
+		return true, nil
+	}
+	n.metrics.incPositionChecks(positionCheckResult(validPosition), true)
 	return validPosition, nil
+}
+
+// positionCheckResult returns label value for position_checks_total metric.
+func positionCheckResult(validPosition bool) string {
+	if validPosition {
+		return "valid"
+	}
+	return "invalid"
 }
 
 // RemoveHistory removes channel history.
