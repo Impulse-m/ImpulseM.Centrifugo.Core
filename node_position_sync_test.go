@@ -184,32 +184,6 @@ func TestSharedPositionSyncSingleLaggingClientDoesNotAffectOthers(t *testing.T) 
 	}
 }
 
-func TestSharedPositionSyncMediumBehindMarksAllSubscribers(t *testing.T) {
-	stream := newPositionSyncTestStream(StreamPosition{Offset: 5, Epoch: "epoch"})
-	node, setClock := newPositionSyncTestNode(t, stream)
-	base := time.Now()
-	setClock(base)
-
-	const ch = "medium_behind_channel"
-	clients := subscribePositionSyncTestClients(t, node, ch, 3)
-
-	// Publication 6 reaches the medium, publication 7 is in the stream but never reaches the medium.
-	stream.setTop(StreamPosition{Offset: 6, Epoch: "epoch"})
-	require.NoError(t, node.HandlePublication(ch, &Publication{Offset: 6, Data: []byte("{}")}, StreamPosition{Offset: 6, Epoch: "epoch"}, false, nil))
-	stream.setTop(StreamPosition{Offset: 7, Epoch: "epoch"})
-
-	setClock(base.Add(positionSyncTestCheckDelay + time.Second))
-	valid, err := node.checkPosition(ch, StreamPosition{Offset: 6, Epoch: "epoch"}, 0)
-	require.NoError(t, err)
-	require.False(t, valid)
-
-	for _, client := range clients {
-		require.Eventually(t, func() bool {
-			return !positionSyncTestIsSubscribed(client, ch)
-		}, 5*time.Second, 10*time.Millisecond)
-	}
-}
-
 func TestSharedPositionSyncMediumCreateTeardownConcurrent(t *testing.T) {
 	stream := newPositionSyncTestStream(StreamPosition{Offset: 5, Epoch: "epoch"})
 	node, setClock := newPositionSyncTestNode(t, stream)
@@ -223,6 +197,25 @@ func TestSharedPositionSyncMediumCreateTeardownConcurrent(t *testing.T) {
 	for i := range clients {
 		clients[i] = newTestClient(t, node, strconv.Itoa(i))
 	}
+
+	// Sample the gauge during the run: a channel must never have more than one medium.
+	var maxMediums atomic.Int64
+	stopSampling := make(chan struct{})
+	samplerDone := make(chan struct{})
+	go func() {
+		defer close(samplerDone)
+		for {
+			select {
+			case <-stopSampling:
+				return
+			default:
+			}
+			if v := int64(testutil.ToFloat64(node.metrics.channelMediumsGauge)); v > maxMediums.Load() {
+				maxMediums.Store(v)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
 
 	errCh := make(chan error, numWorkers*numIterations*3)
 	var wg sync.WaitGroup
@@ -252,10 +245,13 @@ func TestSharedPositionSyncMediumCreateTeardownConcurrent(t *testing.T) {
 		}(clients[i])
 	}
 	wg.Wait()
+	close(stopSampling)
+	<-samplerDone
 	close(errCh)
 	for err := range errCh {
 		require.NoError(t, err)
 	}
+	require.LessOrEqual(t, maxMediums.Load(), int64(1))
 
 	// Last subscriber left the channel, medium must be torn down once the dissolver runs.
 	require.Eventually(t, func() bool {

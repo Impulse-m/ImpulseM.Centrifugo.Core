@@ -210,6 +210,9 @@ func TestChannelMediumCheckPositionDecision(t *testing.T) {
 		broadcastPos   StreamPosition
 		streamTop      StreamPosition
 		clientPosition StreamPosition
+		// secondInterval makes the row run one more check on the next interval: the marker is expected
+		// on the second check only.
+		secondInterval bool
 		expectValid    bool
 		expectMarker   bool
 	}{
@@ -218,8 +221,9 @@ func TestChannelMediumCheckPositionDecision(t *testing.T) {
 			broadcast:      false,
 			streamTop:      StreamPosition{Offset: 5, Epoch: "e"},
 			clientPosition: StreamPosition{Offset: 3, Epoch: "e"},
+			secondInterval: true,
 			expectValid:    false,
-			expectMarker:   false,
+			expectMarker:   true,
 		},
 		{
 			name:           "node in sync, only client behind",
@@ -236,6 +240,7 @@ func TestChannelMediumCheckPositionDecision(t *testing.T) {
 			broadcastPos:   StreamPosition{Offset: 4, Epoch: "e"},
 			streamTop:      StreamPosition{Offset: 5, Epoch: "e"},
 			clientPosition: StreamPosition{Offset: 4, Epoch: "e"},
+			secondInterval: true,
 			expectValid:    false,
 			expectMarker:   true,
 		},
@@ -245,6 +250,7 @@ func TestChannelMediumCheckPositionDecision(t *testing.T) {
 			broadcastPos:   StreamPosition{Offset: 5, Epoch: "e1"},
 			streamTop:      StreamPosition{Offset: 5, Epoch: "e2"},
 			clientPosition: StreamPosition{Offset: 5, Epoch: "e1"},
+			secondInterval: true,
 			expectValid:    false,
 			expectMarker:   true,
 		},
@@ -278,12 +284,24 @@ func TestChannelMediumCheckPositionDecision(t *testing.T) {
 			if tt.broadcast {
 				medium.broadcastPublication(&Publication{Offset: tt.broadcastPos.Offset}, tt.broadcastPos, false, nil)
 			}
-			clock = base.Add(time.Hour)
-			checked, validPosition, err := medium.CheckPosition(time.Second, tt.clientPosition, time.Second)
-			require.NoError(t, err)
-			require.True(t, checked)
-			require.Equal(t, tt.expectValid, validPosition)
-			require.Equal(t, tt.expectMarker, markers > 0)
+			checks := 1
+			if tt.secondInterval {
+				checks = 2
+			}
+			for i := 1; i <= checks; i++ {
+				clock = base.Add(time.Duration(i) * time.Hour)
+				checked, validPosition, err := medium.CheckPosition(time.Second, tt.clientPosition, time.Second)
+				require.NoError(t, err)
+				require.True(t, checked)
+				if i == checks {
+					require.Equal(t, tt.expectValid, validPosition)
+					require.Equal(t, tt.expectMarker, markers > 0)
+				} else {
+					// First sighting of a behind node: the client is not marked, no marker yet.
+					require.True(t, validPosition)
+					require.Equal(t, 0, markers)
+				}
+			}
 		})
 	}
 }

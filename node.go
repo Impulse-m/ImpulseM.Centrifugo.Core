@@ -1069,22 +1069,21 @@ func (n *Node) addSubscription(ch string, sub subInfo) (int64, error) {
 			if mediumOptions.isMediumEnabled() {
 				// Medium may still exist here if its teardown is pending in subDissolver. Keep it: it has been
 				// receiving all channel publications so far, replacing it would leak the old medium.
+				// Check and insert in one critical section, so correctness does not depend on subLock alone.
 				mediumMu := n.mediumLock(ch)
 				mediumMu.Lock()
-				_, exists := n.mediums[ch]
-				mediumMu.Unlock()
-				if !exists {
+				if _, exists := n.mediums[ch]; !exists {
 					medium, err := newChannelMedium(ch, n, mediumOptions)
 					if err != nil {
+						mediumMu.Unlock()
 						_, _ = n.hub.removeSub(ch, sub.client)
 						return 0, err
 					}
-					mediumMu.Lock()
 					n.mediums[ch] = medium
-					mediumMu.Unlock()
 					n.metrics.incChannelMediums()
 					createdMedium = true
 				}
+				mediumMu.Unlock()
 			}
 		}
 
