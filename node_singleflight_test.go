@@ -16,20 +16,20 @@ const singleFlightConcurrentCalls = 50
 
 var errSingleFlightBoom = errors.New("boom")
 
-type blockingPresenceManager struct {
+type singleFlightBlockingPresenceManager struct {
 	*TestPresenceManager
 	releaseCh          chan struct{}
 	presenceCalls      int32
 	presenceStatsCalls int32
 }
 
-func (m *blockingPresenceManager) Presence(_ string) (map[string]*ClientInfo, error) {
+func (m *singleFlightBlockingPresenceManager) Presence(_ string) (map[string]*ClientInfo, error) {
 	atomic.AddInt32(&m.presenceCalls, 1)
 	<-m.releaseCh
 	return map[string]*ClientInfo{}, nil
 }
 
-func (m *blockingPresenceManager) PresenceStats(_ string) (PresenceStats, error) {
+func (m *singleFlightBlockingPresenceManager) PresenceStats(_ string) (PresenceStats, error) {
 	atomic.AddInt32(&m.presenceStatsCalls, 1)
 	<-m.releaseCh
 	return PresenceStats{NumClients: 1}, nil
@@ -145,7 +145,7 @@ func TestSingleFlightHistoryDeliversErrorToAllWaiters(t *testing.T) {
 
 func TestSingleFlightPresenceMergesConcurrentCalls(t *testing.T) {
 	releaseCh := make(chan struct{})
-	pm := &blockingPresenceManager{
+	pm := &singleFlightBlockingPresenceManager{
 		TestPresenceManager: NewTestPresenceManager(),
 		releaseCh:           releaseCh,
 	}
@@ -167,7 +167,7 @@ func TestSingleFlightPresenceMergesConcurrentCalls(t *testing.T) {
 
 func TestSingleFlightPresenceStatsMergesConcurrentCalls(t *testing.T) {
 	releaseCh := make(chan struct{})
-	pm := &blockingPresenceManager{
+	pm := &singleFlightBlockingPresenceManager{
 		TestPresenceManager: NewTestPresenceManager(),
 		releaseCh:           releaseCh,
 	}

@@ -59,13 +59,6 @@ func (s *positionSyncTestStream) historyCalls() int32 {
 func newPositionSyncTestNode(t *testing.T, stream *positionSyncTestStream) (*Node, func(time.Time)) {
 	t.Helper()
 	clock := time.Now()
-	originalGetter := channelMediumTimeNow
-	channelMediumTimeNow = func() time.Time {
-		return clock
-	}
-	t.Cleanup(func() {
-		channelMediumTimeNow = originalGetter
-	})
 	node, err := New(Config{
 		ClientChannelPositionCheckDelay: positionSyncTestCheckDelay,
 		GetChannelMediumOptions: func(_ string) ChannelMediumOptions {
@@ -76,6 +69,10 @@ func newPositionSyncTestNode(t *testing.T, stream *positionSyncTestStream) (*Nod
 		},
 	})
 	require.NoError(t, err)
+	// Channel mediums take their clock from the node.
+	node.nowTimeGetter = func() time.Time {
+		return clock
+	}
 	broker := NewTestBroker()
 	broker.historyFunc = stream.history
 	node.SetBroker(broker)
@@ -131,7 +128,7 @@ func TestSharedPositionSyncOneStreamTopRequestPerInterval(t *testing.T) {
 	setClock(base.Add(positionSyncTestCheckDelay + time.Second))
 	before := stream.historyCalls()
 	for _, client := range clients {
-		valid, err := node.checkPosition(ch, clientPosition, 0)
+		valid, err := node.checkPosition(ch, clientPosition, 0, false, 0)
 		require.NoError(t, err)
 		require.True(t, valid)
 		require.True(t, positionSyncTestIsSubscribed(client, ch))
@@ -142,7 +139,7 @@ func TestSharedPositionSyncOneStreamTopRequestPerInterval(t *testing.T) {
 	setClock(base.Add(2*positionSyncTestCheckDelay + 2*time.Second))
 	before = stream.historyCalls()
 	for range clients {
-		valid, err := node.checkPosition(ch, clientPosition, 0)
+		valid, err := node.checkPosition(ch, clientPosition, 0, false, 0)
 		require.NoError(t, err)
 		require.True(t, valid)
 	}
@@ -172,7 +169,7 @@ func TestSharedPositionSyncSingleLaggingClientDoesNotAffectOthers(t *testing.T) 
 	lagging.mu.Unlock()
 
 	setClock(base.Add(positionSyncTestCheckDelay + time.Second))
-	valid, err := node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0)
+	valid, err := node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0, false, 0)
 	require.NoError(t, err)
 	require.False(t, valid)
 
@@ -224,19 +221,20 @@ func TestSharedPositionSyncMediumCreateTeardownConcurrent(t *testing.T) {
 		go func(client *Client) {
 			defer wg.Done()
 			for j := 0; j < numIterations; j++ {
-				_, err := node.addSubscription(ch, subInfo{client: client})
+				subGen := uint64(j + 1)
+				_, err := node.addSubscription(ch, subInfo{client: client, subGen: subGen})
 				if err != nil {
 					errCh <- err
 					return
 				}
 				// Publications and position checks race with medium creation and teardown.
 				_ = node.HandlePublication(ch, &Publication{Offset: uint64(j + 1), Data: []byte("{}")}, StreamPosition{Offset: uint64(j + 1), Epoch: "epoch"}, false, nil)
-				_, err = node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0)
+				_, err = node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0, false, 0)
 				if err != nil {
 					errCh <- err
 					return
 				}
-				err = node.removeSubscription(ch, client)
+				err = node.removeSubscription(ch, client, subGen)
 				if err != nil {
 					errCh <- err
 					return
@@ -270,14 +268,14 @@ func TestSharedPositionSyncBrokerErrorCountedAsError(t *testing.T) {
 
 	stream.setErr(errSingleFlightBoom)
 	setClock(base.Add(positionSyncTestCheckDelay + time.Second))
-	valid, err := node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0)
+	valid, err := node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0, false, 0)
 	require.ErrorIs(t, err, errSingleFlightBoom)
 	require.False(t, valid)
 	require.Equal(t, float64(1), testutil.ToFloat64(node.metrics.positionChecksCount.WithLabelValues("error", "true")))
 
 	// The interval is still consumed: no broker request until the next interval.
 	before := stream.historyCalls()
-	valid, err = node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0)
+	valid, err = node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0, false, 0)
 	require.NoError(t, err)
 	require.True(t, valid)
 	require.Equal(t, before, stream.historyCalls())

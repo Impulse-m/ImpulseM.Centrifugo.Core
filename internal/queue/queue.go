@@ -10,6 +10,7 @@ import (
 type Item struct {
 	Data      []byte
 	Channel   string
+	Key       string
 	FrameType protocol.FrameType
 }
 
@@ -127,6 +128,12 @@ func (q *Queue) Close() {
 	q.cnt = 0
 	q.nodes = nil
 	q.size = 0
+	// Stop any pending delayed-shrink timer: its AfterFunc closure retains the
+	// Queue, so leaving it armed keeps a closed connection's queue alive until it
+	// fires (up to QueueShrinkDelay). Stopping it lets the queue be collected now.
+	if q.shrinkTimer != nil {
+		q.shrinkTimer.Stop()
+	}
 	q.cond.Broadcast()
 }
 
@@ -149,6 +156,10 @@ func (q *Queue) CloseRemaining() []Item {
 	q.cnt = 0
 	q.nodes = nil
 	q.size = 0
+	// See Close: stop the delayed-shrink timer so the closed queue is collectable.
+	if q.shrinkTimer != nil {
+		q.shrinkTimer.Stop()
+	}
 	q.cond.Broadcast()
 	return rem
 }
@@ -255,6 +266,44 @@ func (q *Queue) RemoveMany(maxItems int) ([]Item, bool) {
 	return messages, true
 }
 
+// RemoveManyIntoShrink is RemoveManyInto plus the immediate shrink that
+// RemoveMany performs, both in one critical section. It exists so the
+// no-write-delay writer path can drop RemoveMany's per-drain slice allocation
+// without either changing shrink timing or taking mu a second time via
+// FinishCollect — this mutex is contended by every broadcast producer, so an
+// extra acquisition per drain is not free.
+func (q *Queue) RemoveManyIntoShrink(buf []Item, maxItems int) (int, bool) {
+	q.mu.Lock()
+
+	if q.cnt == 0 {
+		q.mu.Unlock()
+		return 0, false
+	}
+
+	var count int
+	if maxItems == -1 || q.cnt < maxItems {
+		count = q.cnt
+	} else {
+		count = maxItems
+	}
+	if count > len(buf) {
+		count = len(buf)
+	}
+
+	for i := 0; i < count; i++ {
+		buf[i] = q.nodes[q.head]
+		q.nodes[q.head] = Item{}
+		q.head = (q.head + 1) % len(q.nodes)
+		q.cnt--
+		q.size -= len(buf[i].Data)
+	}
+
+	q.doShrinkLocked()
+
+	q.mu.Unlock()
+	return count, true
+}
+
 // Cap returns the capacity (without allocations)
 func (q *Queue) Cap() int {
 	q.mu.RLock()
@@ -284,6 +333,13 @@ func (q *Queue) Size() int {
 // Under load, the timer keeps resetting, keeping queue at working set size.
 func (q *Queue) FinishCollect(shrinkDelay time.Duration) {
 	q.mu.Lock()
+
+	if q.closed {
+		// Close stopped the shrink timer so the queue can be collected; arming
+		// (or Reset-ing) it here would retain the closed queue again.
+		q.mu.Unlock()
+		return
+	}
 
 	if shrinkDelay == 0 {
 		// Immediate shrink

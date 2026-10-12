@@ -42,6 +42,19 @@ const (
 	statusCodeClientConnectionClosed = 499
 )
 
+func supportsFlushing(w http.ResponseWriter) bool {
+	for {
+		switch t := w.(type) {
+		case interface{ FlushError() error }, http.Flusher:
+			return true
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = t.Unwrap()
+		default:
+			return false
+		}
+	}
+}
+
 func (h *HTTPStreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions { // For pre-flight browser requests.
 		w.Header().Set("Access-Control-Max-Age", "300")
@@ -50,8 +63,7 @@ func (h *HTTPStreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, ok := w.(http.Flusher)
-	if !ok {
+	if !supportsFlushing(w) {
 		h.node.logger.log(newErrorLogEntry(errors.New("not http.Flusher"), "HTTP stream: ResponseWriter is not a Flusher", map[string]any{}))
 		http.Error(w, "expected http.ResponseWriter to be http.Flusher", http.StatusInternalServerError)
 		return
@@ -62,18 +74,21 @@ func (h *HTTPStreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		protocolType = ProtocolTypeProtobuf
 	}
 
+	// messageSizeLimit bounds both the request body and a single decoded command;
+	// it must be positive since the stream decoder rejects a non-positive limit.
+	messageSizeLimit := h.config.MaxRequestBodySize
+	if messageSizeLimit <= 0 {
+		messageSizeLimit = defaultMaxHTTPStreamingBodySize
+	}
+
 	var requestData []byte
 	if r.Method == http.MethodPost {
-		maxBytesSize := h.config.MaxRequestBodySize
-		if maxBytesSize == 0 {
-			maxBytesSize = defaultMaxHTTPStreamingBodySize
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, int64(maxBytesSize))
+		r.Body = http.MaxBytesReader(w, r.Body, int64(messageSizeLimit))
 		var err error
 		requestData, err = io.ReadAll(r.Body)
 		if err != nil {
 			h.node.logger.log(newLogEntry(LogLevelInfo, "error reading http stream request body", map[string]any{"error": err.Error()}))
-			if len(requestData) >= maxBytesSize {
+			if len(requestData) >= messageSizeLimit {
 				w.WriteHeader(http.StatusRequestEntityTooLarge)
 				return
 			}
@@ -120,7 +135,7 @@ func (h *HTTPStreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 
 	reader := readerpool.GetBytesReader(requestData)
-	_ = HandleReadFrame(c, reader)
+	_ = HandleReadFrame(c, reader, int64(messageSizeLimit))
 	readerpool.PutBytesReader(reader)
 
 	sendAck := func() {

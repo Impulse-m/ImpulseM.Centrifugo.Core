@@ -3,6 +3,7 @@ package centrifuge
 import (
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,25 +17,99 @@ var defaultMetricsNamespace = "centrifuge"
 
 var registryMu sync.RWMutex
 
+// clientMetricDef defines a Prometheus metric with its subsystem and name.
+type clientMetricDef struct {
+	Subsystem string
+	Name      string
+}
+
+// Client metric definitions.
+var (
+	metricClientConnectionsAccepted = clientMetricDef{
+		Subsystem: "client",
+		Name:      "connections_accepted",
+	}
+	metricClientConnectionsInflight = clientMetricDef{
+		Subsystem: "client",
+		Name:      "connections_inflight",
+	}
+	metricClientSubscriptionsAccepted = clientMetricDef{
+		Subsystem: "client",
+		Name:      "subscriptions_accepted",
+	}
+	metricClientSubscriptionsInflight = clientMetricDef{
+		Subsystem: "client",
+		Name:      "subscriptions_inflight",
+	}
+	metricClientCommandDuration = clientMetricDef{
+		Subsystem: "client",
+		Name:      "command_duration_seconds",
+	}
+	metricClientNumReplyErrors = clientMetricDef{
+		Subsystem: "client",
+		Name:      "num_reply_errors",
+	}
+	metricClientNumServerUnsubscribes = clientMetricDef{
+		Subsystem: "client",
+		Name:      "num_server_unsubscribes",
+	}
+	metricClientNumServerDisconnects = clientMetricDef{
+		Subsystem: "client",
+		Name:      "num_server_disconnects",
+	}
+	metricTransportMessagesSent = clientMetricDef{
+		Subsystem: "transport",
+		Name:      "messages_sent",
+	}
+	metricTransportMessagesSentSize = clientMetricDef{
+		Subsystem: "transport",
+		Name:      "messages_sent_size",
+	}
+	metricTransportMessagesReceived = clientMetricDef{
+		Subsystem: "transport",
+		Name:      "messages_received",
+	}
+	metricTransportMessagesReceivedSize = clientMetricDef{
+		Subsystem: "transport",
+		Name:      "messages_received_size",
+	}
+	metricTransportOutgoingClose = clientMetricDef{
+		Subsystem: "transport",
+		Name:      "outgoing_close_count",
+	}
+	metricTransportFrameSize = clientMetricDef{
+		Subsystem: "transport",
+		Name:      "frame_size",
+	}
+)
+
 type metrics struct {
-	messagesSentCount             *prometheus.CounterVec
-	messagesReceivedCount         *prometheus.CounterVec
-	actionCount                   *prometheus.CounterVec
-	buildInfoGauge                *prometheus.GaugeVec
-	numClientsGauge               prometheus.Gauge
-	numUsersGauge                 prometheus.Gauge
-	numSubsGauge                  prometheus.Gauge
-	numChannelsGauge              prometheus.Gauge
-	numNodesGauge                 prometheus.Gauge
-	replyErrorCount               *prometheus.CounterVec
-	connectionsAccepted           *prometheus.CounterVec
-	connectionsInflight           *prometheus.GaugeVec
-	subscriptionsAccepted         *prometheus.CounterVec
-	subscriptionsInflight         *prometheus.GaugeVec
-	serverUnsubscribeCount        *prometheus.CounterVec
-	serverDisconnectCount         *prometheus.CounterVec
-	commandDurationSummary        *prometheus.SummaryVec
-	surveyDurationSummary         *prometheus.SummaryVec
+	messagesSentCount           *prometheus.CounterVec
+	messagesReceivedCount       *prometheus.CounterVec
+	actionCount                 *prometheus.CounterVec
+	buildInfoGauge              *prometheus.GaugeVec
+	numClientsGauge             prometheus.Gauge
+	numUsersGauge               prometheus.Gauge
+	numSubsGauge                prometheus.Gauge
+	numChannelsGauge            prometheus.Gauge
+	numNodesGauge               prometheus.Gauge
+	replyErrorCount             *prometheus.CounterVec
+	connectionsAccepted         *prometheus.CounterVec
+	connectionsInflight         *prometheus.GaugeVec
+	subscriptionsAccepted       *prometheus.CounterVec
+	subscriptionsInflight       *prometheus.GaugeVec
+	serverUnsubscribeCount      *prometheus.CounterVec
+	serverDisconnectCount       *prometheus.CounterVec
+	transportOutgoingCloseCount *prometheus.CounterVec
+	transportFrameSizeHistogram *prometheus.HistogramVec
+	// commandDurationSummary holds the legacy Summary by default; when
+	// EnableNativeHistograms is true it is a no-op (the Summary is not
+	// exposed). The companion commandDurationHistogram below always carries
+	// the real observations, with native schema when the flag is on.
+	commandDurationSummary        prometheus.ObserverVec
+	commandDurationHistogram      *prometheus.HistogramVec
+	surveyDurationSummary         prometheus.ObserverVec
+	surveyDurationHistogram       *prometheus.HistogramVec
 	recoverCount                  *prometheus.CounterVec
 	recoveredPublications         *prometheus.HistogramVec
 	transportMessagesSent         *prometheus.CounterVec
@@ -69,29 +144,75 @@ type metrics struct {
 	commandDurationSubRefresh    prometheus.Observer
 	commandDurationUnknown       prometheus.Observer
 
-	broadcastDurationHistogram *prometheus.HistogramVec
-	pubSubLagHistogram         prometheus.Histogram
-	pingPongDurationHistogram  *prometheus.HistogramVec
+	broadcastDurationHistogram      *prometheus.HistogramVec
+	pubSubLagHistogram              *prometheus.HistogramVec
+	pingPongDurationHistogram       *prometheus.HistogramVec
+	brokerPublishSuppressedCount    *prometheus.CounterVec
+	mapBrokerPublishSuppressedCount *prometheus.CounterVec
+	mapBrokerRemoveSuppressedCount  *prometheus.CounterVec
+	mapBrokerCleanupLag             *prometheus.GaugeVec
+	mapBrokerCleanupRemoved         *prometheus.CounterVec
+	mapBrokerCleanupErrors          *prometheus.CounterVec
 
 	redisBrokerPubSubErrors           *prometheus.CounterVec
 	redisBrokerPubSubDroppedMessages  *prometheus.CounterVec
 	redisBrokerPubSubBufferedMessages *prometheus.GaugeVec
 
+	// brokerPubSub and mapBrokerPubSub bundle the Redis PUB/SUB metric vectors per
+	// broker kind so the shared pub/sub loop reports under each broker's own
+	// subsystem: broker_* for RedisBroker, map_broker_* for RedisMapBroker.
+	brokerPubSub    redisPubSubMetrics
+	mapBrokerPubSub redisPubSubMetrics
+
+	// Shared poll metrics.
+	sharedPollCycleDurationHistogram     *prometheus.HistogramVec
+	sharedPollCycleWorkDurationHistogram *prometheus.HistogramVec
+	sharedPollHandlerDurationHistogram   *prometheus.HistogramVec
+	sharedPollSemWaitDurationHistogram   *prometheus.HistogramVec
+	sharedPollHandlerErrorCount          *prometheus.CounterVec
+	sharedPollItemsCount                 *prometheus.CounterVec
+	sharedPollNotifyCount                *prometheus.CounterVec
+	sharedPollDroppedNotifyCount         *prometheus.CounterVec
+	sharedPollPublishCount               *prometheus.CounterVec
+	sharedPollNumChannelsGauge           prometheus.Gauge
+	sharedPollNumKeysGauge               prometheus.Gauge
+
 	config MetricsConfig
 
-	transportMessagesSentCache     sync.Map
-	transportMessagesReceivedCache sync.Map
-	commandDurationCache           sync.Map
-	replyErrorCache                sync.Map
-	actionCache                    sync.Map
-	recoverCache                   sync.Map
-	unsubscribeCache               sync.Map
-	disconnectCache                sync.Map
-	messagesSentCache              sync.Map
-	messagesReceivedCache          sync.Map
-	tagsFilterDroppedCache         sync.Map
-	nsCache                        *otter.Cache[string, string]
-	codeStrings                    map[uint32]string
+	transportMessagesSentCache      sync.Map
+	transportMessagesReceivedCache  sync.Map
+	transportFrameSizeCache         sync.Map
+	pingPongCache                   sync.Map
+	commandDurationCache            sync.Map
+	replyErrorCache                 sync.Map
+	actionCache                     sync.Map
+	recoverCache                    sync.Map
+	unsubscribeCache                sync.Map
+	disconnectCache                 sync.Map
+	messagesSentCache               sync.Map
+	messagesReceivedCache           sync.Map
+	tagsFilterDroppedCache          sync.Map
+	brokerPublishSuppressedCache    sync.Map
+	mapBrokerPublishSuppressedCache sync.Map
+	mapBrokerRemoveSuppressedCache  sync.Map
+	pubSubLagCache                  sync.Map
+	broadcastDurationCache          sync.Map
+	sharedPollHandlerCache          sync.Map
+	sharedPollResultCache           sync.Map
+	sharedPollChannelCache          sync.Map
+	sharedPollPublishCache          sync.Map
+	nsCache                         *otter.Cache[string, string]
+	codeStrings                     map[uint32]string
+
+	// Cache for client label combinations: maps cache key -> {labelValues, cacheKey}
+	// This allows sharing pre-computed label data across all clients with the same label values
+	clientLabelCombinationsCache sync.Map // map[string]*clientLabelCombination
+}
+
+// clientLabelCombination holds pre-computed label values and cache key for a unique combination
+type clientLabelCombination struct {
+	labelValues []string
+	cacheKey    string
 }
 
 func getMetricsNamespace(config MetricsConfig) string {
@@ -99,6 +220,271 @@ func getMetricsNamespace(config MetricsConfig) string {
 		return defaultMetricsNamespace
 	}
 	return config.MetricsNamespace
+}
+
+// clientLabelPrefix is prepended to every client-label name exported as a
+// Prometheus dimension. It guarantees that user-chosen names in
+// MetricsConfig.ClientLabels can never collide with built-in metric labels
+// like "transport", "code", "method", etc.
+const clientLabelPrefix = "app_"
+
+// buildMetricLabels creates a label slice, optionally appending client labels if enabled.
+// Exported client-label names are prefixed with clientLabelPrefix.
+func (m *metrics) buildMetricLabels(baseLabels []string) []string {
+	if len(m.config.ClientLabels) == 0 {
+		return baseLabels
+	}
+	labels := make([]string, 0, len(baseLabels)+len(m.config.ClientLabels))
+	labels = append(labels, baseLabels...)
+	for _, name := range m.config.ClientLabels {
+		labels = append(labels, clientLabelPrefix+name)
+	}
+	return labels
+}
+
+// appendClientLabels appends client label values to base labels if client labels are enabled.
+// Returns a new slice with client labels appended, or the original base labels if disabled.
+func (m *metrics) appendClientLabels(baseLabels []string, c *Client) []string {
+	if len(m.config.ClientLabels) == 0 {
+		return baseLabels
+	}
+	clientLabelValues := m.extractClientLabelValues(c)
+	if clientLabelValues != nil {
+		result := make([]string, len(baseLabels)+len(clientLabelValues))
+		copy(result, baseLabels)
+		copy(result[len(baseLabels):], clientLabelValues)
+		return result
+	}
+	// Append empty strings for missing client labels to match metric definition
+	result := make([]string, len(baseLabels)+len(m.config.ClientLabels))
+	copy(result, baseLabels)
+	return result
+}
+
+// getOrCreateClientLabelCombinationFromLabels returns a cached combination for the given labels map.
+// This is used during client connect to precompute and cache the combination.
+func (m *metrics) getOrCreateClientLabelCombinationFromLabels(labels map[string]string) *clientLabelCombination {
+	if len(m.config.ClientLabels) == 0 {
+		return nil
+	}
+
+	// Build cache key directly from the map to check if it's already cached
+	cacheKey := buildClientLabelsCacheKeyFromMap(m.config.ClientLabels, labels)
+
+	// Try to load existing combination from global cache
+	if combo, ok := m.clientLabelCombinationsCache.Load(cacheKey); ok {
+		return combo.(*clientLabelCombination)
+	}
+
+	// Not cached - now build the values slice (only done once per unique combination)
+	labelValues := make([]string, len(m.config.ClientLabels))
+	if labels != nil {
+		for i, label := range m.config.ClientLabels {
+			labelValues[i] = labels[label]
+		}
+	}
+
+	// Create new combination
+	combo := &clientLabelCombination{
+		labelValues: labelValues,
+		cacheKey:    cacheKey,
+	}
+
+	// Store in global cache (even if another goroutine stored it first, we'll use theirs)
+	actual, _ := m.clientLabelCombinationsCache.LoadOrStore(cacheKey, combo)
+	return actual.(*clientLabelCombination)
+}
+
+// getCachedClientLabelCombination returns the cached combination for the given client.
+// The combination is pre-cached during client connect. This is used only in non-hot paths
+// and for tests. Hot paths should call c.labelCombinationCached.Load() directly.
+func (m *metrics) getCachedClientLabelCombination(c *Client) *clientLabelCombination {
+	if len(m.config.ClientLabels) == 0 || c == nil {
+		return nil
+	}
+
+	// Load pre-cached combination from client (set during connect)
+	if cached := c.labelCombinationCached.Load(); cached != nil {
+		return cached
+	}
+
+	// Fallback: shouldn't happen in normal flow, but handle gracefully
+	// This can happen if metrics are recorded before client is fully connected or in tests
+	return nil
+}
+
+// extractClientLabelValues extracts client label values from a client, returning empty strings for missing labels.
+// This is a helper for non-hot-path uses. For hot paths, call c.labelCombinationCached.Load() directly.
+func (m *metrics) extractClientLabelValues(c *Client) []string {
+	if len(m.config.ClientLabels) == 0 || c == nil {
+		return nil
+	}
+
+	// Try to get the cached combination first
+	combo := m.getCachedClientLabelCombination(c)
+	if combo != nil {
+		return combo.labelValues
+	}
+
+	// Fallback: client doesn't have combination cached (e.g., in tests)
+	// Build label values directly from client.labels map
+	// Note: c.labels is set once during connect and never modified, so safe to read without lock
+	values := make([]string, len(m.config.ClientLabels))
+	if c.labels != nil {
+		for i, label := range m.config.ClientLabels {
+			values[i] = c.labels[label]
+		}
+	}
+	return values
+}
+
+// clientLabelsCacheKey returns a key identifying the client label combination
+// used for this client, or an empty string when client labels are not
+// configured. Metric caches keyed by label struct must include it: two clients
+// with different label values resolve to different Prometheus children, so a
+// cache key that ignores them would hand the second client the first client's
+// metric.
+//
+// It reuses the key precomputed on the client at connect time, so the hot path
+// does no allocation. The fallback below does allocate, but only runs for a
+// client whose combination is not cached yet - one observed before connect
+// completes, or none at all.
+func (m *metrics) clientLabelsCacheKey(c *Client) string {
+	_, key := m.clientLabelValuesAndKey(c)
+	return key
+}
+
+// clientLabelValuesAndKey resolves both the client label values and the cache
+// key identifying them, returning (nil, "") when client labels are not
+// configured.
+//
+// Paths that need the values as well as the key must go through this rather
+// than calling buildClientLabelsCacheKey per call: the key precomputed on the
+// client at connect time is reused as is, which is what keeps the per-message
+// paths allocation free.
+func (m *metrics) clientLabelValuesAndKey(c *Client) ([]string, string) {
+	if len(m.config.ClientLabels) == 0 {
+		return nil, ""
+	}
+	if c != nil {
+		if combo := c.labelCombinationCached.Load(); combo != nil {
+			return combo.labelValues, combo.cacheKey
+		}
+	}
+	values := m.extractClientLabelValues(c)
+	if values == nil {
+		// No client at all. appendClientLabels resolves this to a full set of
+		// empty values, so the key has to be built over the same shape - not
+		// over nil, which would key the all-empty combination twice.
+		values = make([]string, len(m.config.ClientLabels))
+	}
+	return values, buildClientLabelsCacheKey(values)
+}
+
+// buildClientLabelsCacheKey builds a cache key from client label values without allocations.
+// Uses strings.Builder with pre-sized buffer to minimize allocations.
+func buildClientLabelsCacheKey(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	// Pre-calculate size to avoid Builder growth allocations
+	size := 0
+	for _, v := range values {
+		size += len(v) + 1 // +1 for separator
+	}
+	var b strings.Builder
+	b.Grow(size)
+	for i, val := range values {
+		if i > 0 {
+			b.WriteByte(0) // Use null byte as separator
+		}
+		b.WriteString(val)
+	}
+	return b.String()
+}
+
+// buildClientLabelsCacheKeyFromMap builds a cache key directly from a labels map.
+// This avoids allocating the intermediate values slice.
+func buildClientLabelsCacheKeyFromMap(labelNames []string, labelsMap map[string]string) string {
+	if len(labelNames) == 0 {
+		return ""
+	}
+	// Pre-calculate size to avoid Builder growth allocations
+	size := len(labelNames) - 1 // separators
+	if labelsMap != nil {
+		for _, name := range labelNames {
+			size += len(labelsMap[name])
+		}
+	}
+	var b strings.Builder
+	b.Grow(size)
+	for i, name := range labelNames {
+		if i > 0 {
+			b.WriteByte(0) // Use null byte as separator
+		}
+		if labelsMap != nil {
+			b.WriteString(labelsMap[name])
+		}
+	}
+	return b.String()
+}
+
+// dualObserver fans observations out to both a Summary and a Histogram
+// observer. Used when a metric is exposed as both instrument types — the
+// Summary preserves existing {quantile="..."} dashboards while the Histogram
+// supplies the histogram_quantile()- and OpenTelemetry-friendly form. When
+// EnableNativeHistograms is true the Summary side is a no-op, so only the
+// Histogram records data.
+type dualObserver struct {
+	summary, histogram prometheus.Observer
+}
+
+func (d dualObserver) Observe(v float64) {
+	d.summary.Observe(v)
+	d.histogram.Observe(v)
+}
+
+// noopObserverVec implements prometheus.ObserverVec with all no-op methods.
+// Assigned to a Summary accessor when EnableNativeHistograms is true so the
+// Summary side of a dual-instrument metric is not exposed and contributes no
+// observation cost. Callers that cache observers via WithLabelValues do not
+// need nil-checks — they get a noopObserver that silently drops Observe()
+// calls.
+type noopObserverVec struct{}
+
+func (noopObserverVec) Describe(chan<- *prometheus.Desc)              {}
+func (noopObserverVec) Collect(chan<- prometheus.Metric)              {}
+func (noopObserverVec) WithLabelValues(...string) prometheus.Observer { return noopObserver{} }
+func (noopObserverVec) With(prometheus.Labels) prometheus.Observer    { return noopObserver{} }
+func (noopObserverVec) GetMetricWith(prometheus.Labels) (prometheus.Observer, error) {
+	return noopObserver{}, nil
+}
+func (noopObserverVec) GetMetricWithLabelValues(...string) (prometheus.Observer, error) {
+	return noopObserver{}, nil
+}
+func (noopObserverVec) CurryWith(prometheus.Labels) (prometheus.ObserverVec, error) {
+	return noopObserverVec{}, nil
+}
+func (noopObserverVec) MustCurryWith(prometheus.Labels) prometheus.ObserverVec {
+	return noopObserverVec{}
+}
+
+type noopObserver struct{}
+
+func (noopObserver) Observe(float64) {}
+
+// nativeHistogramOpts returns opts unchanged when native is false. When true,
+// it enables Prometheus native histogram schema with no explicit buckets —
+// the metric exposes only _count, _sum, and the native histogram chunk.
+func nativeHistogramOpts(opts prometheus.HistogramOpts, native bool) prometheus.HistogramOpts {
+	if !native {
+		return opts
+	}
+	opts.Buckets = nil
+	opts.NativeHistogramBucketFactor = 1.1
+	opts.NativeHistogramMaxBucketNumber = 200
+	opts.NativeHistogramMinResetDuration = time.Hour
+	return opts
 }
 
 func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
@@ -127,6 +513,11 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		if cacheTTL < 0 {
 			return nil, errors.New("channel namespace cache TTL must be positive")
 		}
+		if cacheSize < -1 {
+			// -1 is the documented way to disable the cache; anything below it is
+			// a misconfiguration, and the cache constructor panics on it.
+			return nil, errors.New("channel namespace cache size must be positive, or -1 to disable the cache")
+		}
 		if cacheSize != -1 {
 			nsCache = otter.Must(&otter.Options[string, string]{
 				MaximumSize:      cacheSize,
@@ -145,20 +536,6 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		nsCache:     nsCache,
 		codeStrings: codeStrings,
 	}
-
-	m.messagesSentCount = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricsNamespace,
-		Subsystem: "node",
-		Name:      "messages_sent_count",
-		Help:      "Number of messages sent by node to broker.",
-	}, []string{"type", "channel_namespace"})
-
-	m.messagesReceivedCount = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricsNamespace,
-		Subsystem: "node",
-		Name:      "messages_received_count",
-		Help:      "Number of messages received from broker.",
-	}, []string{"type", "channel_namespace"})
 
 	m.actionCount = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
@@ -209,64 +586,119 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		Help:      "Number of channels with one or more subscribers.",
 	})
 
-	m.surveyDurationSummary = prometheus.NewSummaryVec(prometheus.SummaryOpts{
-		Namespace:  metricsNamespace,
-		Subsystem:  "node",
-		Name:       "survey_duration_seconds",
-		Objectives: map[float64]float64{0.5: 0.05, 0.99: 0.001, 0.999: 0.0001},
-		Help:       "Survey duration summary.",
-	}, []string{"op"})
+	if config.EnableNativeHistograms {
+		m.surveyDurationSummary = noopObserverVec{}
+	} else {
+		m.surveyDurationSummary = prometheus.NewSummaryVec(prometheus.SummaryOpts{
+			Namespace:  metricsNamespace,
+			Subsystem:  "node",
+			Name:       "survey_duration_seconds",
+			Objectives: map[float64]float64{0.5: 0.05, 0.99: 0.001, 0.999: 0.0001},
+			Help:       "DEPRECATED — use survey_duration_seconds_histogram. Will be removed in future releases. Survey duration summary.",
+		}, []string{"op"})
+	}
+	m.surveyDurationHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "node",
+		Name:      "survey_duration_seconds_histogram",
+		Help:      "Survey duration histogram. Use for histogram_quantile() and OpenTelemetry export.",
+		Buckets: []float64{
+			0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500,
+			1.0, 2.5, 5.0, 10.0,
+		},
+	}, config.EnableNativeHistograms), []string{"op"})
 
-	m.commandDurationSummary = prometheus.NewSummaryVec(prometheus.SummaryOpts{
-		Namespace:  metricsNamespace,
-		Subsystem:  "client",
-		Name:       "command_duration_seconds",
-		Objectives: map[float64]float64{0.5: 0.05, 0.99: 0.001, 0.999: 0.0001},
-		Help:       "Client command duration summary.",
-	}, []string{"method", "channel_namespace"})
+	m.messagesSentCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "node",
+		Name:      "messages_sent_count",
+		Help:      "Number of messages sent by node to broker.",
+	}, []string{"type", "channel_namespace"})
+
+	m.messagesReceivedCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "node",
+		Name:      "messages_received_count",
+		Help:      "Number of messages received from broker.",
+	}, []string{"type", "channel_namespace"})
+
+	if config.EnableNativeHistograms {
+		m.commandDurationSummary = noopObserverVec{}
+	} else {
+		m.commandDurationSummary = prometheus.NewSummaryVec(prometheus.SummaryOpts{
+			Namespace:  metricsNamespace,
+			Subsystem:  metricClientCommandDuration.Subsystem,
+			Name:       metricClientCommandDuration.Name,
+			Objectives: map[float64]float64{0.5: 0.05, 0.99: 0.001, 0.999: 0.0001},
+			Help:       "DEPRECATED — use command_duration_seconds_histogram. Will be removed in future releases. Client command duration summary.",
+		}, m.buildMetricLabels([]string{"method", "channel_namespace"}))
+	}
+	m.commandDurationHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricClientCommandDuration.Subsystem,
+		Name:      metricClientCommandDuration.Name + "_histogram",
+		Help:      "Client command duration histogram. Use for histogram_quantile() and OpenTelemetry export.",
+		Buckets: []float64{
+			0.000100, 0.000250, 0.000500,
+			0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500,
+			1.0, 2.5, 5.0, 10.0,
+		},
+	}, config.EnableNativeHistograms), m.buildMetricLabels([]string{"method", "channel_namespace"}))
 
 	m.replyErrorCount = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "client",
-		Name:      "num_reply_errors",
+		Subsystem: metricClientNumReplyErrors.Subsystem,
+		Name:      metricClientNumReplyErrors.Name,
 		Help:      "Number of errors in replies sent to clients.",
-	}, []string{"method", "code", "channel_namespace"})
+	}, m.buildMetricLabels([]string{"method", "code", "channel_namespace"}))
 
 	m.serverUnsubscribeCount = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "client",
-		Name:      "num_server_unsubscribes",
+		Subsystem: metricClientNumServerUnsubscribes.Subsystem,
+		Name:      metricClientNumServerUnsubscribes.Name,
 		Help:      "Number of server initiated unsubscribes.",
-	}, []string{"code", "channel_namespace"})
+	}, m.buildMetricLabels([]string{"code", "channel_namespace"}))
 
 	m.serverDisconnectCount = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "client",
-		Name:      "num_server_disconnects",
+		Subsystem: metricClientNumServerDisconnects.Subsystem,
+		Name:      metricClientNumServerDisconnects.Name,
 		Help:      "Number of server initiated disconnects.",
-	}, []string{"code"})
+	}, m.buildMetricLabels([]string{"code"}))
+
+	// Note: only server-sent (outgoing) close codes are recorded. They are
+	// chosen by the server/operator, so the "code" label cardinality is bounded.
+	// Client-supplied (incoming) close codes are deliberately not recorded - a
+	// client may send any code in the RFC 6455 application range (3000-4999),
+	// which would let an unauthenticated peer inflate metric cardinality.
+	m.transportOutgoingCloseCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricTransportOutgoingClose.Subsystem,
+		Name:      metricTransportOutgoingClose.Name,
+		Help:      "Number of close frames sent to clients, by transport and code.",
+	}, []string{"transport", "code"})
 
 	m.recoverCount = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: "client",
 		Name:      "recover",
 		Help:      "Count of recover operations with success/fail resolution.",
-	}, []string{"recovered", "channel_namespace", "has_recovered_publications"})
+	}, m.buildMetricLabels([]string{"recovered", "channel_namespace", "has_recovered_publications"}))
 
 	if config.EnableRecoveredPublicationsHistogram {
 		m.recoveredPublications = prometheus.NewHistogramVec(
-			prometheus.HistogramOpts{
+			nativeHistogramOpts(prometheus.HistogramOpts{
 				Namespace: metricsNamespace,
 				Subsystem: "client",
 				Name:      "recovered_publications",
 				Help:      "Number of publications recovered during subscription recovery.",
 				Buckets:   []float64{0, 1, 2, 3, 5, 10, 20, 50, 100, 250, 500, 1000, 2000, 5000, 10000},
-			},
-			[]string{"channel_namespace"},
+			}, config.EnableNativeHistograms),
+			m.buildMetricLabels([]string{"channel_namespace"}),
 		)
 	}
 
-	m.pingPongDurationHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	m.pingPongDurationHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Subsystem: "client",
 		Name:      "ping_pong_duration_seconds",
@@ -275,63 +707,91 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 			0.000100, 0.000250, 0.000500, // Microsecond resolution.
 			0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, // Millisecond resolution.
 			1.0, 2.5, 5.0, 10.0, // Second resolution.
-		}}, []string{"transport"})
+		}}, config.EnableNativeHistograms), m.buildMetricLabels([]string{"transport"}))
 
 	m.connectionsAccepted = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "client",
-		Name:      "connections_accepted",
+		Subsystem: metricClientConnectionsAccepted.Subsystem,
+		Name:      metricClientConnectionsAccepted.Name,
 		Help:      "Count of accepted transports.",
-	}, []string{"transport", "accept_protocol", "client_name", "client_version"})
+	}, m.buildMetricLabels([]string{"transport", "accept_protocol", "client_name", "client_version"}))
 
 	m.connectionsInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "client",
-		Name:      "connections_inflight",
+		Subsystem: metricClientConnectionsInflight.Subsystem,
+		Name:      metricClientConnectionsInflight.Name,
 		Help:      "Number of inflight client connections.",
-	}, []string{"transport", "accept_protocol", "client_name", "client_version"})
+	}, m.buildMetricLabels([]string{"transport", "accept_protocol", "client_name", "client_version"}))
 
 	m.subscriptionsAccepted = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "client",
-		Name:      "subscriptions_accepted",
+		Subsystem: metricClientSubscriptionsAccepted.Subsystem,
+		Name:      metricClientSubscriptionsAccepted.Name,
 		Help:      "Count of accepted client subscriptions.",
-	}, []string{"client_name", "channel_namespace"})
+	}, m.buildMetricLabels([]string{"client_name", "channel_namespace"}))
 
 	m.subscriptionsInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "client",
-		Name:      "subscriptions_inflight",
+		Subsystem: metricClientSubscriptionsInflight.Subsystem,
+		Name:      metricClientSubscriptionsInflight.Name,
 		Help:      "Number of inflight client subscriptions.",
-	}, []string{"client_name", "channel_namespace"})
+	}, m.buildMetricLabels([]string{"client_name", "channel_namespace"}))
 
 	m.transportMessagesSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "transport",
-		Name:      "messages_sent",
+		Subsystem: metricTransportMessagesSent.Subsystem,
+		Name:      metricTransportMessagesSent.Name,
 		Help:      "Number of messages sent to client connections over specific transport.",
-	}, []string{"transport", "frame_type", "channel_namespace"})
+	}, m.buildMetricLabels([]string{"transport", "frame_type", "channel_namespace"}))
 
 	m.transportMessagesSentSize = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "transport",
-		Name:      "messages_sent_size",
+		Subsystem: metricTransportMessagesSentSize.Subsystem,
+		Name:      metricTransportMessagesSentSize.Name,
 		Help:      "MaxSize in bytes of messages sent to client connections over specific transport (uncompressed and does not include framing overhead).",
-	}, []string{"transport", "frame_type", "channel_namespace"})
+	}, m.buildMetricLabels([]string{"transport", "frame_type", "channel_namespace"}))
 
 	m.transportMessagesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "transport",
-		Name:      "messages_received",
+		Subsystem: metricTransportMessagesReceived.Subsystem,
+		Name:      metricTransportMessagesReceived.Name,
 		Help:      "Number of messages received from client connections over specific transport.",
-	}, []string{"transport", "frame_type", "channel_namespace"})
+	}, m.buildMetricLabels([]string{"transport", "frame_type", "channel_namespace"}))
 
 	m.transportMessagesReceivedSize = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
-		Subsystem: "transport",
-		Name:      "messages_received_size",
+		Subsystem: metricTransportMessagesReceivedSize.Subsystem,
+		Name:      metricTransportMessagesReceivedSize.Name,
 		Help:      "MaxSize in bytes of messages received from client connections over specific transport (uncompressed and does not include framing overhead).",
-	}, []string{"transport", "frame_type", "channel_namespace"})
+	}, m.buildMetricLabels([]string{"transport", "frame_type", "channel_namespace"}))
+
+	// Size of whole protocol frames read from client connections.
+	//
+	// This is deliberately not derivable from the messages_received counters.
+	// Those count individual commands, and a frame may carry many: the protocol
+	// batches, and SDKs use it - centrifuge-js puts the connect command and
+	// every subscribe into a single frame on each transport open. So a frame is
+	// not a command, and dividing the two counters yields a mean command size,
+	// never the tail.
+	//
+	// The tail is the part that matters. WebsocketConfig.MessageSizeLimit is
+	// applied as a transport read limit, so it bounds the whole frame: a client
+	// whose batched reconnect frame exceeds it is closed with 1009 every time it
+	// tries, and that is visible after the fact in outgoing_close_count. This
+	// histogram is what lets the limit be chosen before that happens, from an
+	// observed p99 rather than an estimate.
+	//
+	// Its _count series is also the number of frames, so mean commands per frame
+	// falls out of it and messages_received without a second metric.
+	m.transportFrameSizeHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricTransportFrameSize.Subsystem,
+		Name:      metricTransportFrameSize.Name,
+		Help:      "Size in bytes of protocol frames received from client connections, over specific transport. A frame may contain several commands, so this is not the same as messages_received_size which counts individual commands.",
+		Buckets: []float64{
+			64, 256, 1024, 4096, 16384, 65536, 262144, 1048576,
+		},
+	}, config.EnableNativeHistograms), m.buildMetricLabels([]string{"transport"}))
 
 	m.tagsFilterDroppedCount = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
@@ -350,6 +810,9 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 	m.singleflightMergedCount.WithLabelValues("history").Add(0)
 	m.singleflightMergedCount.WithLabelValues("presence").Add(0)
 	m.singleflightMergedCount.WithLabelValues("presence_stats").Add(0)
+	m.singleflightMergedCount.WithLabelValues("map_state").Add(0)
+	m.singleflightMergedCount.WithLabelValues("map_stream").Add(0)
+	m.singleflightMergedCount.WithLabelValues("map_stats").Add(0)
 
 	m.channelMediumsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
@@ -371,15 +834,15 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		}
 	}
 
-	m.pubSubLagHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
+	m.pubSubLagHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Subsystem: "node",
 		Name:      "pub_sub_lag_seconds",
 		Help:      "Pub sub lag in seconds",
 		Buckets:   []float64{0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000, 10.000},
-	})
+	}, config.EnableNativeHistograms), []string{"channel_namespace"})
 
-	m.broadcastDurationHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	m.broadcastDurationHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Subsystem: "node",
 		Name:      "broadcast_duration_seconds",
@@ -388,7 +851,143 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 			0.000001, 0.000005, 0.000010, 0.000050, 0.000100, 0.000250, 0.000500, // Microsecond resolution.
 			0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, // Millisecond resolution.
 			1.0, 2.5, 5.0, 10.0, // Second resolution.
-		}}, []string{"type", "channel_namespace"})
+		}}, config.EnableNativeHistograms), []string{"type", "channel_namespace"})
+
+	m.brokerPublishSuppressedCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "broker",
+		Name:      "publish_suppressed_count",
+		Help:      "Number of suppressed publish operations.",
+	}, []string{"reason", "channel_namespace"})
+
+	m.mapBrokerPublishSuppressedCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "map_broker",
+		Name:      "publish_suppressed_count",
+		Help:      "Number of suppressed map publish operations.",
+	}, []string{"reason", "channel_namespace"})
+
+	m.mapBrokerRemoveSuppressedCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "map_broker",
+		Name:      "remove_suppressed_count",
+		Help:      "Number of suppressed map remove operations.",
+	}, []string{"reason", "channel_namespace"})
+
+	m.mapBrokerCleanupLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "map_broker",
+		Name:      "cleanup_lag_seconds",
+		Help:      "Lag between now and the oldest expired entry awaiting cleanup. 0 means caught up.",
+	}, []string{"broker_name"})
+
+	m.mapBrokerCleanupRemoved = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "map_broker",
+		Name:      "cleanup_removed_count",
+		Help:      "Total number of expired entries removed by cleanup.",
+	}, []string{"broker_name"})
+
+	m.mapBrokerCleanupErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "map_broker",
+		Name:      "cleanup_errors_count",
+		Help:      "Total number of cleanup errors.",
+	}, []string{"broker_name"})
+
+	sharedPollDurationBuckets := []float64{
+		0.010, 0.025, 0.050, 0.100, 0.250, 0.500, // Millisecond resolution.
+		1.0, 2.5, 5.0, 10.0, 30.0, 60.0, // Second resolution.
+	}
+	sharedPollHandlerBuckets := []float64{
+		0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, // Millisecond resolution.
+		1.0, 2.5, 5.0, 10.0, 30.0, // Second resolution.
+	}
+	sharedPollSemWaitBuckets := []float64{
+		0.0001, 0.0005, 0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, // Millisecond resolution.
+		1.0, 2.5, 5.0, 10.0, 30.0, // Second resolution.
+	}
+
+	m.sharedPollCycleDurationHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "cycle_duration_seconds",
+		Help:      "Full timer cycle duration in seconds.",
+		Buckets:   sharedPollDurationBuckets,
+	}, config.EnableNativeHistograms), []string{"channel_namespace"})
+
+	m.sharedPollCycleWorkDurationHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "cycle_work_duration_seconds",
+		Help:      "Cycle work time in seconds (minus spread delay).",
+		Buckets:   sharedPollDurationBuckets,
+	}, config.EnableNativeHistograms), []string{"channel_namespace"})
+
+	m.sharedPollHandlerDurationHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "handler_duration_seconds",
+		Help:      "Handler call latency in seconds.",
+		Buckets:   sharedPollHandlerBuckets,
+	}, config.EnableNativeHistograms), []string{"trigger", "channel_namespace"})
+
+	m.sharedPollSemWaitDurationHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "sem_wait_duration_seconds",
+		Help:      "Semaphore wait duration in seconds.",
+		Buckets:   sharedPollSemWaitBuckets,
+	}, config.EnableNativeHistograms), []string{"trigger", "channel_namespace"})
+
+	m.sharedPollHandlerErrorCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "handler_error_count",
+		Help:      "Number of handler errors.",
+	}, []string{"trigger", "channel_namespace"})
+
+	m.sharedPollItemsCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "items_count",
+		Help:      "Number of items by result.",
+	}, []string{"trigger", "result", "channel_namespace"})
+
+	m.sharedPollNotifyCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "notify_count",
+		Help:      "Number of notifications received.",
+	}, []string{"channel_namespace"})
+
+	m.sharedPollDroppedNotifyCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "dropped_notify_count",
+		Help:      "Number of notifications dropped due to full buffer.",
+	}, []string{"channel_namespace"})
+
+	m.sharedPollPublishCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "publish_count",
+		Help:      "Number of direct publish operations by result.",
+	}, []string{"result", "channel_namespace"})
+
+	m.sharedPollNumChannelsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "num_channels",
+		Help:      "Number of active shared poll channels.",
+	})
+
+	m.sharedPollNumKeysGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "shared_poll",
+		Name:      "num_keys",
+		Help:      "Total number of tracked keys.",
+	})
 
 	m.redisBrokerPubSubErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
@@ -414,32 +1013,86 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 	m.redisBrokerPubSubDroppedMessages.WithLabelValues("", "control").Add(0)
 	m.redisBrokerPubSubDroppedMessages.WithLabelValues("", "client").Add(0)
 
-	m.messagesReceivedCountPublication = m.messagesReceivedCount.WithLabelValues("publication", "")
-	m.messagesReceivedCountJoin = m.messagesReceivedCount.WithLabelValues("join", "")
-	m.messagesReceivedCountLeave = m.messagesReceivedCount.WithLabelValues("leave", "")
-	m.messagesReceivedCountControl = m.messagesReceivedCount.WithLabelValues("control", "")
+	m.brokerPubSub = redisPubSubMetrics{
+		errors:   m.redisBrokerPubSubErrors,
+		dropped:  m.redisBrokerPubSubDroppedMessages,
+		buffered: m.redisBrokerPubSubBufferedMessages,
+	}
 
-	m.messagesSentCountPublication = m.messagesSentCount.WithLabelValues("publication", "")
-	m.messagesSentCountJoin = m.messagesSentCount.WithLabelValues("join", "")
-	m.messagesSentCountLeave = m.messagesSentCount.WithLabelValues("leave", "")
-	m.messagesSentCountControl = m.messagesSentCount.WithLabelValues("control", "")
+	// RedisMapBroker reports the same Redis PUB/SUB metrics under its own
+	// map_broker subsystem so its series never collide with the stream broker's.
+	m.mapBrokerPubSub = redisPubSubMetrics{
+		errors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "map_broker",
+			Name:      "redis_pub_sub_errors",
+			Help:      "Number of times there was an error in Redis PUB/SUB connection.",
+		}, []string{"broker_name", "error"}),
+		dropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "map_broker",
+			Name:      "redis_pub_sub_dropped_messages",
+			Help:      "Number of dropped messages on application level in Redis PUB/SUB.",
+		}, []string{"broker_name", "channel_type"}),
+		buffered: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "map_broker",
+			Name:      "redis_pub_sub_buffered_messages",
+			Help:      "Number of messages buffered in Redis PUB/SUB.",
+		}, []string{"broker_name", "channel_type", "pub_sub_processor"}),
+	}
+	m.mapBrokerPubSub.dropped.WithLabelValues("", "client").Add(0)
+
+	// Helper to build message labels for node-level broker message metrics
+	// These metrics don't support client labels as they track node-to-broker communication
+	buildMessageLabels := func(msgType string) []string {
+		return []string{msgType, ""}
+	}
+
+	m.messagesReceivedCountPublication = m.messagesReceivedCount.WithLabelValues(buildMessageLabels("publication")...)
+	m.messagesReceivedCountJoin = m.messagesReceivedCount.WithLabelValues(buildMessageLabels("join")...)
+	m.messagesReceivedCountLeave = m.messagesReceivedCount.WithLabelValues(buildMessageLabels("leave")...)
+	m.messagesReceivedCountControl = m.messagesReceivedCount.WithLabelValues(buildMessageLabels("control")...)
+
+	m.messagesSentCountPublication = m.messagesSentCount.WithLabelValues(buildMessageLabels("publication")...)
+	m.messagesSentCountJoin = m.messagesSentCount.WithLabelValues(buildMessageLabels("join")...)
+	m.messagesSentCountLeave = m.messagesSentCount.WithLabelValues(buildMessageLabels("leave")...)
+	m.messagesSentCountControl = m.messagesSentCount.WithLabelValues(buildMessageLabels("control")...)
 
 	labelForMethod := func(frameType protocol.FrameType) string {
 		return frameType.String()
 	}
 
-	m.commandDurationConnect = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypeConnect), "")
-	m.commandDurationSubscribe = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypeSubscribe), "")
-	m.commandDurationUnsubscribe = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypeUnsubscribe), "")
-	m.commandDurationPublish = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypePublish), "")
-	m.commandDurationPresence = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypePresence), "")
-	m.commandDurationPresenceStats = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypePresenceStats), "")
-	m.commandDurationHistory = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypeHistory), "")
-	m.commandDurationSend = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypeSend), "")
-	m.commandDurationRPC = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypeRPC), "")
-	m.commandDurationRefresh = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypeRefresh), "")
-	m.commandDurationSubRefresh = m.commandDurationSummary.WithLabelValues(labelForMethod(protocol.FrameTypeSubRefresh), "")
-	m.commandDurationUnknown = m.commandDurationSummary.WithLabelValues("unknown", "")
+	// Helper to build initial label values with empty client labels if configured.
+	// Client labels are added as empty strings since these pre-cached observers
+	// are only used when no per-call ClientLabels lookup is needed.
+	buildCommandLabels := func(method string) []string {
+		labels := []string{method, ""}
+		for range m.config.ClientLabels {
+			labels = append(labels, "")
+		}
+		return labels
+	}
+
+	makeCommandObserver := func(method string) prometheus.Observer {
+		labels := buildCommandLabels(method)
+		return dualObserver{
+			summary:   m.commandDurationSummary.WithLabelValues(labels...),
+			histogram: m.commandDurationHistogram.WithLabelValues(labels...),
+		}
+	}
+	m.commandDurationConnect = makeCommandObserver(labelForMethod(protocol.FrameTypeConnect))
+	m.commandDurationSubscribe = makeCommandObserver(labelForMethod(protocol.FrameTypeSubscribe))
+	m.commandDurationUnsubscribe = makeCommandObserver(labelForMethod(protocol.FrameTypeUnsubscribe))
+	m.commandDurationPublish = makeCommandObserver(labelForMethod(protocol.FrameTypePublish))
+	m.commandDurationPresence = makeCommandObserver(labelForMethod(protocol.FrameTypePresence))
+	m.commandDurationPresenceStats = makeCommandObserver(labelForMethod(protocol.FrameTypePresenceStats))
+	m.commandDurationHistory = makeCommandObserver(labelForMethod(protocol.FrameTypeHistory))
+	m.commandDurationSend = makeCommandObserver(labelForMethod(protocol.FrameTypeSend))
+	m.commandDurationRPC = makeCommandObserver(labelForMethod(protocol.FrameTypeRPC))
+	m.commandDurationRefresh = makeCommandObserver(labelForMethod(protocol.FrameTypeRefresh))
+	m.commandDurationSubRefresh = makeCommandObserver(labelForMethod(protocol.FrameTypeSubRefresh))
+	m.commandDurationUnknown = makeCommandObserver("unknown")
 
 	var alreadyRegistered prometheus.AlreadyRegisteredError
 
@@ -453,6 +1106,7 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		m.numChannelsGauge,
 		m.numNodesGauge,
 		m.commandDurationSummary,
+		m.commandDurationHistogram,
 		m.replyErrorCount,
 		m.connectionsAccepted,
 		m.connectionsInflight,
@@ -460,6 +1114,8 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		m.subscriptionsInflight,
 		m.serverUnsubscribeCount,
 		m.serverDisconnectCount,
+		m.transportOutgoingCloseCount,
+		m.transportFrameSizeHistogram,
 		m.recoverCount,
 		m.pingPongDurationHistogram,
 		m.transportMessagesSent,
@@ -472,11 +1128,32 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		m.positionChecksCount,
 		m.buildInfoGauge,
 		m.surveyDurationSummary,
+		m.surveyDurationHistogram,
 		m.pubSubLagHistogram,
 		m.broadcastDurationHistogram,
+		m.brokerPublishSuppressedCount,
+		m.mapBrokerPublishSuppressedCount,
+		m.mapBrokerRemoveSuppressedCount,
+		m.mapBrokerCleanupLag,
+		m.mapBrokerCleanupRemoved,
+		m.mapBrokerCleanupErrors,
 		m.redisBrokerPubSubErrors,
 		m.redisBrokerPubSubDroppedMessages,
 		m.redisBrokerPubSubBufferedMessages,
+		m.mapBrokerPubSub.errors,
+		m.mapBrokerPubSub.dropped,
+		m.mapBrokerPubSub.buffered,
+		m.sharedPollCycleDurationHistogram,
+		m.sharedPollCycleWorkDurationHistogram,
+		m.sharedPollHandlerDurationHistogram,
+		m.sharedPollSemWaitDurationHistogram,
+		m.sharedPollHandlerErrorCount,
+		m.sharedPollItemsCount,
+		m.sharedPollNotifyCount,
+		m.sharedPollDroppedNotifyCount,
+		m.sharedPollPublishCount,
+		m.sharedPollNumChannelsGauge,
+		m.sharedPollNumKeysGauge,
 	} {
 		if err := registerer.Register(collector); err != nil && !errors.As(err, &alreadyRegistered) {
 			return nil, err
@@ -490,6 +1167,19 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 	}
 
 	return m, nil
+}
+
+// redisPubSubMetrics bundles the Redis PUB/SUB metric vectors for one broker kind
+// so the shared pub/sub loop (runPubSubLoop) reports under the calling broker's
+// own subsystem — broker_* for RedisBroker, map_broker_* for RedisMapBroker.
+type redisPubSubMetrics struct {
+	errors   *prometheus.CounterVec
+	dropped  *prometheus.CounterVec
+	buffered *prometheus.GaugeVec
+}
+
+func (p redisPubSubMetrics) incErrors(name, errType string) {
+	p.errors.WithLabelValues(name, errType).Inc()
 }
 
 func (m *metrics) incRedisBrokerPubSubErrors(name string, error string) {
@@ -519,21 +1209,29 @@ func (m *metrics) getChannelNamespaceLabel(ch string) string {
 type commandDurationLabels struct {
 	ChannelNamespace string
 	FrameType        protocol.FrameType
+	ClientLabels     string // Concatenated client label values for cache key
 }
 
-func (m *metrics) observeCommandDuration(frameType protocol.FrameType, d time.Duration, ch string) {
-	if ch != "" && m.config.GetChannelNamespaceLabel != nil {
-		channelNamespace := m.getChannelNamespaceLabel(ch)
+func (m *metrics) observeCommandDuration(frameType protocol.FrameType, d time.Duration, ch string, c *Client) {
+	channelNamespace := m.getChannelNamespaceLabel(ch)
+
+	if (ch != "" && m.config.GetChannelNamespaceLabel != nil) || len(m.config.ClientLabels) > 0 {
 		labels := commandDurationLabels{
 			ChannelNamespace: channelNamespace,
 			FrameType:        frameType,
+			ClientLabels:     m.clientLabelsCacheKey(c),
 		}
-		summary, ok := m.commandDurationCache.Load(labels)
+		observer, ok := m.commandDurationCache.Load(labels)
 		if !ok {
-			summary = m.commandDurationSummary.WithLabelValues(frameType.String(), channelNamespace)
-			m.commandDurationCache.Store(labels, summary)
+			baseLabels := []string{frameType.String(), channelNamespace}
+			labelValues := m.appendClientLabels(baseLabels, c)
+			observer = dualObserver{
+				summary:   m.commandDurationSummary.WithLabelValues(labelValues...),
+				histogram: m.commandDurationHistogram.WithLabelValues(labelValues...),
+			}
+			m.commandDurationCache.Store(labels, observer)
 		}
-		summary.(prometheus.Observer).Observe(d.Seconds())
+		observer.(prometheus.Observer).Observe(d.Seconds())
 		return
 	}
 
@@ -568,23 +1266,64 @@ func (m *metrics) observeCommandDuration(frameType protocol.FrameType, d time.Du
 	observer.Observe(d.Seconds())
 }
 
-func (m *metrics) observePubSubDeliveryLag(lagTimeMilli int64) {
+func (m *metrics) observePubSubDeliveryLag(lagTimeMilli int64, ch string) {
 	if lagTimeMilli < 0 {
 		lagTimeMilli = -lagTimeMilli
 	}
-	m.pubSubLagHistogram.Observe(float64(lagTimeMilli) / 1000)
+	channelNamespace := m.getChannelNamespaceLabel(ch)
+	observer, ok := m.pubSubLagCache.Load(channelNamespace)
+	if !ok {
+		observer = m.pubSubLagHistogram.WithLabelValues(channelNamespace)
+		m.pubSubLagCache.Store(channelNamespace, observer)
+	}
+	observer.(prometheus.Observer).Observe(float64(lagTimeMilli) / 1000)
+}
+
+type broadcastDurationLabels struct {
+	Type             string
+	ChannelNamespace string
 }
 
 func (m *metrics) observeBroadcastDuration(started time.Time, ch string) {
-	if m.config.GetChannelNamespaceLabel != nil {
-		m.broadcastDurationHistogram.WithLabelValues("publication", m.getChannelNamespaceLabel(ch)).Observe(time.Since(started).Seconds())
-		return
+	// Runs once per broadcast, so resolve the histogram child once per label set
+	// and cache it — WithLabelValues hashes the label values on every call. The
+	// cache key must carry BOTH labels the vector declares: keying on the
+	// namespace alone would hand back the wrong child the moment a second call
+	// site passes a different type.
+	const broadcastType = "publication"
+	channelNamespace := m.getChannelNamespaceLabel(ch)
+	labels := broadcastDurationLabels{Type: broadcastType, ChannelNamespace: channelNamespace}
+	observer, ok := m.broadcastDurationCache.Load(labels)
+	if !ok {
+		observer = m.broadcastDurationHistogram.WithLabelValues(broadcastType, channelNamespace)
+		m.broadcastDurationCache.Store(labels, observer)
 	}
-	m.broadcastDurationHistogram.WithLabelValues("publication", m.getChannelNamespaceLabel(ch)).Observe(time.Since(started).Seconds())
+	observer.(prometheus.Observer).Observe(time.Since(started).Seconds())
 }
 
-func (m *metrics) observePingPongDuration(duration time.Duration, transport string) {
-	m.pingPongDurationHistogram.WithLabelValues(transport).Observe(duration.Seconds())
+type pingPongLabels struct {
+	Transport    string
+	ClientLabels string // Concatenated client label values for cache key
+}
+
+// observePingPongDuration records the round trip time of one server ping and
+// the client pong answering it.
+//
+// The resolved observer is cached per label combination, as the transport frame
+// size histogram is: this runs once per ping interval per connection, so on a
+// node holding many connections it is a steady stream of label lookups.
+func (m *metrics) observePingPongDuration(duration time.Duration, transport string, c *Client) {
+	labels := pingPongLabels{
+		Transport:    transport,
+		ClientLabels: m.clientLabelsCacheKey(c),
+	}
+	observer, ok := m.pingPongCache.Load(labels)
+	if !ok {
+		baseLabels := []string{transport}
+		observer = m.pingPongDurationHistogram.WithLabelValues(m.appendClientLabels(baseLabels, c)...)
+		m.pingPongCache.Store(labels, observer)
+	}
+	observer.(prometheus.Observer).Observe(duration.Seconds())
 }
 
 func (m *metrics) setBuildInfo(version string) {
@@ -615,18 +1354,22 @@ type replyErrorLabels struct {
 	FrameType        protocol.FrameType
 	ChannelNamespace string
 	Code             string
+	ClientLabels     string // Concatenated client label values for cache key
 }
 
-func (m *metrics) incReplyError(frameType protocol.FrameType, code uint32, ch string) {
+func (m *metrics) incReplyError(frameType protocol.FrameType, code uint32, ch string, c *Client) {
 	channelNamespace := m.getChannelNamespaceLabel(ch)
 	labels := replyErrorLabels{
 		ChannelNamespace: channelNamespace,
 		FrameType:        frameType,
 		Code:             m.getCodeLabel(code),
+		ClientLabels:     m.clientLabelsCacheKey(c),
 	}
 	counter, ok := m.replyErrorCache.Load(labels)
 	if !ok {
-		counter = m.replyErrorCount.WithLabelValues(frameType.String(), labels.Code, channelNamespace)
+		baseLabels := []string{frameType.String(), labels.Code, channelNamespace}
+		labelValues := m.appendClientLabels(baseLabels, c)
+		counter = m.replyErrorCount.WithLabelValues(labelValues...)
 		m.replyErrorCache.Store(labels, counter)
 	}
 	counter.(prometheus.Counter).Inc()
@@ -636,9 +1379,10 @@ type recoverLabels struct {
 	ChannelNamespace string
 	Success          string
 	HasPublications  string
+	ClientLabels     string // Concatenated client label values for cache key
 }
 
-func (m *metrics) incRecover(success bool, ch string, hasPublications bool) {
+func (m *metrics) incRecover(success bool, ch string, hasPublications bool, c *Client) {
 	var successStr string
 	if success {
 		successStr = "yes"
@@ -656,19 +1400,21 @@ func (m *metrics) incRecover(success bool, ch string, hasPublications bool) {
 		ChannelNamespace: channelNamespace,
 		Success:          successStr,
 		HasPublications:  hasPubsStr,
+		ClientLabels:     m.clientLabelsCacheKey(c),
 	}
 	counter, ok := m.recoverCache.Load(labels)
 	if !ok {
-		counter = m.recoverCount.WithLabelValues(successStr, channelNamespace, hasPubsStr)
+		baseLabels := []string{successStr, channelNamespace, hasPubsStr}
+		counter = m.recoverCount.WithLabelValues(m.appendClientLabels(baseLabels, c)...)
 		m.recoverCache.Store(labels, counter)
 	}
 	counter.(prometheus.Counter).Inc()
 }
 
-func (m *metrics) observeRecoveredPublications(count int, ch string) {
+func (m *metrics) observeRecoveredPublications(count int, ch string, c *Client) {
 	if m.recoveredPublications != nil {
-		channelNamespace := m.getChannelNamespaceLabel(ch)
-		m.recoveredPublications.WithLabelValues(channelNamespace).Observe(float64(count))
+		baseLabels := []string{m.getChannelNamespaceLabel(ch)}
+		m.recoveredPublications.WithLabelValues(m.appendClientLabels(baseLabels, c)...).Observe(float64(count))
 	}
 }
 
@@ -676,6 +1422,7 @@ type transportMessageLabels struct {
 	Transport        string
 	ChannelNamespace string
 	FrameType        string
+	ClientLabels     string // Concatenated client label values for cache key
 }
 
 type transportMessagesSent struct {
@@ -688,16 +1435,39 @@ type transportMessagesReceived struct {
 	counterReceivedSize prometheus.Counter
 }
 
-func (m *metrics) getTransportMessagesSentCounters(transport string, frameType string, namespace string) transportMessagesSent {
+func (m *metrics) getTransportMessagesSentCounters(transport string, frameType string, namespace string, clientLabelValues []string, clientLabelCacheKey string) transportMessagesSent {
+	// Apply client labels if they are configured
+	useClientLabels := len(m.config.ClientLabels) > 0
+	if useClientLabels {
+		if clientLabelValues == nil {
+			// Create empty strings for missing client labels
+			clientLabelValues = make([]string, len(m.config.ClientLabels))
+			clientLabelCacheKey = buildClientLabelsCacheKey(clientLabelValues)
+		}
+	} else {
+		// Client labels not configured - don't use them even if provided
+		clientLabelValues = nil
+		clientLabelCacheKey = ""
+	}
+
+	// Use pre-computed cache key - no allocation here
 	labels := transportMessageLabels{
 		Transport:        transport,
 		ChannelNamespace: namespace,
 		FrameType:        frameType,
+		ClientLabels:     clientLabelCacheKey,
 	}
 	counters, ok := m.transportMessagesSentCache.Load(labels)
 	if !ok {
-		counterSent := m.transportMessagesSent.WithLabelValues(transport, frameType, namespace)
-		counterSentSize := m.transportMessagesSentSize.WithLabelValues(transport, frameType, namespace)
+		// Pre-allocate labelValues with exact capacity to avoid append reallocation
+		labelValues := make([]string, 0, 3+len(clientLabelValues))
+		labelValues = append(labelValues, transport, frameType, namespace)
+		if useClientLabels {
+			labelValues = append(labelValues, clientLabelValues...)
+		}
+
+		counterSent := m.transportMessagesSent.WithLabelValues(labelValues...)
+		counterSentSize := m.transportMessagesSentSize.WithLabelValues(labelValues...)
 		counters = transportMessagesSent{
 			counterSent:     counterSent,
 			counterSentSize: counterSentSize,
@@ -707,24 +1477,47 @@ func (m *metrics) getTransportMessagesSentCounters(transport string, frameType s
 	return counters.(transportMessagesSent)
 }
 
-func (m *metrics) incTransportMessagesSent(transport string, frameType protocol.FrameType, channel string, size int) {
+func (m *metrics) incTransportMessagesSent(transport string, frameType protocol.FrameType, channel string, size int, c *Client) {
 	channelNamespace := m.getChannelNamespaceLabel(channel)
-	counters := m.getTransportMessagesSentCounters(transport, frameType.String(), channelNamespace)
+
+	// Use pre-cached combination from client (set during connect)
+	var clientLabelValues []string
+	var clientLabelCacheKey string
+	if c != nil {
+		if combo := c.labelCombinationCached.Load(); combo != nil {
+			clientLabelValues = combo.labelValues
+			clientLabelCacheKey = combo.cacheKey
+		}
+	}
+
+	counters := m.getTransportMessagesSentCounters(transport, frameType.String(), channelNamespace, clientLabelValues, clientLabelCacheKey)
 	counters.counterSent.Inc()
 	counters.counterSentSize.Add(float64(size))
 }
 
-func (m *metrics) incTransportMessagesReceived(transport string, frameType protocol.FrameType, channel string, size int) {
+func (m *metrics) incTransportMessagesReceived(transport string, frameType protocol.FrameType, channel string, size int, c *Client) {
 	channelNamespace := m.getChannelNamespaceLabel(channel)
+
+	// Runs once per received command, so the label values and their key come
+	// from the combination cached on the client - building the key here would
+	// allocate on every message.
+	clientLabelValues, clientLabelsKey := m.clientLabelValuesAndKey(c)
+	useClientLabels := len(m.config.ClientLabels) > 0
+
 	labels := transportMessageLabels{
 		Transport:        transport,
 		ChannelNamespace: channelNamespace,
 		FrameType:        frameType.String(),
+		ClientLabels:     clientLabelsKey,
 	}
 	counters, ok := m.transportMessagesReceivedCache.Load(labels)
 	if !ok {
-		counterReceived := m.transportMessagesReceived.WithLabelValues(transport, labels.FrameType, channelNamespace)
-		counterReceivedSize := m.transportMessagesReceivedSize.WithLabelValues(transport, labels.FrameType, channelNamespace)
+		labelValues := []string{transport, labels.FrameType, channelNamespace}
+		if useClientLabels && len(clientLabelValues) > 0 {
+			labelValues = append(labelValues, clientLabelValues...)
+		}
+		counterReceived := m.transportMessagesReceived.WithLabelValues(labelValues...)
+		counterReceivedSize := m.transportMessagesReceivedSize.WithLabelValues(labelValues...)
 		counters = transportMessagesReceived{
 			counterReceived:     counterReceived,
 			counterReceivedSize: counterReceivedSize,
@@ -744,16 +1537,57 @@ func (m *metrics) getCodeLabel(code uint32) string {
 }
 
 type disconnectLabels struct {
-	Code string
+	Code         string
+	ClientLabels string // Concatenated client label values for cache key
 }
 
-func (m *metrics) incServerDisconnect(code uint32) {
+func (m *metrics) incTransportOutgoingClose(transport string, code int) {
+	m.transportOutgoingCloseCount.WithLabelValues(transport, m.getCodeLabel(uint32(code))).Inc()
+}
+
+type transportFrameLabels struct {
+	Transport    string
+	ClientLabels string // Concatenated client label values for cache key
+}
+
+// observeTransportFrameSize records the size of one protocol frame read from a
+// client connection.
+//
+// The resolved observer is cached per label combination, as the per-command
+// transport counters are, because WithLabelValues hashes and looks up its label
+// values on every call and this runs once per frame on the read path. Without
+// the cache it measured 52ns/frame, and 63ns with an allocation when client
+// labels are configured; with it the label work is a single map load.
+func (m *metrics) observeTransportFrameSize(transport string, size int, c *Client) {
+	clientLabelValues, clientLabelsKey := m.clientLabelValuesAndKey(c)
+	useClientLabels := len(m.config.ClientLabels) > 0
+
+	labels := transportFrameLabels{
+		Transport:    transport,
+		ClientLabels: clientLabelsKey,
+	}
+	observer, ok := m.transportFrameSizeCache.Load(labels)
+	if !ok {
+		labelValues := []string{transport}
+		if useClientLabels && len(clientLabelValues) > 0 {
+			labelValues = append(labelValues, clientLabelValues...)
+		}
+		observer = m.transportFrameSizeHistogram.WithLabelValues(labelValues...)
+		m.transportFrameSizeCache.Store(labels, observer)
+	}
+	observer.(prometheus.Observer).Observe(float64(size))
+}
+
+func (m *metrics) incServerDisconnect(code uint32, c *Client) {
 	labels := disconnectLabels{
-		Code: m.getCodeLabel(code),
+		Code:         m.getCodeLabel(code),
+		ClientLabels: m.clientLabelsCacheKey(c),
 	}
 	counter, ok := m.disconnectCache.Load(labels)
 	if !ok {
-		counter = m.serverDisconnectCount.WithLabelValues(labels.Code)
+		baseLabels := []string{labels.Code}
+		labelValues := m.appendClientLabels(baseLabels, c)
+		counter = m.serverDisconnectCount.WithLabelValues(labelValues...)
 		m.disconnectCache.Store(labels, counter)
 	}
 	counter.(prometheus.Counter).Inc()
@@ -762,16 +1596,20 @@ func (m *metrics) incServerDisconnect(code uint32) {
 type unsubscribeLabels struct {
 	Code             string
 	ChannelNamespace string
+	ClientLabels     string // Concatenated client label values for cache key
 }
 
-func (m *metrics) incServerUnsubscribe(code uint32, ch string) {
+func (m *metrics) incServerUnsubscribe(code uint32, ch string, c *Client) {
 	labels := unsubscribeLabels{
 		Code:             m.getCodeLabel(code),
 		ChannelNamespace: m.getChannelNamespaceLabel(ch),
+		ClientLabels:     m.clientLabelsCacheKey(c),
 	}
 	counter, ok := m.unsubscribeCache.Load(labels)
 	if !ok {
-		counter = m.serverUnsubscribeCount.WithLabelValues(labels.Code, labels.ChannelNamespace)
+		baseLabels := []string{labels.Code, labels.ChannelNamespace}
+		labelValues := m.appendClientLabels(baseLabels, c)
+		counter = m.serverUnsubscribeCount.WithLabelValues(labelValues...)
 		m.unsubscribeCache.Store(labels, counter)
 	}
 	counter.(prometheus.Counter).Inc()
@@ -863,7 +1701,9 @@ func (m *metrics) incActionCount(action string, ch string) {
 }
 
 func (m *metrics) observeSurveyDuration(op string, d time.Duration) {
-	m.surveyDurationSummary.WithLabelValues(op).Observe(d.Seconds())
+	seconds := d.Seconds()
+	m.surveyDurationSummary.WithLabelValues(op).Observe(seconds)
+	m.surveyDurationHistogram.WithLabelValues(op).Observe(seconds)
 }
 
 type tagsFilterDroppedLabels struct {
@@ -897,6 +1737,150 @@ func (m *metrics) incTagsFilterDropped(ch string, count int) {
 		m.tagsFilterDroppedCache.Store(labels, counter)
 	}
 	counter.(prometheus.Counter).Add(float64(count))
+}
+
+type suppressedLabels struct {
+	Reason           string
+	ChannelNamespace string
+}
+
+// incSuppressed increments a suppressed-operation counter, caching the resolved
+// child by {reason, channel_namespace} to keep the hot publish path cheap.
+func (m *metrics) incSuppressed(vec *prometheus.CounterVec, cache *sync.Map, reason SuppressReason, ch string) {
+	channelNamespace := m.getChannelNamespaceLabel(ch)
+	labels := suppressedLabels{
+		Reason:           string(reason),
+		ChannelNamespace: channelNamespace,
+	}
+	counter, ok := cache.Load(labels)
+	if !ok {
+		counter = vec.WithLabelValues(string(reason), channelNamespace)
+		cache.Store(labels, counter)
+	}
+	counter.(prometheus.Counter).Inc()
+}
+
+func (m *metrics) incBrokerPublishSuppressed(reason SuppressReason, ch string) {
+	m.incSuppressed(m.brokerPublishSuppressedCount, &m.brokerPublishSuppressedCache, reason, ch)
+}
+
+func (m *metrics) incMapBrokerPublishSuppressed(reason SuppressReason, ch string) {
+	m.incSuppressed(m.mapBrokerPublishSuppressedCount, &m.mapBrokerPublishSuppressedCache, reason, ch)
+}
+
+func (m *metrics) incMapBrokerRemoveSuppressed(reason SuppressReason, ch string) {
+	m.incSuppressed(m.mapBrokerRemoveSuppressedCount, &m.mapBrokerRemoveSuppressedCache, reason, ch)
+}
+
+func (m *metrics) setMapBrokerCleanupLag(name string, seconds float64) {
+	m.mapBrokerCleanupLag.WithLabelValues(name).Set(seconds)
+}
+
+func (m *metrics) addMapBrokerCleanupRemoved(name string, count int64) {
+	m.mapBrokerCleanupRemoved.WithLabelValues(name).Add(float64(count))
+}
+
+func (m *metrics) incMapBrokerCleanupErrors(name string) {
+	m.mapBrokerCleanupErrors.WithLabelValues(name).Inc()
+}
+
+// Shared poll cached metric bundles and helpers.
+
+type sharedPollTriggerNsLabels struct {
+	Trigger          string
+	ChannelNamespace string
+}
+
+type sharedPollHandlerCached struct {
+	errorCount  prometheus.Counter
+	itemsPolled prometheus.Counter
+	duration    prometheus.Observer
+	semWait     prometheus.Observer
+}
+
+type sharedPollResultCached struct {
+	changed   prometheus.Counter
+	unchanged prometheus.Counter
+	removed   prometheus.Counter
+}
+
+type sharedPollChannelCached struct {
+	cycleDuration      prometheus.Observer
+	cycleWorkDuration  prometheus.Observer
+	notifyCount        prometheus.Counter
+	droppedNotifyCount prometheus.Counter
+}
+
+type sharedPollPublishCached struct {
+	applied prometheus.Counter
+	skipped prometheus.Counter
+}
+
+func (m *metrics) getSharedPollHandlerCached(trigger, ch string) sharedPollHandlerCached {
+	channelNamespace := m.getChannelNamespaceLabel(ch)
+	labels := sharedPollTriggerNsLabels{Trigger: trigger, ChannelNamespace: channelNamespace}
+	cached, ok := m.sharedPollHandlerCache.Load(labels)
+	if !ok {
+		cached = sharedPollHandlerCached{
+			errorCount:  m.sharedPollHandlerErrorCount.WithLabelValues(trigger, channelNamespace),
+			itemsPolled: m.sharedPollItemsCount.WithLabelValues(trigger, "polled", channelNamespace),
+			duration:    m.sharedPollHandlerDurationHistogram.WithLabelValues(trigger, channelNamespace),
+			semWait:     m.sharedPollSemWaitDurationHistogram.WithLabelValues(trigger, channelNamespace),
+		}
+		m.sharedPollHandlerCache.Store(labels, cached)
+	}
+	return cached.(sharedPollHandlerCached)
+}
+
+func (m *metrics) getSharedPollResultCached(trigger, ch string) sharedPollResultCached {
+	channelNamespace := m.getChannelNamespaceLabel(ch)
+	labels := sharedPollTriggerNsLabels{Trigger: trigger, ChannelNamespace: channelNamespace}
+	cached, ok := m.sharedPollResultCache.Load(labels)
+	if !ok {
+		cached = sharedPollResultCached{
+			changed:   m.sharedPollItemsCount.WithLabelValues(trigger, "changed", channelNamespace),
+			unchanged: m.sharedPollItemsCount.WithLabelValues(trigger, "unchanged", channelNamespace),
+			removed:   m.sharedPollItemsCount.WithLabelValues(trigger, "removed", channelNamespace),
+		}
+		m.sharedPollResultCache.Store(labels, cached)
+	}
+	return cached.(sharedPollResultCached)
+}
+
+func (m *metrics) getSharedPollChannelCached(ch string) sharedPollChannelCached {
+	channelNamespace := m.getChannelNamespaceLabel(ch)
+	cached, ok := m.sharedPollChannelCache.Load(channelNamespace)
+	if !ok {
+		cached = sharedPollChannelCached{
+			cycleDuration:      m.sharedPollCycleDurationHistogram.WithLabelValues(channelNamespace),
+			cycleWorkDuration:  m.sharedPollCycleWorkDurationHistogram.WithLabelValues(channelNamespace),
+			notifyCount:        m.sharedPollNotifyCount.WithLabelValues(channelNamespace),
+			droppedNotifyCount: m.sharedPollDroppedNotifyCount.WithLabelValues(channelNamespace),
+		}
+		m.sharedPollChannelCache.Store(channelNamespace, cached)
+	}
+	return cached.(sharedPollChannelCached)
+}
+
+func (m *metrics) getSharedPollPublishCached(ch string) sharedPollPublishCached {
+	channelNamespace := m.getChannelNamespaceLabel(ch)
+	cached, ok := m.sharedPollPublishCache.Load(channelNamespace)
+	if !ok {
+		cached = sharedPollPublishCached{
+			applied: m.sharedPollPublishCount.WithLabelValues("applied", channelNamespace),
+			skipped: m.sharedPollPublishCount.WithLabelValues("skipped", channelNamespace),
+		}
+		m.sharedPollPublishCache.Store(channelNamespace, cached)
+	}
+	return cached.(sharedPollPublishCached)
+}
+
+func (m *metrics) setSharedPollNumChannels(n float64) {
+	m.sharedPollNumChannelsGauge.Set(n)
+}
+
+func (m *metrics) setSharedPollNumKeys(n float64) {
+	m.sharedPollNumKeysGauge.Set(n)
 }
 
 // getAcceptProtocolLabel returns the transport accept protocol label based on HTTP version.

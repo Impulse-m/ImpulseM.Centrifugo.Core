@@ -28,13 +28,6 @@ type positionTestMedium struct {
 func newPositionTestMedium(t *testing.T) *positionTestMedium {
 	t.Helper()
 	p := &positionTestMedium{clock: time.Now()}
-	originalGetter := channelMediumTimeNow
-	channelMediumTimeNow = func() time.Time {
-		return p.clock
-	}
-	t.Cleanup(func() {
-		channelMediumTimeNow = originalGetter
-	})
 	node := &mockNode{
 		handlePublicationFunc: func(_ string, _ StreamPosition, pub, _, _ *Publication) error {
 			if pub.Offset == math.MaxUint64 {
@@ -52,6 +45,7 @@ func newPositionTestMedium(t *testing.T) *positionTestMedium {
 		},
 	}
 	p.medium = setupChannelMedium(t, ChannelMediumOptions{SharedPositionSync: true}, node)
+	p.medium.nowFn = func() time.Time { return p.clock }
 	return p
 }
 
@@ -65,13 +59,32 @@ func (p *positionTestMedium) tick() {
 	p.clock = p.clock.Add(time.Second)
 }
 
-// check runs CheckPosition for a client at position client and returns its validPosition.
+// check runs CheckPosition for a client at position client, stamped with the current clock second, and
+// returns its validPosition.
 func (p *positionTestMedium) check(t *testing.T, client StreamPosition) bool {
 	t.Helper()
-	checked, validPosition, err := p.medium.CheckPosition(0, client, time.Second)
+	return p.checkAt(t, client, p.clock.Unix())
+}
+
+// checkAt runs CheckPosition for a client whose positionCheckTime is posTime (Unix seconds).
+func (p *positionTestMedium) checkAt(t *testing.T, client StreamPosition, posTime int64) bool {
+	t.Helper()
+	checked, validPosition, err := p.medium.CheckPosition(0, client, time.Second, posTime)
 	require.NoError(t, err)
 	require.True(t, checked)
 	return validPosition
+}
+
+func (p *positionTestMedium) hasRegress() bool {
+	p.medium.mu.Lock()
+	defer p.medium.mu.Unlock()
+	return p.medium.hasRegress
+}
+
+func (p *positionTestMedium) lastPos() StreamPosition {
+	p.medium.mu.Lock()
+	defer p.medium.mu.Unlock()
+	return p.medium.lastPosition
 }
 
 func (p *positionTestMedium) hasSuspect() bool {
@@ -208,6 +221,54 @@ func TestSharedPositionSyncClientAheadOfCachedTopIsValid(t *testing.T) {
 	// Client recovered to a newer position than the cached top, within the same interval.
 	require.True(t, p.check(t, testPos(8)))
 	require.Equal(t, calls, p.topCalls)
+
+	// Next interval: the top is fetched after the client was checked, and it is still 7 while the node is at 6.
+	// The client is not delivered by the node, so it is invalid. The node is not confirmed behind (the top is
+	// not ahead of lastPosition), so no marker is sent.
+	stamp := p.clock.Unix()
+	p.tick()
+	require.False(t, p.checkAt(t, testPos(8), stamp))
+	require.Equal(t, 0, p.markers)
+}
+
+// A same-epoch broker regression (the stream tail is lost, the epoch is kept) must be caught without a
+// publication: a client ahead of the re-issued top is invalid once the regression is confirmed.
+func TestSharedPositionSyncBrokerRegressionConfirmedAfterTwoIntervals(t *testing.T) {
+	p := newPositionTestMedium(t)
+	p.publish(testPos(105))
+	p.top = testPos(105)
+	p.tick()
+	require.True(t, p.check(t, testPos(105)))
+
+	// Broker re-issued the tail: the top is 103 while the node delivered 105. First sighting is suspect only.
+	p.top = testPos(103)
+	p.tick()
+	require.True(t, p.check(t, testPos(105)))
+	require.Equal(t, 0, p.markers)
+	require.True(t, p.hasRegress())
+
+	// Second consecutive fetch with the same regression confirms it: the marker is sent.
+	p.tick()
+	require.False(t, p.check(t, testPos(105)))
+	require.Equal(t, 1, p.markers)
+	require.Equal(t, testPos(103), p.lastPos())
+
+	// The re-issued 104 is delivered after the marker: it does not trigger another marker.
+	p.publish(testPos(104))
+	require.Equal(t, 1, p.markers)
+}
+
+func TestSharedPositionSyncClientAheadDeliveredByNodeIsValid(t *testing.T) {
+	p := newPositionTestMedium(t)
+	p.publish(testPos(6))
+	p.publish(testPos(8))
+	p.top = testPos(7)
+	stamp := p.clock.Unix()
+	p.tick()
+
+	// The node delivered 8 already, so a client at 8 is valid even though the top was fetched after it.
+	require.True(t, p.checkAt(t, testPos(8), stamp))
+	require.Equal(t, 0, p.markers)
 }
 
 func TestSharedPositionSyncNothingBroadcastYetUsesClientFloor(t *testing.T) {

@@ -32,8 +32,8 @@ const (
 	massReconnectTopCallsPerChannel int64 = 2
 )
 
-// massReconnectClock is a time source shared by the Node (nowTimeGetter) and the channel medium
-// (channelMediumTimeNow) so that the position check interval can be advanced deterministically.
+// massReconnectClock is a time source shared by the Node (nowTimeGetter), from which channel mediums
+// take their clock, so that the position check interval can be advanced deterministically.
 type massReconnectClock struct {
 	unixNano atomic.Int64
 }
@@ -166,12 +166,6 @@ func runMassReconnectScenario(t *testing.T, mode massReconnectMode) massReconnec
 	t.Helper()
 	start := time.Now()
 	clock := newMassReconnectClock(start)
-	originalMediumTimeNow := channelMediumTimeNow
-	channelMediumTimeNow = clock.now
-	t.Cleanup(func() {
-		channelMediumTimeNow = originalMediumTimeNow
-	})
-
 	config := Config{
 		ClientChannelPositionCheckDelay: massReconnectCheckDelay,
 		UseSingleFlight:                 mode.singleFlight,

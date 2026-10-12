@@ -20,6 +20,12 @@ type ConnectEvent struct {
 	Name string
 	// Version can contain client version if provided on connect.
 	Version string
+	// Profile can contain the profile name the client declared on connect.
+	// This is an unvalidated client assertion, exactly like Name and Version:
+	// treat it as a request, not a fact. Return ConnectReply.Profile to set the
+	// profile the server will actually use - whatever is returned there wins,
+	// and returning an empty one discards the client's claim entirely.
+	Profile string
 	// Transport contains information about transport used by client.
 	Transport TransportInfo
 	// Channels is a list of channels a client wants to subscribe to
@@ -55,6 +61,21 @@ type ConnectReply struct {
 	// over Client.AcquireStorage() call. This API is EXPERIMENTAL.
 	Storage map[string]any
 
+	// Profile is the application context this connection belongs to - which view,
+	// screen or client kind it is. Connections sharing a profile see traffic of a
+	// similar shape.
+	//
+	// Setting it here overrides whatever the client declared in its connect
+	// command, and is the recommended way to classify connections: a claim in the
+	// token this handler already reads is one change to the service issuing
+	// tokens, rather than a release of every client.
+	//
+	// It is carried on the Client and can be read with Client.Profile(). Nothing
+	// in this package interprets it; it exists so features layered on top - the
+	// obvious one being compression dictionaries - can group connections that
+	// look alike.
+	Profile string
+
 	// MaxMessagesInFrame is the maximum number of messages (replies and pushes) which
 	// Centrifuge Client message writer will collect from the client's queue before sending
 	// to the connection. By default, it's 16. Use -1 to disable the limit.
@@ -81,14 +102,39 @@ type ConnectReply struct {
 	// QueueInitialCap set an initial capacity for client's message queue, the size of queue
 	// can grow further, but won't be reduced below QueueInitialCap. By default, it's 2.
 	QueueInitialCap int
-	// QueueShrinkDelay is a time Centrifuge will wait before shrinking the client's message
-	// queue after it grows. This delay helps to avoid frequent allocations/deallocations when
-	// queue size fluctuates. Zero value means no delay and immediate shrinking. This option
-	// only works when WriteDelay is set to a non-zero value.
+	// QueueShrinkDelay is a time Centrifuge will wait, after the client's message
+	// queue has been drained, before shrinking it back down. This option only
+	// applies when WriteDelay is set to a non-zero value.
+	//
+	// It matters because shrinking is evaluated immediately after a drain, when
+	// the queue is empty by construction. Acting on that would discard the ring
+	// the writer had just filled, and the next frame would rebuild it one
+	// doubling at a time - allocating on every write cycle for the lifetime of
+	// the connection. Waiting instead lets the queue settle: under sustained load
+	// the timer keeps resetting and capacity is simply retained, and once the
+	// connection goes quiet the timer fires and the memory is released in full.
+	//
+	// Zero value (the default) means Centrifuge picks a sensible delay itself
+	// (currently one second). Pass a negative value to shrink immediately after
+	// every drain - available for completeness, but it reintroduces the per-cycle
+	// allocations described above and is not recommended.
+	//
+	// Broadcasting to 200 subscribers with WriteDelay set, per publication:
+	//
+	//	shrink immediately   19.1us   84 allocs   34 KB
+	//	default delay        12.7us    2 allocs  376 B
+	//
+	// A longer delay holds capacity through longer quiet gaps, which suits
+	// connections that burst repeatedly; a shorter one returns memory sooner.
 	QueueShrinkDelay time.Duration
 	// PingPongConfig if set, will override Transport's PingPongConfig to enable setting ping/pong interval
 	// for individual client.
 	PingPongConfig *PingPongConfig
+	// Labels is a map of custom label key-value pairs that will be attached to the client connection.
+	// Labels can be used for any application purpose. Additionally, labels defined in MetricsConfig.ClientLabels
+	// will be exported to Prometheus metrics for all client metrics.
+	// For exported metric labels: if a defined label is not found in this map, an empty string will be used.
+	Labels map[string]string
 }
 
 // ConnectingHandler called when new client authenticates on server.
@@ -158,9 +204,51 @@ type UnsubscribeEvent struct {
 	// is UnsubscribeCodeDisconnect - i.e. when unsubscribe caused by a client disconnection process.
 	// Otherwise, it's nil.
 	Disconnect *Disconnect
+	// Subscribed is true when the client was subscribed to the channel. It is
+	// false when the event ends a subscribe attempt which SubscribeHandler allowed
+	// but which never became a subscription: Centrifuge refused it after the
+	// handler (for example, an invalid expiration or a failed history or map state
+	// read, reported with UnsubscribeCodeServer), or the attempt was abandoned by an
+	// unsubscribe or by a disconnect while it was in progress (reported with that
+	// unsubscribe's or disconnect's code). Map subscriptions are subscribed only
+	// once they reach the live phase, so an unsubscribe during state or stream
+	// pagination also has Subscribed set to false.
+	Subscribed bool
 }
 
-// UnsubscribeHandler called when client unsubscribed from channel.
+// UnsubscribeHandler called when client unsubscribed from channel, and also when
+// a subscribe attempt allowed by SubscribeHandler ended without becoming a
+// subscription (see UnsubscribeEvent.Subscribed). Every SubscribeHandler call
+// whose SubscribeCallback is invoked with a nil error is followed by exactly one
+// UnsubscribeHandler call for that channel, so per-subscription state created in
+// SubscribeHandler can be released in UnsubscribeHandler. A SubscribeCallback
+// invoked with an error is not followed by UnsubscribeHandler.
+//
+// For an attempt which ended without becoming a subscription, the handler is
+// called from a separate goroutine (never from inside the SubscribeCallback
+// call), possibly after the error reply was sent to the client. A subscribe to
+// the same channel calls SubscribeHandler only after that call was made, so it
+// comes before the SubscribeHandler call of the next attempt on the channel
+// (unless it takes more than 5 seconds: a warning is logged then and
+// SubscribeHandler is called; until all such calls of the client are done, its
+// subscribes don't wait for them). Subscribes to other channels don't wait,
+// unless the client has many such calls in progress. The same holds for the
+// UnsubscribeHandler call of a subscription the server unsubscribes
+// (Client.Unsubscribe, Node.Unsubscribe, expiration, insufficient state); for a
+// client unsubscribe it is made before the reply. This does not apply to
+// server-side subscriptions (Client.Subscribe), which don't call
+// SubscribeHandler.
+//
+// On disconnect, UnsubscribeHandler calls for the connection's subscriptions
+// and the attempts in progress come before DisconnectHandler: Centrifuge waits
+// for subscribes in progress (up to 5 seconds for each, 10 seconds in total),
+// then up to 30 seconds for UnsubscribeHandler calls in progress (a warning is
+// logged then), before calling DisconnectHandler. An attempt whose
+// SubscribeCallback is invoked after that ends after DisconnectHandler. Release
+// per-connection state in DisconnectHandler and per-subscription state in
+// UnsubscribeHandler, in a way which works in either order. If a handler
+// allocates something for an allowed subscription, it should do so before
+// invoking the SubscribeCallback.
 type UnsubscribeHandler func(UnsubscribeEvent)
 
 // DisconnectEvent contains fields related to disconnect event.
@@ -193,10 +281,13 @@ type SubscribeEvent struct {
 	Recoverable bool
 	// JoinLeave is true when Client wants to receive join/leave messages.
 	JoinLeave bool
+	// Type is the subscription type requested by the client (map, presence, etc.).
+	// For regular subscriptions this is SubscriptionTypeStream (zero value).
+	Type SubscriptionType
 }
 
 // SubscribeCallback should be called as soon as handler decides what to do
-// with connection subscribe event.
+// with connection subscribe event, exactly once.
 type SubscribeCallback func(SubscribeReply, error)
 
 // SubscribeReply contains fields determining the reaction on subscribe event.
@@ -209,6 +300,11 @@ type SubscribeReply struct {
 	// SubRefresh handler will be used.
 	ClientSideRefresh bool
 
+	// Publications to include in the subscribe result. These are delivered to the
+	// client as publication events before live publications begin — same mechanism
+	// as recovery publications. Useful for delivering initial state on subscribe.
+	Publications []*Publication
+
 	// SubscriptionReady channel if provided will be closed as soon as Centrifuge
 	// written subscribe reply to the connection, so it's possible to start writing
 	// publications into a channel using experimental Client.WritePublication method.
@@ -217,7 +313,17 @@ type SubscribeReply struct {
 	SubscriptionReady chan struct{}
 }
 
-// SubscribeHandler called when client wants to subscribe on channel.
+// SubscribeHandler called when client wants to subscribe on channel. If the
+// SubscribeCallback is invoked with a nil error, exactly one UnsubscribeHandler
+// call follows for the channel: when the subscription ends, or when the attempt
+// ends without becoming a subscription (UnsubscribeEvent.Subscribed is false
+// then). Note that for map subscriptions SubscribeHandler is called on the first
+// subscribe request only, not on further pagination requests.
+//
+// An unsubscribe of the client from the channel (Client.Unsubscribe,
+// Node.Unsubscribe) waits for the subscribe in progress, up to 5 seconds, and
+// disconnects the client if it does not finish: don't unsubscribe the client
+// from the channel inside SubscribeHandler before invoking the callback.
 type SubscribeHandler func(SubscribeEvent, SubscribeCallback)
 
 // PublishEvent contains fields related to publish event. Note that this event
@@ -252,6 +358,65 @@ type PublishCallback func(PublishReply, error)
 // PublishHandler called when client publishes into channel.
 type PublishHandler func(PublishEvent, PublishCallback)
 
+// MapPublishEvent contains fields related to map publish event.
+type MapPublishEvent struct {
+	// Channel client wants to publish data to.
+	Channel string
+	// Key sent by the client (may be empty if server assigns keys).
+	Key string
+	// Data client wants to publish.
+	Data []byte
+	// ClientInfo about client connection.
+	ClientInfo *ClientInfo
+}
+
+// MapPublishReply contains fields determining the result on map publish.
+type MapPublishReply struct {
+	// Key overrides the key from the client request. If set, this key is used
+	// instead of the one sent by the client. This allows the server to control
+	// key assignment (e.g., set key to client ID for cursor channels).
+	Key string
+	// Options to control map publication.
+	Options MapPublishOptions
+	// Result if set will tell Centrifuge that message already published to
+	// channel by handler code. In this case Centrifuge won't try to publish
+	// into channel again after handler returned MapPublishReply.
+	Result *MapUpdateResult
+}
+
+// MapPublishCallback should be called with MapPublishReply or error.
+type MapPublishCallback func(MapPublishReply, error)
+
+// MapPublishHandler called when client publishes into map channel.
+type MapPublishHandler func(MapPublishEvent, MapPublishCallback)
+
+// MapRemoveEvent contains fields related to map remove event.
+type MapRemoveEvent struct {
+	// Channel client wants to remove a key from.
+	Channel string
+	// Key sent by the client (may be empty if server assigns keys).
+	Key string
+	// ClientInfo about client connection.
+	ClientInfo *ClientInfo
+}
+
+// MapRemoveReply contains fields determining the result on map remove.
+type MapRemoveReply struct {
+	// Key overrides the key from the client request.
+	Key string
+	// Options to control map removal.
+	Options MapRemoveOptions
+	// Result if set will tell Centrifuge that removal already performed
+	// by handler code. In this case Centrifuge won't try to remove again.
+	Result *MapUpdateResult
+}
+
+// MapRemoveCallback should be called with MapRemoveReply or error.
+type MapRemoveCallback func(MapRemoveReply, error)
+
+// MapRemoveHandler called when client wants to remove a key from map channel.
+type MapRemoveHandler func(MapRemoveEvent, MapRemoveCallback)
+
 // SubRefreshEvent contains fields related to subscription refresh event.
 type SubRefreshEvent struct {
 	// ClientSideRefresh is true for refresh initiated by client-side subscription
@@ -273,10 +438,24 @@ type SubRefreshReply struct {
 	ExpireAt int64
 	// Info is a new channel-scope info. Zero value means do not change previous one.
 	Info []byte
-	// ServerTagsFilter is a new server tags filter for the subscription. Nil value means do not
-	// change previous one. Invalid filter, or a filter set on a subscription with negotiated delta,
-	// leads to unsubscribe with insufficient state.
-	ServerTagsFilter *protocol.FilterNode
+	// ServerTagsFilter is an optional updated server-side tags filter, see
+	// SubscribeOptions.ServerTagsFilter. It is applied on both client-side and
+	// server-side subscription refresh. When nil, the existing filter is left
+	// unchanged. When set, Centrifuge compares it with the current filter, and
+	// if different, starts delivering by the new one. A subscription which
+	// can't just switch filters must start over:
+	//   - a map subscription is unsubscribed with UnsubscribeCodeStateInvalidated
+	//     to re-sync its state;
+	//   - a subscription using delta compression is unsubscribed with
+	//     UnsubscribeCodeInsufficient to resubscribe without delta, as delta is
+	//     not negotiated together with a server tags filter;
+	//   - a server-side subscription which needs either is disconnected with
+	//     DisconnectInsufficientState, since a client can't resubscribe to it.
+	// Once a subscription has a server tags filter, it is refused history, as
+	// subscribing with one is. Return the same filter in subscribe or connect
+	// options as on refresh: otherwise every subscription starts without it,
+	// and a server-side delta subscription reconnects on every expiration.
+	ServerTagsFilter *FilterNode
 }
 
 // SubRefreshCallback should be called as soon as handler decides what to do
@@ -450,6 +629,8 @@ type TransportWriteEvent struct {
 	Data []byte
 	// Channel will be set if TransportWriteEvent relates to some channel.
 	Channel string
+	// Key of Publication (optional).
+	Key string
 	// FrameType tells what is being sent inside Data.
 	FrameType protocol.FrameType
 }
@@ -513,3 +694,113 @@ func newCommandProcessedEvent(command *protocol.Command, err error, reply *proto
 // purposes this seems tolerable as commands and replies may be matched by id.
 // Also, carefully read docs for CommandProcessedEvent to avoid possible bugs.
 type CommandProcessedHandler func(*Client, CommandProcessedEvent)
+
+// UntrackEvent contains fields related to an untrack request on a keyed channel.
+type UntrackEvent struct {
+	// Channel client untracked keys from.
+	Channel string
+	// Keys are the keys being untracked.
+	Keys []string
+}
+
+// UntrackHandler called when client untracks keys on a keyed channel.
+type UntrackHandler func(UntrackEvent)
+
+// TrackEvent contains fields related to a track request on a keyed channel.
+// A single request may carry multiple signed batches (e.g. when the SDK
+// replays cached signatures after reconnect) — the handler MUST validate
+// every batch's signature before allowing the track to proceed.
+type TrackEvent struct {
+	Channel string
+	Batches []TrackBatch
+}
+
+// TrackBatch is one signed group of items in a TrackEvent. Each batch
+// carries the FULL set of items its Signature was computed over.
+type TrackBatch struct {
+	Items []TrackItem
+	// Signature is an opaque string sent by the client to prove authorization for
+	// the requested channel and keys in this batch. In Centrifugo this is an HMAC
+	// token generated by the application backend. The handler MUST verify Signature
+	// before allowing the batch to proceed — returning nil error without validation
+	// lets any client subscribe to arbitrary keys, bypassing access control.
+	Signature string
+}
+
+// TrackItem represents a single item being tracked (key + version).
+type TrackItem struct {
+	Key     string
+	Version uint64
+}
+
+// TrackReply contains the reaction to a keyed track event. Batches is parallel
+// to TrackEvent.Batches — len(Batches) MUST equal len(event.Batches).
+type TrackReply struct {
+	Batches []TrackBatchReply
+}
+
+// TrackBatchReply contains the per-batch reaction inside a TrackReply.
+type TrackBatchReply struct {
+	// ExpireAt is the Unix timestamp (seconds) after which the keys in this batch
+	// are considered expired and stop receiving updates. The client must re-track
+	// with a fresh signature to continue.
+	//
+	// Setting a reasonable ExpireAt is important for proper permission control: it
+	// limits how long a client can receive data after a single authorization check.
+	// Without it (ExpireAt=0), a successfully tracked client receives updates
+	// indefinitely — even if the user's access has since been revoked.
+	// A typical value matches the signature/token TTL issued by the backend
+	// (e.g. 5–15 minutes).
+	ExpireAt int64
+}
+
+// TrackCallback should be called with TrackReply or error.
+type TrackCallback func(TrackReply, error)
+
+// TrackHandler is called when a client sends a track request on a shared
+// poll channel. The handler MUST validate every TrackBatch.Signature in
+// TrackEvent.Batches and return an error if any is invalid — this is the
+// sole authorization gate for which keys a client may receive data for.
+// On success, return a TrackReply with one TrackBatchReply per batch
+// (parallel to event.Batches), each with ExpireAt set to bound how long
+// the client may receive updates for that batch without re-authorization.
+type TrackHandler func(TrackEvent, TrackCallback)
+
+// SharedPollEvent contains fields for a shared poll refresh call.
+type SharedPollEvent struct {
+	Channel string
+	Items   []SharedPollItem
+}
+
+// SharedPollItem represents an item being refreshed.
+type SharedPollItem struct {
+	Key     string
+	Version uint64 // 0 when Mode is "versionless"
+}
+
+// SharedPollResult contains the response from a shared poll refresh.
+type SharedPollResult struct {
+	Items []SharedPollRefreshItem
+	// Epoch is the publisher's current epoch for this channel. When set, an
+	// epoch change vs the channel's stored epoch resets all per-key versions
+	// and unsubscribes current subscribers with insufficient-state code,
+	// forcing a fresh subscribe handshake. Empty epoch means no epoch
+	// invalidation logic — pure version comparison.
+	//
+	// Only meaningful for versioned shared-poll channels. Versionless
+	// channels use server-generated channel-level epoch and ignore this.
+	Epoch string
+}
+
+// SharedPollRefreshItem represents a single item in a shared poll refresh response.
+type SharedPollRefreshItem struct {
+	Key      string
+	Data     []byte
+	Version  uint64
+	Removed  bool
+	PrevData []byte
+}
+
+// SharedPollHandler is called by the refresh worker to fetch current item
+// data from the backend. Registered on Node, not per-client.
+type SharedPollHandler func(ctx context.Context, event SharedPollEvent) (SharedPollResult, error)

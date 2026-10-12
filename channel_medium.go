@@ -9,7 +9,8 @@ import (
 	"github.com/centrifugal/centrifuge/internal/timers"
 )
 
-// ChannelMediumOptions configures an optional channel medium layer in Centrifuge.
+// ChannelMediumOptions is an EXPERIMENTAL way to enable using a channel medium layer in Centrifuge.
+// Note, channel medium layer is very unstable at the moment – do not use it in production!
 // Channel medium layer is an optional per-channel intermediary between Broker PUB/SUB and Client
 // connections. This intermediary layer may be used for various per-channel tweaks and optimizations.
 // Channel medium comes with memory overhead depending on ChannelMediumOptions. At the same time, it
@@ -32,7 +33,6 @@ type ChannelMediumOptions struct {
 	// and also opens a road for broadcast tweaks – such as BroadcastDelay and delta between several
 	// publications (deltas require both BroadcastDelay and KeepLatestPublication to be enabled). This costs
 	// additional goroutine.
-	// EXPERIMENTAL: the writer goroutine is not stopped by close() – known goroutine leak, not fixed yet.
 	enableQueue bool
 	// QueueMaxSize is a maximum size of the queue used in channel medium (in bytes). If zero, 16MB default
 	// is used. If max size reached, new publications will be dropped.
@@ -51,8 +51,6 @@ func (o ChannelMediumOptions) isMediumEnabled() bool {
 	return o.SharedPositionSync || o.KeepLatestPublication || o.enableQueue || o.broadcastDelay > 0
 }
 
-// Keep global to save 8 byte per-channel. Must be only changed by tests.
-var channelMediumTimeNow = time.Now
 
 // channelMedium is initialized when first subscriber comes into channel, and dropped as soon as last
 // subscriber leaves the channel on the Node.
@@ -60,6 +58,7 @@ type channelMedium struct {
 	channel string
 	node    nodeSubset
 	options ChannelMediumOptions
+	isMap   bool
 
 	mu      sync.RWMutex
 	closeCh chan struct{}
@@ -72,6 +71,10 @@ type channelMedium struct {
 	latestPublication *Publication
 	// positionCheckTime is a time (Unix Nanoseconds) when last position check was performed.
 	positionCheckTime int64
+	// nowFn is the clock used by this medium. Defaults to time.Now in
+	// newChannelMedium; tests override it on the medium instance instead of
+	// mutating a package-level variable (which races with parallel readers).
+	nowFn func() time.Time
 	// cachedTop is the last stream top fetched by a position check, cachedAt is the time (Unix Nanoseconds)
 	// of that fetch. cachedAt is zero until the first fetch.
 	cachedTop StreamPosition
@@ -84,11 +87,20 @@ type channelMedium struct {
 	// valid when hasSuspect is true.
 	suspectTop StreamPosition
 	hasSuspect bool
+	// regressTop is a stream top seen while the stream top was behind lastPosition in the same epoch, and a
+	// client was ahead of it. Only valid when hasRegress is true. A second consecutive fetch with the same
+	// regression confirms it (broker lost the stream tail, epoch kept).
+	regressTop StreamPosition
+	hasRegress bool
+	// markerTop is the stream top the last insufficient state marker set lastPosition to. Cleared together
+	// with hasRegress when lastPosition changes epoch.
+	markerTop StreamPosition
 }
 
 type nodeSubset interface {
 	handlePublication(ch string, sp StreamPosition, pub, prevPub *Publication, localPrevPub *Publication) error
 	streamTop(ch string, historyMetaTTL time.Duration) (StreamPosition, error)
+	mapStreamTop(ch string) (StreamPosition, error)
 }
 
 func newChannelMedium(channel string, node nodeSubset, options ChannelMediumOptions) (*channelMedium, error) {
@@ -96,12 +108,13 @@ func newChannelMedium(channel string, node nodeSubset, options ChannelMediumOpti
 		return nil, errors.New("broadcast delay can only be used with queue enabled")
 	}
 	c := &channelMedium{
-		channel:           channel,
-		node:              node,
-		options:           options,
-		closeCh:           make(chan struct{}),
-		positionCheckTime: channelMediumTimeNow().UnixNano(),
+		channel: channel,
+		node:    node,
+		options: options,
+		closeCh: make(chan struct{}),
+		nowFn:   time.Now,
 	}
+	c.positionCheckTime = c.nowFn().UnixNano()
 	if options.enableQueue {
 		c.messages = newPublicationQueue(2)
 		go c.writer()
@@ -122,7 +135,7 @@ const defaultChannelLayerQueueMaxSize = 16 * 1024 * 1024
 func (c *channelMedium) broadcastPublication(pub *Publication, sp StreamPosition, delta bool, prevPub *Publication) {
 	bp := queuedPub{pub: pub, sp: sp, prevPub: prevPub, delta: delta}
 	c.mu.Lock()
-	c.positionCheckTime = channelMediumTimeNow().UnixNano()
+	c.positionCheckTime = c.nowFn().UnixNano()
 	c.mu.Unlock()
 
 	if c.options.enableQueue {
@@ -144,7 +157,7 @@ func (c *channelMedium) broadcastPublication(pub *Publication, sp StreamPosition
 func (c *channelMedium) broadcastInsufficientState() {
 	bp := queuedPub{prevPub: nil, isInsufficientState: true}
 	c.mu.Lock()
-	c.positionCheckTime = channelMediumTimeNow().UnixNano()
+	c.positionCheckTime = c.nowFn().UnixNano()
 	c.mu.Unlock()
 	if c.options.enableQueue {
 		// TODO: possibly support c.messages.dropQueued() for this path ?
@@ -168,7 +181,11 @@ func (c *channelMedium) broadcast(qp queuedPub) {
 	prevPub := qp.prevPub
 	var localPrevPub *Publication
 	useLocalLatestPub := c.options.KeepLatestPublication && !qp.isInsufficientState
-	if useLocalLatestPub && qp.delta {
+	if useLocalLatestPub && qp.delta && qp.pub.Key == "" {
+		// Only provide localPrevPub for non-map publications. For map subs,
+		// keys are independent streams — a single latestPublication can't serve
+		// as a correct delta base across different keys. Map subs rely on the
+		// broker-level prevPub (positioned path) for delta instead.
 		localPrevPub = c.latestPublication
 	}
 	if c.options.broadcastDelay > 0 && !c.options.KeepLatestPublication {
@@ -186,15 +203,14 @@ func (c *channelMedium) broadcast(qp queuedPub) {
 		// Monotone within an epoch: a publication that was still in flight when a marker moved lastPosition
 		// to the stream top must not move it back.
 		if !c.hasLast || spToBroadcast.Epoch != c.lastPosition.Epoch || spToBroadcast.Offset > c.lastPosition.Offset {
-			c.lastPosition = spToBroadcast
-			c.hasLast = true
+			c.setLastPositionLocked(spToBroadcast)
 		}
 		if c.hasSuspect && spToBroadcast.Epoch == c.suspectTop.Epoch && spToBroadcast.Offset >= c.suspectTop.Offset {
 			c.hasSuspect = false
 		}
 	}
 	c.mu.Unlock()
-	if useLocalLatestPub {
+	if useLocalLatestPub && qp.pub.Key == "" {
 		c.latestPublication = qp.pub
 	}
 }
@@ -266,8 +282,10 @@ func (c *channelMedium) waitSendPub(delay time.Duration) bool {
 //   - an invalid client is marked individually only when the node delivered something it lacks, or when its
 //     epoch differs from the stream top and the node is not suspect. Otherwise the client is behind only
 //     because the node is, and the node-wide marker covers it.
-func (c *channelMedium) CheckPosition(historyMetaTTL time.Duration, clientPosition StreamPosition, checkDelay time.Duration) (checked bool, validPosition bool, err error) {
-	nowUnixNano := channelMediumTimeNow().UnixNano()
+// posTime is the client's positionCheckTime in Unix seconds: a client ahead of the stream top is only
+// invalid when the top was fetched after the client was last checked or delivered to.
+func (c *channelMedium) CheckPosition(historyMetaTTL time.Duration, clientPosition StreamPosition, checkDelay time.Duration, posTime int64) (checked bool, validPosition bool, err error) {
+	nowUnixNano := c.nowFn().UnixNano()
 	c.mu.Lock()
 	needFetch := nowUnixNano-c.positionCheckTime >= checkDelay.Nanoseconds()
 	if needFetch {
@@ -296,9 +314,18 @@ func (c *channelMedium) CheckPosition(historyMetaTTL time.Duration, clientPositi
 		}
 		streamTop = c.cachedTop
 	}
-	if clientPosition.Epoch == streamTop.Epoch && clientPosition.Offset >= streamTop.Offset {
+	sameEpoch := clientPosition.Epoch == streamTop.Epoch
+	if sameEpoch && clientPosition.Offset == streamTop.Offset {
 		c.mu.Unlock()
 		return true, true, nil
+	}
+	if sameEpoch && clientPosition.Offset > streamTop.Offset {
+		validPosition, markerSent := c.checkAheadLocked(clientPosition, streamTop, needFetch, posTime)
+		c.mu.Unlock()
+		if markerSent {
+			c.broadcastInsufficientState()
+		}
+		return true, validPosition, nil
 	}
 
 	// Floor is what the Node is known to have delivered. Without a broadcast the client position is used.
@@ -316,9 +343,9 @@ func (c *channelMedium) CheckPosition(historyMetaTTL time.Duration, clientPositi
 			// Subscribers are about to resync from the stream top, so the Node is considered up to it.
 			// Without this the same gap would be re-confirmed on every interval while the channel is quiet.
 			if !c.hasLast || streamTop.Epoch != c.lastPosition.Epoch || streamTop.Offset > c.lastPosition.Offset {
-				c.lastPosition = streamTop
-				c.hasLast = true
+				c.setLastPositionLocked(streamTop)
 			}
+			c.markerTop = streamTop
 			c.mu.Unlock()
 			c.broadcastInsufficientState()
 			return true, false, nil
@@ -338,20 +365,80 @@ func (c *channelMedium) CheckPosition(historyMetaTTL time.Duration, clientPositi
 	return true, true, nil
 }
 
-// streamTopWithRetry fetches stream top, retrying once on error.
+// checkAheadLocked resolves a client which is ahead of the stream top in the same epoch. Must be called with
+// c.mu held. Returns whether the client is valid and whether an insufficient state marker must be broadcast
+// (after c.mu is released).
+//
+// Channel level (R1), once per actual fetch: the Node is behind the stream top when the top is behind
+// lastPosition in the same epoch. The first sighting only marks it suspect. A second consecutive fetch with
+// the same top confirms it: lastPosition moves to the top and the marker is broadcast.
+//
+// Client level (R2): a client at or behind what the Node delivered is valid, as R1 owns that case. Otherwise
+// it is valid only when the top was not fetched after the client was last checked or delivered to.
+func (c *channelMedium) checkAheadLocked(clientPosition, streamTop StreamPosition, needFetch bool, posTime int64) (bool, bool) {
+	if needFetch {
+		brokerBehindNode := c.hasLast && streamTop.Epoch == c.lastPosition.Epoch && streamTop.Offset < c.lastPosition.Offset
+		if !brokerBehindNode {
+			c.hasRegress = false
+		} else if c.hasRegress && c.regressTop.Epoch == streamTop.Epoch {
+			c.hasRegress = false
+			c.setLastPositionLocked(streamTop)
+			c.markerTop = streamTop
+			return false, true
+		} else {
+			c.regressTop = streamTop
+			c.hasRegress = true
+		}
+	}
+	deliveredByNode := c.hasLast && clientPosition.Epoch == c.lastPosition.Epoch && clientPosition.Offset <= c.lastPosition.Offset
+	if deliveredByNode {
+		return true, false
+	}
+	fetchedAfterClient := c.cachedAt >= (posTime+1)*int64(time.Second)
+	return !fetchedAfterClient, false
+}
+
+// setLastPositionLocked sets lastPosition. Must be called with c.mu held. Regression state is only meaningful
+// within one epoch, so a change of epoch clears it.
+func (c *channelMedium) setLastPositionLocked(sp StreamPosition) {
+	if c.hasLast && sp.Epoch != c.lastPosition.Epoch {
+		c.hasRegress = false
+		c.markerTop = StreamPosition{}
+	}
+	c.lastPosition = sp
+	c.hasLast = true
+}
+
+// streamTopWithRetry fetches stream top of the channel (map stream top for map mediums), retrying once on error.
 func (c *channelMedium) streamTopWithRetry(historyMetaTTL time.Duration) (StreamPosition, error) {
-	streamTop, err := c.node.streamTop(c.channel, historyMetaTTL)
+	streamTop, err := c.fetchStreamTop(historyMetaTTL)
 	if err != nil {
-		streamTop, err = c.node.streamTop(c.channel, historyMetaTTL)
+		streamTop, err = c.fetchStreamTop(historyMetaTTL)
 	}
 	return streamTop, err
 }
 
-// close only closes closeCh and is called when the medium is removed from the Node. A publication that still
-// reaches a closed medium (it was fetched before the removal) is benign: it is broadcast to a hub that has no
-// subscribers for the channel anymore.
+func (c *channelMedium) fetchStreamTop(historyMetaTTL time.Duration) (StreamPosition, error) {
+	if c.isMap {
+		return c.node.mapStreamTop(c.channel)
+	}
+	return c.node.streamTop(c.channel, historyMetaTTL)
+}
+
+// close is called when the medium is removed from the Node. A publication that still reaches a closed medium
+// (it was fetched before the removal) is benign: it is broadcast to a hub that has no subscribers for the
+// channel anymore.
 func (c *channelMedium) close() {
 	close(c.closeCh)
+	// Unblock the writer goroutine. publicationQueue.Wait sleeps on a
+	// sync.Cond and is woken only by an Add (cnt > 0) or Close (broadcast).
+	// closeCh is checked only inside the broadcastDelay timer branch, which
+	// is unreachable until Wait returns — so without closing the queue the
+	// writer goroutine sits forever on an empty channel and leaks for every
+	// channelMedium that ever existed.
+	if c.messages != nil {
+		c.messages.Close()
+	}
 }
 
 type queuedPublication struct {

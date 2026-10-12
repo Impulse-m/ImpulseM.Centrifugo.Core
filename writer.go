@@ -46,7 +46,30 @@ func newWriter(config writerConfig, queueInitialCap int) *writer {
 
 const (
 	defaultMaxMessagesInFrame = 16
+
+	// defaultQueueShrinkDelay is used when a batching writer does not specify
+	// QueueShrinkDelay. Shrink is evaluated straight after a drain, when the
+	// queue is empty by construction, so shrinking on the spot discards the ring
+	// the writer had just filled and the next frame rebuilds it by doubling.
+	// Deferring the decision lets it settle: under load the timer keeps
+	// resetting, and once the connection goes quiet it fires and the capacity is
+	// released in full. Callers wanting the old immediate behaviour pass a
+	// negative QueueShrinkDelay.
+	defaultQueueShrinkDelay = time.Second
 )
+
+// effectiveShrinkDelay resolves the configured QueueShrinkDelay. Zero means
+// "unset" and gets defaultQueueShrinkDelay; a negative value means the caller
+// explicitly wants the queue shrunk immediately after every drain.
+func effectiveShrinkDelay(configured time.Duration) time.Duration {
+	if configured == 0 {
+		return defaultQueueShrinkDelay
+	}
+	if configured < 0 {
+		return 0
+	}
+	return configured
+}
 
 func (w *writer) waitSendMessage(maxMessagesInFrame int, writeDelay time.Duration, shrinkDelay time.Duration) bool {
 	// Wait for message from the queue.
@@ -109,21 +132,45 @@ func (w *writer) waitSendMessage(maxMessagesInFrame int, writeDelay time.Duratio
 		return true
 	}
 
-	// No batching - use RemoveMany which handles shrinking automatically.
+	// No batching. Drain into a pooled buffer rather than letting the queue
+	// allocate a fresh []Item per drain (RemoveMany does), which on the
+	// broadcast path is an allocation per drain per connection. Shrink stays
+	// inline in the same critical section, so timing and lock traffic match
+	// RemoveMany exactly: shrinkDelay is deliberately NOT consulted here —
+	// QueueShrinkDelay is documented to apply only when WriteDelay > 0, and
+	// routing this path through FinishCollect would both start honouring it and
+	// arm/Reset a timer on every drain.
 	w.mu.Lock()
-	defer w.mu.Unlock()
 
-	items, ok := w.messages.RemoveMany(maxMessagesInFrame)
+	bufSize := maxMessagesInFrame
+	if bufSize < 0 { // Unlimited, just use current length.
+		bufSize = w.messages.Len()
+		if bufSize == 0 {
+			w.mu.Unlock()
+			return !w.messages.Closed()
+		}
+	}
+
+	itemBuf := getItemBuf(bufSize)
+	buf := itemBuf.B
+
+	n, ok := w.messages.RemoveManyIntoShrink(buf, bufSize)
 	if !ok {
+		putItemBuf(itemBuf)
+		w.mu.Unlock()
 		return !w.messages.Closed()
 	}
 
+	items := buf[:n]
 	var writeErr error
-	if len(items) == 1 {
+	if n == 1 {
 		writeErr = w.config.WriteFn(items[0])
 	} else {
 		writeErr = w.config.WriteManyFn(items...)
 	}
+
+	putItemBuf(itemBuf)
+	w.mu.Unlock()
 
 	if writeErr != nil {
 		// Write failed, transport must close itself, here we just return from routine.
@@ -139,6 +186,7 @@ func (w *writer) run(writeDelay time.Duration, maxMessagesInFrame int, shrinkDel
 	if maxMessagesInFrame == 0 {
 		maxMessagesInFrame = defaultMaxMessagesInFrame
 	}
+	shrinkDelay = effectiveShrinkDelay(shrinkDelay)
 
 	// Timer-driven mode for writeDelay > 0 and useWriteTimer: non-blocking, triggered by enqueue.
 	if writeDelay > 0 && useWriteTimer {
@@ -286,6 +334,13 @@ func (w *writer) enqueueMany(item ...queue.Item) *Disconnect {
 }
 
 func (w *writer) close(flushRemaining bool) error {
+	return w.closeWithLast(nil, flushRemaining)
+}
+
+// closeWithLast closes the writer like close, and with flushRemaining writes
+// last (if not nil) after the remaining messages: nothing can be written after
+// it, an enqueue fails once the queue is closed.
+func (w *writer) closeWithLast(last *queue.Item, flushRemaining bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -300,6 +355,9 @@ func (w *writer) close(flushRemaining bool) error {
 
 	if flushRemaining {
 		remaining := w.messages.CloseRemaining()
+		if last != nil {
+			remaining = append(remaining, *last)
+		}
 		if len(remaining) > 0 {
 			_ = w.config.WriteManyFn(remaining...)
 		}

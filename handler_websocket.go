@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/centrifugal/centrifuge/internal/cancelctx"
@@ -17,6 +18,17 @@ import (
 	"github.com/centrifugal/protocol"
 	"github.com/maypok86/otter/v2"
 )
+
+// defaultWebsocketDecompressedMessageSizeLimitMultiplier is the default factor
+// applied to MessageSizeLimit to derive the maximum allowed decompressed
+// message size when permessage-deflate compression is negotiated and
+// WebsocketConfig.DecompressedMessageSizeLimit is not set explicitly.
+// MessageSizeLimit alone only bounds the compressed bytes received on the wire,
+// so a small compressed frame could otherwise be inflated into a much larger
+// amount of memory (a "decompression bomb"). The multiplier leaves generous
+// headroom for legitimately compressible messages while still rejecting
+// extreme expansion ratios.
+const defaultWebsocketDecompressedMessageSizeLimitMultiplier = 10
 
 // WebsocketConfig represents config for WebsocketHandler.
 type WebsocketConfig struct {
@@ -38,7 +50,19 @@ type WebsocketConfig struct {
 
 	// MessageSizeLimit sets the maximum size in bytes of allowed message from client.
 	// By default, 65536 bytes (64KB) will be used.
+	// Note that with Compression enabled this only bounds the compressed bytes
+	// received on the wire - see DecompressedMessageSizeLimit which bounds the
+	// size after decompression.
 	MessageSizeLimit int
+
+	// DecompressedMessageSizeLimit sets the maximum size in bytes of a single
+	// message after permessage-deflate decompression. It only has an effect when
+	// Compression is enabled. MessageSizeLimit alone bounds only the compressed
+	// bytes received on the wire, so without this limit a small compressed frame
+	// could be inflated into a much larger amount of memory (a "decompression
+	// bomb"). When set to zero (the default) the limit is derived from
+	// MessageSizeLimit multiplied by 10 (const multiplier).
+	DecompressedMessageSizeLimit int
 
 	// WriteTimeout is maximum time of write message operation.
 	// Slow client will be disconnected.
@@ -74,6 +98,34 @@ type WebsocketConfig struct {
 	// When true, only HTTP/2 Extended CONNECT is accepted (EnableHTTP2ExtendedConnect
 	// must be true, otherwise no connections will be accepted).
 	DisableHTTP1Upgrade bool
+
+	// ProcessCommandsOffReadLoop makes each connection's read loop hand every
+	// frame to a short-lived goroutine and wait for it, instead of processing the
+	// frame itself.
+	//
+	// It exists to keep the read loop's goroutine stack small. Command
+	// processing runs the whole dispatch chain - handlers, publish, broker,
+	// broadcast fan-out - and a goroutine's stack only ever grows to the deepest
+	// call it makes and is not given back while the goroutine lives. A read loop
+	// that has processed one command therefore keeps that peak stack for as long
+	// as the connection is open, even while completely idle. Moving the work to a
+	// goroutine that exits afterwards returns the deep stack to the runtime's
+	// stack cache, where connections reuse it instead of each owning one.
+	//
+	// The trade is one goroutine start and two scheduler handoffs per frame.
+	// That is a latency cost, not a throughput one: it is visible on a
+	// connection that sends a command and waits for the reply with nothing else
+	// going on, and it disappears once many connections are busy at the same
+	// time, where the handoff overlaps with other work. Under that kind of load
+	// per-connection memory is lower as well, because only the connections
+	// actually mid-frame hold a deep stack rather than every one of them.
+	//
+	// Ordering is unaffected: the read loop waits for each frame to finish
+	// before reading the next.
+	//
+	// Off by default. It suits large pools of mostly-idle connections, where it
+	// roughly halves the read loop's stack.
+	ProcessCommandsOffReadLoop bool
 
 	PingPongConfig
 }
@@ -171,11 +223,22 @@ func (s *WebsocketHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		writeTimeout = 1 * time.Second
 	}
 	messageSizeLimit := s.config.MessageSizeLimit
-	if messageSizeLimit == 0 {
+	if messageSizeLimit <= 0 {
 		messageSizeLimit = 65536 // 64KB
 	}
-	if messageSizeLimit > 0 {
-		conn.SetReadLimit(int64(messageSizeLimit))
+	conn.SetReadLimit(int64(messageSizeLimit))
+	// The stream command decoder parses decoded command bytes, so it is bounded
+	// by the decompressed message size when compression is enabled, otherwise by
+	// the wire message size. It must be positive - the decoder rejects a
+	// non-positive limit.
+	decoderMessageSizeLimit := int64(messageSizeLimit)
+	if compression {
+		decompressedMessageSizeLimit := s.config.DecompressedMessageSizeLimit
+		if decompressedMessageSizeLimit <= 0 {
+			decompressedMessageSizeLimit = messageSizeLimit * defaultWebsocketDecompressedMessageSizeLimitMultiplier
+		}
+		conn.SetDecompressedReadLimit(int64(decompressedMessageSizeLimit))
+		decoderMessageSizeLimit = int64(decompressedMessageSizeLimit)
 	}
 
 	if useFramePingPong {
@@ -196,6 +259,14 @@ func (s *WebsocketHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	handleConn := func() {
+		// Registered first so it runs last, after any teardown close frame has
+		// been written. Only server-sent (outgoing) close codes are recorded -
+		// client-supplied codes are skipped to keep metric cardinality bounded.
+		defer func() {
+			if code, incoming := conn.CloseCode(); code != 0 && !incoming {
+				s.node.IncTransportOutgoingClose(transportWebsocket, code)
+			}
+		}()
 		opts := websocketTransportOptions{
 			pingPong:           s.config.PingPongConfig,
 			writeTimeout:       writeTimeout,
@@ -236,6 +307,13 @@ func (s *WebsocketHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			}(time.Now())
 		}
 
+		// Allocated once per connection when enabled, so handing a frame off
+		// costs a goroutine but no allocation. See ProcessCommandsOffReadLoop.
+		var handoff *frameHandoff
+		if s.config.ProcessCommandsOffReadLoop {
+			handoff = newFrameHandoff(c, decoderMessageSizeLimit)
+		}
+
 		for {
 			_, r, err := conn.NextReader()
 			if err != nil {
@@ -244,7 +322,12 @@ func (s *WebsocketHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 				}
 				break
 			}
-			proceed := HandleReadFrame(c, r)
+			var proceed bool
+			if handoff != nil {
+				proceed = handoff.handle(r)
+			} else {
+				proceed = HandleReadFrame(c, r, decoderMessageSizeLimit)
+			}
 			if !proceed {
 				break
 			}
@@ -272,22 +355,71 @@ func (s *WebsocketHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// frameHandoff runs HandleReadFrame on a goroutine other than the one that owns
+// the connection's read loop, one goroutine per frame, and lets the read loop
+// wait for the result.
+//
+// It is a struct with a method rather than a closure so that handing off costs
+// nothing beyond the goroutine itself: the reader and the result channel live
+// here for the lifetime of the connection, and `go h.run()` on an
+// already-heap-allocated receiver allocates no closure per frame.
+//
+// Only the read loop writes r, and it does so before starting run and does not
+// touch it again until run has sent on done, so the two goroutines never race.
+type frameHandoff struct {
+	c                *Client
+	r                io.Reader
+	done             chan bool
+	messageSizeLimit int64
+}
+
+func newFrameHandoff(c *Client, messageSizeLimit int64) *frameHandoff {
+	return &frameHandoff{c: c, done: make(chan bool, 1), messageSizeLimit: messageSizeLimit}
+}
+
+func (h *frameHandoff) run() {
+	h.done <- HandleReadFrame(h.c, h.r, h.messageSizeLimit)
+}
+
+// handle processes one frame off the read loop and reports whether the
+// connection should keep reading.
+func (h *frameHandoff) handle(r io.Reader) bool {
+	h.r = r
+	go h.run()
+	proceed := <-h.done
+	// Drop the reader: it is only valid until the next NextReader call, and
+	// holding it would keep the frame's buffers reachable while idle.
+	h.r = nil
+	return proceed
+}
+
 // HandleReadFrame is a helper to read Centrifuge commands from frame-based io.Reader and
 // process them. Frame-based means that EOF treated as the end of the frame, not the entire
 // connection close.
-func HandleReadFrame(c *Client, r io.Reader) bool {
+//
+// messageSizeLimit bounds the size of a single command and must be positive: the
+// underlying stream decoder rejects a non-positive limit, since the length prefix
+// is attacker-controlled and used as an allocation size. Callers pass the
+// transport's configured limit (coerced to a positive default).
+func HandleReadFrame(c *Client, r io.Reader, messageSizeLimit int64) bool {
 	protoType := c.Transport().Protocol().toProto()
-	decoder := protocol.GetStreamCommandDecoder(protoType, r)
+	decoder := protocol.GetStreamCommandDecoderLimited(protoType, r, messageSizeLimit)
 	defer protocol.PutStreamCommandDecoder(protoType, decoder)
 
 	hadCommands := false
+	// Accumulated so the frame can be observed as a whole. The per-command
+	// counters cannot answer what a frame weighs, because the protocol batches:
+	// one frame routinely carries a connect plus every subscribe.
+	frameSize := 0
 
 	for {
 		cmd, cmdProtocolSize, err := decoder.Decode()
 		if cmd != nil {
 			hadCommands = true
+			frameSize += cmdProtocolSize
 			proceed := c.HandleCommand(cmd, cmdProtocolSize)
 			if !proceed {
+				c.node.metrics.observeTransportFrameSize(c.transport.Name(), frameSize, c)
 				return false
 			}
 		}
@@ -299,13 +431,17 @@ func HandleReadFrame(c *Client, r io.Reader) bool {
 					return false
 				}
 				break
-			} else {
-				c.node.logger.log(newLogEntry(LogLevelInfo, "error reading command", map[string]any{"client": c.ID(), "user": c.UserID(), "error": err.Error()}))
-				c.Disconnect(DisconnectBadRequest)
-				return false
 			}
+			// A frame that failed to decode part-way still cost what was read.
+			if hadCommands {
+				c.node.metrics.observeTransportFrameSize(c.transport.Name(), frameSize, c)
+			}
+			c.node.logger.log(newLogEntry(LogLevelInfo, "error reading command", map[string]any{"client": c.ID(), "user": c.UserID(), "error": err.Error()}))
+			c.Disconnect(DisconnectBadRequest)
+			return false
 		}
 	}
+	c.node.metrics.observeTransportFrameSize(c.transport.Name(), frameSize, c)
 	return true
 }
 
@@ -323,6 +459,34 @@ type websocketTransport struct {
 	opts            websocketTransportOptions
 	nativePingTimer *time.Timer
 	closed          bool
+	// compression encodes outgoing frames once a connection has negotiated
+	// dictionary compression. Client installs it while handling the connect
+	// command, so it is read atomically on the write path.
+	compression atomic.Pointer[DictionaryConnection]
+	// compressionPending holds the encoder for exactly one frame - the connect
+	// reply, which carries the dictionary and so must itself go out
+	// uncompressed. The first write moves it into compression.
+	compressionPending atomic.Pointer[DictionaryConnection]
+}
+
+// SetDictionaryCompression installs the engine's per-connection encoder. It
+// starts encoding from the frame after the next one, because the next one is
+// the connect reply carrying the dictionary. Implements DictionaryAwareTransport.
+func (t *websocketTransport) SetDictionaryCompression(cc DictionaryConnection) {
+	t.compressionPending.Store(&cc)
+}
+
+// CloseDictionaryCompression hands the codec its last call. It also covers a
+// connection that never wrote a frame after the connect reply, whose codec is
+// therefore still sitting in compressionPending having never been promoted.
+func (t *websocketTransport) CloseDictionaryCompression() {
+	if ccp := t.compression.Swap(nil); ccp != nil {
+		(*ccp).Close()
+		return
+	}
+	if ccp := t.compressionPending.Swap(nil); ccp != nil {
+		(*ccp).Close()
+	}
 }
 
 type websocketTransportOptions struct {
@@ -397,14 +561,48 @@ func (t *websocketTransport) PingPongConfig() PingPongConfig {
 }
 
 func (t *websocketTransport) writeData(data []byte) error {
+	if ccp := t.compression.Load(); ccp != nil {
+		// Compressed output makes permessage-deflate pointless, and writeFrame
+		// bypasses it for binary frames.
+		out, binary := (*ccp).Encode(data)
+		return t.writeFrame(out, binary)
+	}
+	// This is the frame that carries the dictionary, so it goes out raw and
+	// arms compression for everything after it. That ordering is what lets the
+	// client decode every later frame without a negotiation window.
+	//
+	// Loaded before it is swapped, and the load is what almost every frame in
+	// almost every deployment executes. A bare Swap here reads the same but is a
+	// locked read-modify-write on every frame of every connection - measured at
+	// 1.70ns against 0.51ns - which is a cost paid forever by everyone who never
+	// turns this feature on. The promotion itself happens once per connection.
+	if t.compressionPending.Load() != nil {
+		if p := t.compressionPending.Swap(nil); p != nil {
+			t.compression.Store(p)
+		}
+	}
+	return t.writeFrame(data, false)
+}
+
+// writeFrame puts one frame on the wire. binary forces a binary WebSocket
+// message, which compressed frames need even on a JSON connection.
+func (t *websocketTransport) writeFrame(data []byte, binary bool) error {
 	usePreparedMessage := t.conn.IsCompressionNegotiated()
-	if t.opts.compressionMinSize > 0 {
+	if binary {
+		// Prepared messages were tried here: dictionary-compressed frames are
+		// byte-identical across connections, so they look like ideal candidates.
+		// Measured, it changed nothing - 9.59 against 9.60 core-seconds per
+		// million deliveries - because the cost is the write syscall itself, not
+		// building the frame header. Not worth the extra parameter.
+		usePreparedMessage = false
+		t.conn.EnableWriteCompression(false)
+	} else if t.opts.compressionMinSize > 0 {
 		enableCompression := len(data) > t.opts.compressionMinSize
 		usePreparedMessage = enableCompression
 		t.conn.EnableWriteCompression(enableCompression)
 	}
 	var messageType = websocket.TextMessage
-	if t.Protocol() == ProtocolTypeProtobuf {
+	if binary || t.Protocol() == ProtocolTypeProtobuf {
 		messageType = websocket.BinaryMessage
 	}
 	if t.opts.writeTimeout > 0 {
@@ -436,18 +634,27 @@ func (t *websocketTransport) writeData(data []byte) error {
 		}
 	}
 
-	if t.opts.writeTimeout > 0 {
-		_ = t.conn.SetWriteDeadline(time.Time{})
-		if t.opts.protoMajor > 1 {
-			// For HTTP/2 connections, we need to actually clear the deadline on the underlying
-			// connection. The websocket Conn.SetWriteDeadline only sets a field, but doesn't
-			// clear the deadline that was already set on the underlying net.Conn during write.
-			// This is critical for HTTP/2 ResponseController where expired deadlines cannot be
-			// extended and will cause the stream to fail permanently.
-			_ = t.conn.NetConn().SetWriteDeadline(time.Time{})
-		}
-	}
+	t.clearWriteDeadline()
 	return nil
+}
+
+// clearWriteDeadline resets the write deadline set before a write. It must be
+// called after every write that armed a deadline (both data writes and frame
+// control writes such as pings), otherwise on HTTP/2 a lingering expired
+// deadline makes all subsequent writes fail permanently.
+func (t *websocketTransport) clearWriteDeadline() {
+	if t.opts.writeTimeout <= 0 {
+		return
+	}
+	_ = t.conn.SetWriteDeadline(time.Time{})
+	if t.opts.protoMajor > 1 {
+		// For HTTP/2 connections, we need to actually clear the deadline on the underlying
+		// connection. The websocket Conn.SetWriteDeadline only sets a field, but doesn't
+		// clear the deadline that was already set on the underlying net.Conn during write.
+		// This is critical for HTTP/2 ResponseController where expired deadlines cannot be
+		// extended and will cause the stream to fail permanently.
+		_ = t.conn.NetConn().SetWriteDeadline(time.Time{})
+	}
 }
 
 // Write data to transport.
@@ -544,6 +751,18 @@ func (t *websocketTransport) ping() {
 		if err != nil {
 			_ = t.Close(DisconnectWriteError)
 			return
+		}
+		// WriteControl arms a write deadline directly on the underlying connection
+		// (not on the gorilla writeDeadline field that conn.SetWriteDeadline writes).
+		// On HTTP/2 that lingering deadline must be cleared, otherwise once expired
+		// it cannot be extended by a later write and the stream fails permanently.
+		// Clear only the underlying deadline here: calling conn.SetWriteDeadline
+		// (as the shared clearWriteDeadline does) would write the gorilla
+		// writeDeadline field concurrently with the writer goroutine, which is a
+		// data race — that field is not safe for concurrent use. On HTTP/1 the next
+		// data write re-arms the deadline, so nothing needs clearing.
+		if t.opts.writeTimeout > 0 && t.opts.protoMajor > 1 {
+			_ = t.conn.NetConn().SetWriteDeadline(time.Time{})
 		}
 		t.addPing()
 	}

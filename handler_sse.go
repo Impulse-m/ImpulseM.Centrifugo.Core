@@ -43,11 +43,17 @@ const connectUrlParam = "cf_connect"
 const defaultMaxSSEBodySize = 64 * 1024
 
 func (h *SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	_, ok := w.(http.Flusher)
-	if !ok {
+	if !supportsFlushing(w) {
 		h.node.logger.log(newErrorLogEntry(errors.New("not http.Flusher"), "SSE: ResponseWriter is not a Flusher", map[string]any{}))
 		http.Error(w, "expected http.ResponseWriter to be http.Flusher", http.StatusInternalServerError)
 		return
+	}
+
+	// messageSizeLimit bounds both the request body and a single decoded command;
+	// it must be positive since the stream decoder rejects a non-positive limit.
+	messageSizeLimit := h.config.MaxRequestBodySize
+	if messageSizeLimit <= 0 {
+		messageSizeLimit = defaultMaxSSEBodySize
 	}
 
 	var requestData []byte
@@ -61,16 +67,12 @@ func (h *SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else if r.Method == http.MethodPost {
-		maxBytesSize := h.config.MaxRequestBodySize
-		if maxBytesSize == 0 {
-			maxBytesSize = defaultMaxSSEBodySize
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, int64(maxBytesSize))
+		r.Body = http.MaxBytesReader(w, r.Body, int64(messageSizeLimit))
 		var err error
 		requestData, err = io.ReadAll(r.Body)
 		if err != nil {
 			h.node.logger.log(newLogEntry(LogLevelInfo, "error reading sse request body", map[string]any{"error": err.Error()}))
-			if len(requestData) >= maxBytesSize {
+			if len(requestData) >= messageSizeLimit {
 				w.WriteHeader(http.StatusRequestEntityTooLarge)
 				return
 			}
@@ -128,7 +130,7 @@ func (h *SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = rc.SetWriteDeadline(time.Time{})
 
 	reader := readerpool.GetBytesReader(requestData)
-	_ = HandleReadFrame(c, reader)
+	_ = HandleReadFrame(c, reader, int64(messageSizeLimit))
 	readerpool.PutBytesReader(reader)
 
 	sendAck := func() {

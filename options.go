@@ -28,6 +28,15 @@ func WithIdempotencyKey(key string) PublishOption {
 	}
 }
 
+// WithKey sets a key for the publication. When set, the publication is associated
+// with a specific key within the channel. This may enable per-key debouncing or
+// channel level per-key batching. The key is delivered to subscribers in the Publication.
+func WithKey(key string) PublishOption {
+	return func(opts *PublishOptions) {
+		opts.Key = key
+	}
+}
+
 // WithDelta tells Broker to use delta streaming.
 func WithDelta(enabled bool) PublishOption {
 	return func(opts *PublishOptions) {
@@ -82,6 +91,49 @@ func WithVersion(version uint64, versionEpoch string) PublishOption {
 	}
 }
 
+// SubscriptionType defines the type of subscription.
+type SubscriptionType int32
+
+const (
+	// SubscriptionTypeStream is a regular PUB/SUB subscription (default).
+	SubscriptionTypeStream SubscriptionType = 0
+	// SubscriptionTypeMap is a map subscription with keyed state.
+	SubscriptionTypeMap SubscriptionType = 1
+	// SubscriptionTypeMapClients is a client presence subscription on a map channel.
+	SubscriptionTypeMapClients SubscriptionType = 2
+	// SubscriptionTypeMapUsers is a user presence subscription on a map channel.
+	SubscriptionTypeMapUsers SubscriptionType = 3
+	// SubscriptionTypeSharedPoll is a shared poll subscription.
+	SubscriptionTypeSharedPoll SubscriptionType = 4
+)
+
+// IsMapPresence reports whether t is a map presence subscription type
+// (SubscriptionTypeMapClients or SubscriptionTypeMapUsers).
+func (t SubscriptionType) IsMapPresence() bool {
+	return t == SubscriptionTypeMapClients || t == SubscriptionTypeMapUsers
+}
+
+func (t SubscriptionType) String() string {
+	switch t {
+	case SubscriptionTypeStream:
+		return "stream"
+	case SubscriptionTypeMap:
+		return "map"
+	case SubscriptionTypeMapClients:
+		return "map_clients"
+	case SubscriptionTypeMapUsers:
+		return "map_users"
+	case SubscriptionTypeSharedPoll:
+		return "shared_poll"
+	default:
+		return "unknown"
+	}
+}
+
+// FilterNode is a filter expression tree for matching against key-value tags.
+// Used for server-side publication filtering (ServerTagsFilter in SubscribeOptions).
+type FilterNode = protocol.FilterNode
+
 // SubscribeOptions define per-subscription options.
 type SubscribeOptions struct {
 	// clientID to subscribe.
@@ -125,6 +177,23 @@ type SubscribeOptions struct {
 	Data []byte
 	// RecoverSince will try to subscribe a client and recover from a certain StreamPosition.
 	RecoverSince *StreamPosition
+	// AutoCacheRecover, when set, makes Centrifuge initiate cache recovery for a subscription
+	// even if the client did not request it (i.e. without a recover flag/position in the
+	// subscribe request). It applies to both client-initiated and server-side subscriptions and
+	// requires EnableRecovery to be set.
+	//
+	// AutoCacheRecover only takes effect in cache recovery mode (RecoveryModeCache): there it
+	// delivers the latest publication on each (re)subscribe regardless of position, which is
+	// especially useful for unidirectional clients with server-side subscriptions that can't
+	// request recovery themselves, or to avoid requiring an empty "since" on the client.
+	//
+	// In stream recovery mode AutoCacheRecover is ignored: forcing recovery without a client
+	// position can't preserve continuity (there is no baseline to compare against), and the
+	// cache-style "deliver latest" semantics don't map onto a stream. To recover a stream
+	// subscription use the client recover flag/position, or SubscribeOptions.RecoverSince for a
+	// specific position; to deliver an initial backlog use SubscribeReply.Publications.
+	// AutoCacheRecover is also ignored for map subscriptions.
+	AutoCacheRecover bool
 
 	// HistoryMetaTTL allows to override default (set in Config.HistoryMetaTTL) history
 	// meta information expiration time.
@@ -148,10 +217,52 @@ type SubscribeOptions struct {
 	// Important note here, since channel permissions are managed on channel level, tags filtering
 	// must be used as a bandwidth optimization, not an access control mechanism.
 	AllowTagsFilter bool
-	// ServerTagsFilter is a publication filter by tags set by the server. Publications not matching
-	// it are never delivered to the client. Client can not widen this filter: if AllowTagsFilter is
-	// true, client-side filter can only narrow it. Delta compression is not negotiated when set.
-	ServerTagsFilter *protocol.FilterNode
+	// ServerTagsFilter is a server-controlled tags filter applied to publications before delivery.
+	// Unlike AllowTagsFilter (which enables client-side filtering), this filter is set by the server
+	// (via subscribe proxy or JWT) and cannot be overridden by the client. When both server and
+	// client filters are set, they are applied independently (AND semantics). ServerTagsFilter
+	// can not be used together with Delta Compression in subscription. History is not filtered
+	// by it, so a subscription with ServerTagsFilter is refused history requests; recovery on
+	// subscribe applies the filter and stays the way to get missed publications.
+	ServerTagsFilter *FilterNode
+
+	// Type defines the subscription type. Use SubscriptionTypeMap for map subscriptions.
+	// For regular subscriptions this can be left as zero value (SubscriptionTypeStream).
+	Type SubscriptionType
+	// MapClientPresenceChannel is the full channel name for client presence.
+	// When set, client presence will be published to this channel on subscribe.
+	// Empty string means no client presence publishing.
+	MapClientPresenceChannel string
+	// MapUserPresenceChannel is the full channel name for user presence.
+	// When set, user presence will be published to this channel on subscribe.
+	// Empty string means no user presence publishing.
+	MapUserPresenceChannel string
+	// MapRemoveClientOnUnsubscribe enables automatic cleanup of map state when the
+	// subscription ends – the key matching current client ID will be removed.
+	// This is useful for ephemeral state like cursor positions or temporary resources
+	// that should not persist after the client leaves.
+	MapRemoveClientOnUnsubscribe bool
+	// ClientPublishDebounceInterval when > 0, included in the subscribe result
+	// as publish_debounce (milliseconds). The SDK debounces client-initiated publishes
+	// to this channel locally.
+	ClientPublishDebounceInterval time.Duration
+	// labelFilter narrows the subscribe to a subset of the user's connections by
+	// matching against Client.Labels (the full map set via ConnectReply.Labels —
+	// NOT only the keys whitelisted in MetricsConfig.ClientLabels). A user with
+	// multiple connections may end up partially subscribed; non-matching
+	// connections are left untouched. Subscribe never removes an existing
+	// subscription from a non-matching connection. Combined with clientID and
+	// sessionID using AND semantics. A malformed filter causes Node.Subscribe
+	// to return an error. Nil means no label filtering. Set via WithSubscribeLabelFilter.
+	labelFilter *FilterNode
+	// allUsers changes the meaning of an empty userID passed to Node.Subscribe.
+	// By default an empty userID targets the anonymous-user bucket (connections
+	// established without authentication). When allUsers is true and userID is
+	// empty, Subscribe instead iterates every connection on every node — useful
+	// for fleet-wide ops combined with labelFilter (e.g. "subscribe all EU pro
+	// users to a new channel"). When userID is non-empty this option has no
+	// effect: the per-user path is always taken. Set via WithSubscribeAllUsers.
+	allUsers bool
 }
 
 // SubscribeOption is a type to represent various Subscribe options.
@@ -250,6 +361,15 @@ func WithRecoverSince(since *StreamPosition) SubscribeOption {
 	}
 }
 
+// WithAutoCacheRecover allows setting SubscribeOptions.AutoCacheRecover. It makes Centrifuge
+// initiate cache recovery for a subscription even if the client did not request it. See
+// SubscribeOptions.AutoCacheRecover for details.
+func WithAutoCacheRecover(enabled bool) SubscribeOption {
+	return func(opts *SubscribeOptions) {
+		opts.AutoCacheRecover = enabled
+	}
+}
+
 // WithSubscribeSource allows setting SubscribeOptions.Source.
 func WithSubscribeSource(source uint8) SubscribeOption {
 	return func(opts *SubscribeOptions) {
@@ -261,6 +381,26 @@ func WithSubscribeSource(source uint8) SubscribeOption {
 func WithSubscribeHistoryMetaTTL(metaTTL time.Duration) SubscribeOption {
 	return func(opts *SubscribeOptions) {
 		opts.HistoryMetaTTL = metaTTL
+	}
+}
+
+// WithSubscribeLabelFilter restricts the subscribe to connections whose
+// Client.Labels match the filter. See SubscribeOptions.LabelFilter for the
+// detailed contract.
+func WithSubscribeLabelFilter(f *FilterNode) SubscribeOption {
+	return func(opts *SubscribeOptions) {
+		opts.labelFilter = f
+	}
+}
+
+// WithSubscribeAllUsers changes the meaning of an empty userID passed to
+// Node.Subscribe from "anonymous bucket only" to "all users including
+// anonymous." It is a no-op when userID is non-empty — the per-user path
+// is always taken in that case. Typically combined with
+// WithSubscribeLabelFilter to narrow the fleet-wide dispatch.
+func WithSubscribeAllUsers(enabled bool) SubscribeOption {
+	return func(opts *SubscribeOptions) {
+		opts.allUsers = enabled
 	}
 }
 
@@ -277,6 +417,16 @@ type RefreshOptions struct {
 	clientID string
 	// sessionID to refresh.
 	sessionID string
+	// labelFilter narrows the refresh to a subset of the user's connections by
+	// matching against Client.Labels (the full map set via ConnectReply.Labels —
+	// NOT only the keys whitelisted in MetricsConfig.ClientLabels). A user with
+	// multiple connections may end up partially refreshed. Combined with clientID
+	// and sessionID using AND semantics. A malformed filter causes Node.Refresh
+	// to return an error. Nil means no label filtering. Set via WithRefreshLabelFilter.
+	labelFilter *FilterNode
+	// allUsers changes the meaning of an empty userID passed to Node.Refresh.
+	// See SubscribeOptions.allUsers for the contract. Set via WithRefreshAllUsers.
+	allUsers bool
 }
 
 // RefreshOption is a type to represent various Refresh options.
@@ -318,6 +468,24 @@ func WithRefreshInfo(info []byte) RefreshOption {
 	}
 }
 
+// WithRefreshLabelFilter restricts the refresh to connections whose
+// Client.Labels match the filter. See RefreshOptions.LabelFilter for the
+// detailed contract.
+func WithRefreshLabelFilter(f *FilterNode) RefreshOption {
+	return func(opts *RefreshOptions) {
+		opts.labelFilter = f
+	}
+}
+
+// WithRefreshAllUsers changes the meaning of an empty userID passed to
+// Node.Refresh from "anonymous bucket only" to "all users including
+// anonymous." It is a no-op when userID is non-empty.
+func WithRefreshAllUsers(enabled bool) RefreshOption {
+	return func(opts *RefreshOptions) {
+		opts.allUsers = enabled
+	}
+}
+
 // UnsubscribeOptions ...
 type UnsubscribeOptions struct {
 	// clientID to unsubscribe.
@@ -326,6 +494,18 @@ type UnsubscribeOptions struct {
 	sessionID string
 	// custom unsubscribe object.
 	unsubscribe *Unsubscribe
+	// labelFilter narrows the unsubscribe to a subset of the user's connections
+	// by matching against Client.Labels (the full map set via ConnectReply.Labels
+	// — NOT only the keys whitelisted in MetricsConfig.ClientLabels). When the
+	// channel argument is empty (unsubscribe from all channels), the filter still
+	// applies and narrows which connections are affected. Combined with clientID
+	// and sessionID using AND semantics. A malformed filter causes
+	// Node.Unsubscribe to return an error. Nil means no label filtering.
+	// Set via WithUnsubscribeLabelFilter.
+	labelFilter *FilterNode
+	// allUsers changes the meaning of an empty userID passed to Node.Unsubscribe.
+	// See SubscribeOptions.allUsers for the contract. Set via WithUnsubscribeAllUsers.
+	allUsers bool
 }
 
 // UnsubscribeOption is a type to represent various Unsubscribe options.
@@ -354,6 +534,24 @@ func WithCustomUnsubscribe(unsubscribe Unsubscribe) UnsubscribeOption {
 	}
 }
 
+// WithUnsubscribeLabelFilter restricts the unsubscribe to connections whose
+// Client.Labels match the filter. See UnsubscribeOptions.LabelFilter for the
+// detailed contract.
+func WithUnsubscribeLabelFilter(f *FilterNode) UnsubscribeOption {
+	return func(opts *UnsubscribeOptions) {
+		opts.labelFilter = f
+	}
+}
+
+// WithUnsubscribeAllUsers changes the meaning of an empty userID passed to
+// Node.Unsubscribe from "anonymous bucket only" to "all users including
+// anonymous." It is a no-op when userID is non-empty.
+func WithUnsubscribeAllUsers(enabled bool) UnsubscribeOption {
+	return func(opts *UnsubscribeOptions) {
+		opts.allUsers = enabled
+	}
+}
+
 // DisconnectOptions define some fields to alter behaviour of Disconnect operation.
 type DisconnectOptions struct {
 	// Disconnect represents custom disconnect to use.
@@ -365,6 +563,17 @@ type DisconnectOptions struct {
 	clientID string
 	// sessionID to disconnect.
 	sessionID string
+	// labelFilter narrows the disconnect to a subset of the user's connections by
+	// matching against Client.Labels (the full map set via ConnectReply.Labels —
+	// NOT only the keys whitelisted in MetricsConfig.ClientLabels). Combined with
+	// ClientWhitelist, clientID and sessionID using AND semantics — a connection
+	// must clear every set check to be disconnected. A malformed filter causes
+	// Node.Disconnect to return an error. Nil means no label filtering.
+	// Set via WithDisconnectLabelFilter.
+	labelFilter *FilterNode
+	// allUsers changes the meaning of an empty userID passed to Node.Disconnect.
+	// See SubscribeOptions.allUsers for the contract. Set via WithDisconnectAllUsers.
+	allUsers bool
 }
 
 // DisconnectOption is a type to represent various Disconnect options.
@@ -395,6 +604,24 @@ func WithDisconnectSession(sessionID string) DisconnectOption {
 func WithDisconnectClientWhitelist(whitelist []string) DisconnectOption {
 	return func(opts *DisconnectOptions) {
 		opts.ClientWhitelist = whitelist
+	}
+}
+
+// WithDisconnectLabelFilter restricts the disconnect to connections whose
+// Client.Labels match the filter. See DisconnectOptions.LabelFilter for the
+// detailed contract.
+func WithDisconnectLabelFilter(f *FilterNode) DisconnectOption {
+	return func(opts *DisconnectOptions) {
+		opts.labelFilter = f
+	}
+}
+
+// WithDisconnectAllUsers changes the meaning of an empty userID passed to
+// Node.Disconnect from "anonymous bucket only" to "all users including
+// anonymous." It is a no-op when userID is non-empty.
+func WithDisconnectAllUsers(enabled bool) DisconnectOption {
+	return func(opts *DisconnectOptions) {
+		opts.allUsers = enabled
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/centrifugal/centrifuge/internal/queue"
-	"github.com/centrifugal/centrifuge/internal/timers"
 
 	"github.com/centrifugal/protocol"
 )
@@ -139,7 +138,7 @@ func (c *Client) writeQueueItems(items []queue.Item) error {
 	disconnect := c.messageWriter.enqueueMany(items...)
 	if disconnect != nil {
 		// close in goroutine to not block message broadcast.
-		go func() { _ = c.close(*disconnect) }()
+		c.spawnCloseUnlessClosing(*disconnect)
 		return io.EOF
 	}
 	return nil
@@ -162,16 +161,21 @@ type ChannelBatchConfig struct {
 	FlushLatestPublication bool
 }
 
-// channelWriter buffers queue.Item objects and flushes them after a fixed delay
-// or when a specific batch size is reached.
+// channelWriter buffers queue.Item objects of one channel for one connection
+// and flushes them after a delay or when a specific batch size is reached.
 type channelWriter struct {
-	mu           sync.Mutex
-	buffer       []queue.Item
-	timer        *time.Timer
-	flushFn      func([]queue.Item) error
-	latestOnly   bool
-	latestPub    queue.Item
-	hasLatestPub bool
+	mu      sync.Mutex
+	channel string
+	buffer  []queue.Item
+	// inWindow is true while the writer waits in a batch window of its
+	// channel, which flushes it when the delay has passed.
+	inWindow   bool
+	flushFn    func([]queue.Item) error
+	latestOnly bool
+	// latestPubs tracks the latest publication per key for FlushLatestPublication mode.
+	// Items are ordered by last-update time so that offsets are emitted in ascending order.
+	// For non-map publications (Key=""), all collapse into a single entry under "".
+	latestPubs []queue.Item
 }
 
 // newChannelWriter creates a new channelWriter with the given flush callback.
@@ -179,98 +183,91 @@ func newChannelWriter(flushFn func([]queue.Item) error) *channelWriter {
 	return &channelWriter{flushFn: flushFn}
 }
 
-// close stops the timer and optionally flushes remaining items.
+// close optionally flushes remaining items and drops the rest. A batch window
+// the writer waits in may still flush it later: there is nothing left to
+// flush then.
 func (w *channelWriter) close(flushRemaining bool) {
 	w.mu.Lock()
-	if w.timer != nil {
-		w.timer.Stop()
-		w.timer = nil
-	}
-	if flushRemaining && (len(w.buffer) > 0 || w.hasLatestPub) {
+	if flushRemaining && (len(w.buffer) > 0 || len(w.latestPubs) > 0) {
 		w.flushLocked()
 	}
 	w.buffer = nil
-	w.hasLatestPub = false
+	w.latestPubs = nil
 	w.mu.Unlock()
 }
 
-// Add appends an item to the buffer or records it as the latest publication.
-// It starts a delay timer if this is the first item, and flushes immediately if the batch size is reached.
+// flushWindow flushes the writer when the batch window it waited in has
+// passed its delay.
+func (w *channelWriter) flushWindow() {
+	w.mu.Lock()
+	w.inWindow = false
+	if len(w.buffer) > 0 || len(w.latestPubs) > 0 {
+		w.flushLocked()
+	}
+	w.mu.Unlock()
+}
+
+// Add appends an item to the buffer or records it as the latest publication per key.
+// When FlushLatestPublication is enabled, publications are coalesced by key — only the
+// latest publication for each key is kept. For non-map publications (Key=""), all collapse
+// into a single entry. Items are ordered by last-update time so offsets stay ascending.
+// It flushes immediately if the batch size is reached, otherwise the writer joins the
+// batch window of its channel, which flushes it once the delay has passed.
 func (w *channelWriter) Add(item queue.Item, config ChannelBatchConfig) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.latestOnly = config.FlushLatestPublication
 
-	// If FlushLatestPublication is enabled and this is a publication, keep it separately
 	if config.FlushLatestPublication && item.FrameType == protocol.FrameTypePushPublication {
-		w.latestPub = item
-		w.hasLatestPub = true
+		// Remove existing entry with the same key (if any) to maintain offset order.
+		for i, existing := range w.latestPubs {
+			if existing.Key == item.Key {
+				w.latestPubs = append(w.latestPubs[:i], w.latestPubs[i+1:]...)
+				break
+			}
+		}
+		// Append to the end — latest update has the highest offset.
+		w.latestPubs = append(w.latestPubs, item)
 	} else {
 		w.buffer = append(w.buffer, item)
 	}
 
-	// Total items count includes latestPub if present
-	totalCount := len(w.buffer)
-	if w.hasLatestPub {
-		totalCount++
-	}
+	// Total items count includes all latest pubs.
+	totalCount := len(w.buffer) + len(w.latestPubs)
 
-	// Start timer on first item
-	if config.MaxDelay > 0 && totalCount == 1 && w.timer == nil {
-		w.timer = timers.AcquireTimer(config.MaxDelay)
-		go w.waitTimer(w.timer)
-	}
-
-	// Flush immediately if batch size is reached
+	// Flush immediately if batch size is reached.
 	if config.MaxSize > 0 && int64(totalCount) >= config.MaxSize {
-		if w.timer != nil {
-			w.timer.Stop()
-			w.timer = nil // Set timer to nil so waitTimer knows it was cancelled.
-		}
 		w.flushLocked()
-	}
-}
-
-// waitTimer waits for the timer to fire, then flushes the batch.
-func (w *channelWriter) waitTimer(tm *time.Timer) {
-	<-tm.C // Wait for the timer to fire.
-	timers.ReleaseTimer(tm)
-	w.mu.Lock()
-
-	// If timer was stopped, do nothing
-	if w.timer == nil {
-		w.mu.Unlock()
 		return
 	}
 
-	// Flush if any items exist
-	if len(w.buffer) > 0 || w.hasLatestPub {
-		w.flushLocked()
+	// Wait for the delay in the batch window of the channel. A writer which
+	// flushed for size stays in its window, and what it collects next is
+	// flushed with the window, before the delay has passed for it.
+	if config.MaxDelay > 0 && !w.inWindow {
+		w.inWindow = true
+		channelBatchWindows.join(w.channel, config.MaxDelay, w)
 	}
-	w.timer = nil // Mark the timer as no longer active.
-	w.mu.Unlock()
 }
 
 // flushLocked flushes the current batch. Caller must hold the lock.
 func (w *channelWriter) flushLocked() {
-	// Nothing to do if no items.
-	if len(w.buffer) == 0 && !w.hasLatestPub {
+	if len(w.buffer) == 0 && len(w.latestPubs) == 0 {
 		return
 	}
 
 	var batch []queue.Item
-	// Combine logic: if FlushLatestPublication and a latest publication exists, include all buffered items.
-	// followed by that publication.
-	if w.latestOnly && w.hasLatestPub {
+	if w.latestOnly && len(w.latestPubs) > 0 {
+		// Emit non-publication items first, then per-key latest publications
+		// in last-updated order (ascending offsets).
 		batch = append(batch, w.buffer...)
-		batch = append(batch, w.latestPub)
+		batch = append(batch, w.latestPubs...)
 	} else {
-		// Otherwise, flush everything currently buffered.
 		batch = w.buffer
 	}
 
 	w.buffer = w.buffer[:0]
-	w.hasLatestPub = false
+	w.latestPubs = w.latestPubs[:0]
 	_ = w.flushFn(batch)
 }
 
@@ -310,6 +307,7 @@ func (pcw *perChannelWriter) getWriter(channel string) *channelWriter {
 		w, exists = pcw.writers[channel]
 		if !exists {
 			w = newChannelWriter(pcw.flushFn)
+			w.channel = channel
 			pcw.writers[channel] = w
 		}
 		pcw.mu.Unlock()
@@ -333,6 +331,71 @@ func (pcw *perChannelWriter) Add(item queue.Item, ch string, config ChannelBatch
 	w.Add(item, config)
 }
 
+// batchWindows holds the open batch windows of channels. The writers of all
+// connections subscribed to a channel which wait for the same delay wait in
+// one window, flushed by one timer, rather than each arming a timer of its
+// own: a publication into a channel with many subscribers would otherwise
+// start a timer and a goroutine per subscriber.
+//
+// It is shared by all nodes in the process: a window is identified by the
+// channel and the delay, so writers only share a window when they wait for
+// the same delay.
+type batchWindows struct {
+	shards [batchWindowShards]batchWindowShard
+}
+
+const batchWindowShards = 64
+
+type batchWindowShard struct {
+	mu      sync.Mutex
+	windows map[batchWindowKey]*batchWindow
+}
+
+type batchWindowKey struct {
+	channel string
+	delay   time.Duration
+}
+
+type batchWindow struct {
+	writers []*channelWriter
+}
+
+var channelBatchWindows = &batchWindows{}
+
+// join adds the writer to the open window of its channel and delay, opening
+// one when there is none. The window flushes its writers once the delay has
+// passed since it opened, so a writer waits no longer than the delay.
+func (b *batchWindows) join(channel string, delay time.Duration, w *channelWriter) {
+	key := batchWindowKey{channel: channel, delay: delay}
+	shard := &b.shards[index(channel, batchWindowShards)]
+	shard.mu.Lock()
+	if shard.windows == nil {
+		shard.windows = make(map[batchWindowKey]*batchWindow)
+	}
+	window, ok := shard.windows[key]
+	if !ok {
+		window = &batchWindow{}
+		shard.windows[key] = window
+		time.AfterFunc(delay, func() { shard.flush(key, window) })
+	}
+	window.writers = append(window.writers, w)
+	shard.mu.Unlock()
+}
+
+// flush closes the window, so writers which collect items from now on open a
+// new one, and flushes the writers which waited in it. The shard lock is not
+// held while writers flush: a writer joins holding its own lock.
+func (s *batchWindowShard) flush(key batchWindowKey, window *batchWindow) {
+	s.mu.Lock()
+	delete(s.windows, key)
+	writers := window.writers
+	window.writers = nil
+	s.mu.Unlock()
+	for _, w := range writers {
+		w.flushWindow()
+	}
+}
+
 // TimerCanceler is the interface returned from ScheduleTimer which allows the task to be cancelled.
 // EXPERIMENTAL API.
 type TimerCanceler interface {
@@ -341,6 +404,19 @@ type TimerCanceler interface {
 }
 
 // TimerScheduler is the interface for scheduling timers.
+//
+// Callbacks may block: some client periodic operations perform network calls
+// (subscription refresh via RefreshHandler, and — for schedulers that run
+// callbacks on a goroutine shared between connections — anything the
+// application does in AliveHandler). An implementation that runs several
+// connections' callbacks on one goroutine therefore lets a single slow
+// connection delay the others' pings, so it should bound how many callbacks
+// share a goroutine.
+//
+// Centrifuge does not rely on this for presence updates specifically: when a
+// TimerScheduler is set it runs the presence tick on its own goroutine, since
+// that tick calls into PresenceManager/MapBroker on every subscribed channel.
+//
 // EXPERIMENTAL API.
 type TimerScheduler interface {
 	// ScheduleTimer adds a callback for later execution. The TimerCanceler is returned.

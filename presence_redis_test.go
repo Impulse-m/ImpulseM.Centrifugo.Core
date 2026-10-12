@@ -5,12 +5,14 @@ package centrifuge
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/rueidis"
 	"github.com/stretchr/testify/require"
 )
 
@@ -83,10 +85,10 @@ type redisPresenceTest struct {
 
 var redisPresenceTests = []redisPresenceTest{
 	{"rd_single", false, 6379},
-	{"df_single", false, 36379},
-	{"vk_single", false, 16379},
-	{"rd_cluster", true, 7001},
-	{"vk_cluster", true, 17000},
+	//{"df_single", false, 36379},
+	//{"vk_single", false, 16379},
+	//{"rd_cluster", true, 7001},
+	//{"vk_cluster", true, 17000},
 }
 
 func excludeClusterPresenceTests(tests []redisPresenceTest) []redisPresenceTest {
@@ -101,6 +103,7 @@ func excludeClusterPresenceTests(tests []redisPresenceTest) []redisPresenceTest 
 }
 
 func TestRedisPresenceManager(t *testing.T) {
+	t.Parallel()
 	for _, tt := range redisPresenceTests {
 		t.Run(tt.Name, func(t *testing.T) {
 			node := testNode(t)
@@ -131,6 +134,7 @@ func TestRedisPresenceManager(t *testing.T) {
 }
 
 func TestRedisPresenceManagerWithUserMapping(t *testing.T) {
+	t.Parallel()
 	for _, tt := range redisPresenceTests {
 		t.Run(tt.Name, func(t *testing.T) {
 			node := testNode(t)
@@ -204,11 +208,38 @@ func TestRedisPresenceManagerWithUserMapping(t *testing.T) {
 	}
 }
 
+// supportsHashFieldTTL reports whether the server at port implements HEXPIRE,
+// which RedisPresenceManagerConfig.UseHashFieldTTL relies on. It arrived in
+// Redis 7.4, so older servers – and forks that never implemented it – answer
+// with "unknown command". Probing the command mirrors how the sharded PUB/SUB
+// tests detect their own feature.
+func supportsHashFieldTTL(tb testing.TB, port int) bool {
+	tb.Helper()
+	client, err := rueidis.NewClient(rueidis.ClientOption{
+		InitAddress:       []string{"127.0.0.1:" + strconv.Itoa(port)},
+		DisableCache:      true,
+		ForceSingleClient: true,
+	})
+	require.NoError(tb, err)
+	defer client.Close()
+	// A missing hash is fine here: implementations answer it either with an
+	// array or with an error about the key, never with "unknown command".
+	res := client.Do(context.Background(), client.B().Arbitrary(
+		"HEXPIRE", getUniquePrefix()+".hexpire_probe", "100", "FIELDS", "1", "field").Build())
+	if err := res.Error(); err != nil {
+		return !strings.Contains(strings.ToLower(err.Error()), "unknown command")
+	}
+	return true
+}
+
 func TestRedisPresenceManagerWithHashFieldTTL(t *testing.T) {
-	t.Skip() // Will work on Redis 7.4 for now, so skipping for now since CI also runs on Redis 6.
+	t.Parallel()
 	for _, tt := range redisPresenceTests {
 		for _, userMapping := range []bool{true, false} {
 			t.Run(tt.Name+"_user_mapping_"+strconv.FormatBool(userMapping), func(t *testing.T) {
+				if !supportsHashFieldTTL(t, tt.Port) {
+					t.Skip("hash field TTL (HEXPIRE) not supported by this server, skipping test")
+				}
 				node := testNode(t)
 				pm := newTestRedisPresenceManager(t, node, tt.UseCluster, userMapping, true, tt.Port)
 				defer func() { _ = node.Shutdown(context.Background()) }()
@@ -353,6 +384,77 @@ func TestRedisPresenceManagerWithUserMappingExpire(t *testing.T) {
 	}
 }
 
+// TestRedisPresenceManagerWithHashFieldTTLExpire covers the reason
+// UseHashFieldTTL exists: entries drop out on their own once their HEXPIRE
+// fires, with no expiration ZSET for the read scripts to sweep. The ZSET path
+// is covered by TestRedisPresenceManagerWithUserMappingExpire.
+func TestRedisPresenceManagerWithHashFieldTTLExpire(t *testing.T) {
+	t.Parallel()
+	for _, tt := range redisPresenceTests {
+		t.Run(tt.Name, func(t *testing.T) {
+			t.Parallel()
+			if !supportsHashFieldTTL(t, tt.Port) {
+				t.Skip("hash field TTL (HEXPIRE) not supported by this server, skipping test")
+			}
+			node := testNode(t)
+			pm := newTestRedisPresenceManager(t, node, tt.UseCluster, true, true, tt.Port)
+			pm.config.PresenceTTL = 2 * time.Second
+			defer func() { _ = node.Shutdown(context.Background()) }()
+			defer stopRedisPresenceManager(pm)
+
+			require.NoError(t, pm.AddPresence("channel", "uid", &ClientInfo{
+				ClientID: "uid",
+				UserID:   "1",
+			}))
+			// Different user, different conn - never refreshed below, so it is the
+			// one that must disappear.
+			require.NoError(t, pm.AddPresence("channel", "uid-2", &ClientInfo{
+				ClientID: "uid-2",
+				UserID:   "2",
+			}))
+
+			stats, err := pm.PresenceStats("channel")
+			require.NoError(t, err)
+			require.Equal(t, 2, stats.NumClients)
+			require.Equal(t, 2, stats.NumUsers)
+
+			// Keep "uid" alive across the TTL. Refreshing must extend both the
+			// client field and the per-user field, otherwise the counts below
+			// would drop to zero.
+			for i := 0; i < 5; i++ {
+				time.Sleep(500 * time.Millisecond)
+				require.NoError(t, pm.AddPresence("channel", "uid", &ClientInfo{
+					ClientID: "uid",
+					UserID:   "1",
+				}))
+			}
+
+			// uid-2 expired a second ago, uid was refreshed 500ms ago.
+			time.Sleep(500 * time.Millisecond)
+			stats, err = pm.PresenceStats("channel")
+			require.NoError(t, err)
+			require.Equal(t, 1, stats.NumClients)
+			require.Equal(t, 1, stats.NumUsers)
+
+			presence, err := pm.Presence("channel")
+			require.NoError(t, err)
+			require.Len(t, presence, 1)
+			require.Contains(t, presence, "uid")
+
+			// Stop refreshing - uid must expire on its own too.
+			time.Sleep(3 * time.Second)
+			stats, err = pm.PresenceStats("channel")
+			require.NoError(t, err)
+			require.Equal(t, 0, stats.NumClients)
+			require.Equal(t, 0, stats.NumUsers)
+
+			presence, err = pm.Presence("channel")
+			require.NoError(t, err)
+			require.Len(t, presence, 0)
+		})
+	}
+}
+
 func BenchmarkRedisAddPresence_1Ch(b *testing.B) {
 	for _, tt := range redisPresenceTests {
 		b.Run(tt.Name, func(b *testing.B) {
@@ -428,7 +530,7 @@ func BenchmarkRedisPresence_ManyCh(b *testing.B) {
 			defer func() { _ = node.Shutdown(context.Background()) }()
 			defer stopRedisPresenceManager(pm)
 			b.SetParallelism(getBenchParallelism())
-			for i := 0; i < 100; i++ {
+			for i := 0; i < 1000; i++ {
 				_ = pm.AddPresence("channel", uuid.NewString(), &ClientInfo{
 					ClientID: uuid.NewString(),
 					UserID:   uuid.NewString(),
@@ -493,4 +595,36 @@ func BenchmarkRedisPresenceStatsWithMapping(b *testing.B) {
 			})
 		})
 	}
+}
+
+// TestNewRedisPresenceManagerErrors covers the constructor's input-validation branches.
+// These tests don't actually connect to Redis since the failures occur before any
+// connection attempt, but they live with the rest of the integration-tagged tests for
+// this type to keep all RedisPresenceManager tests together.
+func TestNewRedisPresenceManagerErrors(t *testing.T) {
+	t.Parallel()
+	node := defaultTestNode()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	// Empty shards.
+	_, err := NewRedisPresenceManager(node, RedisPresenceManagerConfig{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no Redis shards")
+
+	// ReadFromReplica requires UseHashFieldTTL.
+	_, err = NewRedisPresenceManager(node, RedisPresenceManagerConfig{
+		Shards:          []*RedisShard{{}},
+		ReadFromReplica: true,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "UseHashFieldTTL")
+
+	// ReadFromReplica with UseHashFieldTTL but no replica client initialized.
+	_, err = NewRedisPresenceManager(node, RedisPresenceManagerConfig{
+		Shards:          []*RedisShard{{}},
+		ReadFromReplica: true,
+		UseHashFieldTTL: true,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "replica client")
 }

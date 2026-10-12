@@ -38,6 +38,26 @@ func BenchmarkPerChannelWriter(b *testing.B) {
 	wg.Wait() // Wait for all messages to be flushed.
 }
 
+func BenchmarkPerChannelWriter_FlushLatest(b *testing.B) {
+	const numChannels = 10
+	const numKeys = 50
+
+	flushFn := func(items []queue.Item) error {
+		return nil
+	}
+
+	w := newPerChannelWriter(flushFn)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		channelName := "channel-" + strconv.Itoa(i%numChannels)
+		key := "key-" + strconv.Itoa(i%numKeys)
+		item := queue.Item{Channel: channelName, Key: key, FrameType: protocol.FrameTypePushPublication}
+		w.Add(item, channelName, ChannelBatchConfig{MaxDelay: 10 * time.Millisecond, MaxSize: 128, FlushLatestPublication: true})
+	}
+	w.Close(true)
+}
+
 func TestClientSubscribeReceivePublication_ChannelBatching_Delay(t *testing.T) {
 	t.Parallel()
 	node := defaultTestNode()
@@ -182,6 +202,117 @@ func TestClientSubscribeReceivePublication_ChannelBatching_FlushLatestOnly(t *te
 	}
 }
 
+func TestChannelWriter_FlushLatestPerKey(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var flushed []queue.Item
+
+	w := newChannelWriter(func(items []queue.Item) error {
+		mu.Lock()
+		flushed = append(flushed, items...)
+		mu.Unlock()
+		return nil
+	})
+
+	config := ChannelBatchConfig{
+		FlushLatestPublication: true,
+		MaxDelay:               100 * time.Millisecond,
+	}
+
+	// Publish 3 updates to key "a", 2 updates to key "b", 1 to key "c".
+	w.Add(queue.Item{Data: []byte("a1"), Key: "a", FrameType: protocol.FrameTypePushPublication}, config)
+	w.Add(queue.Item{Data: []byte("b1"), Key: "b", FrameType: protocol.FrameTypePushPublication}, config)
+	w.Add(queue.Item{Data: []byte("a2"), Key: "a", FrameType: protocol.FrameTypePushPublication}, config)
+	w.Add(queue.Item{Data: []byte("c1"), Key: "c", FrameType: protocol.FrameTypePushPublication}, config)
+	w.Add(queue.Item{Data: []byte("b2"), Key: "b", FrameType: protocol.FrameTypePushPublication}, config)
+	w.Add(queue.Item{Data: []byte("a3"), Key: "a", FrameType: protocol.FrameTypePushPublication}, config)
+
+	// Close triggers flush.
+	w.close(true)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Should have 3 items: latest for "c" (unchanged), "b" (updated), "a" (updated last).
+	// Order: "c" stayed at position from first insert, "b" moved after "c", "a" moved to end.
+	require.Len(t, flushed, 3)
+	require.Equal(t, "c", flushed[0].Key)
+	require.Equal(t, []byte("c1"), flushed[0].Data)
+	require.Equal(t, "b", flushed[1].Key)
+	require.Equal(t, []byte("b2"), flushed[1].Data)
+	require.Equal(t, "a", flushed[2].Key)
+	require.Equal(t, []byte("a3"), flushed[2].Data)
+}
+
+func TestChannelWriter_FlushLatestPerKey_EmptyKeyFallback(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var flushed []queue.Item
+
+	w := newChannelWriter(func(items []queue.Item) error {
+		mu.Lock()
+		flushed = append(flushed, items...)
+		mu.Unlock()
+		return nil
+	})
+
+	config := ChannelBatchConfig{
+		FlushLatestPublication: true,
+		MaxDelay:               100 * time.Millisecond,
+	}
+
+	// Regular publications without keys — should coalesce to single latest (backward compat).
+	w.Add(queue.Item{Data: []byte("msg1"), FrameType: protocol.FrameTypePushPublication}, config)
+	w.Add(queue.Item{Data: []byte("msg2"), FrameType: protocol.FrameTypePushPublication}, config)
+	w.Add(queue.Item{Data: []byte("msg3"), FrameType: protocol.FrameTypePushPublication}, config)
+
+	w.close(true)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Should have exactly 1 item — the latest.
+	require.Len(t, flushed, 1)
+	require.Equal(t, []byte("msg3"), flushed[0].Data)
+}
+
+func TestChannelWriter_FlushLatestPerKey_MixedWithNonPub(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var flushed []queue.Item
+
+	w := newChannelWriter(func(items []queue.Item) error {
+		mu.Lock()
+		flushed = append(flushed, items...)
+		mu.Unlock()
+		return nil
+	})
+
+	config := ChannelBatchConfig{
+		FlushLatestPublication: true,
+		MaxDelay:               100 * time.Millisecond,
+	}
+
+	// Mix of join (non-pub, goes to buffer) and keyed publications.
+	w.Add(queue.Item{Data: []byte("join1"), FrameType: protocol.FrameTypePushJoin}, config)
+	w.Add(queue.Item{Data: []byte("a1"), Key: "a", FrameType: protocol.FrameTypePushPublication}, config)
+	w.Add(queue.Item{Data: []byte("a2"), Key: "a", FrameType: protocol.FrameTypePushPublication}, config)
+	w.Add(queue.Item{Data: []byte("b1"), Key: "b", FrameType: protocol.FrameTypePushPublication}, config)
+
+	w.close(true)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// join1 in buffer + 2 per-key pubs. Buffer first, then pubs in last-updated order.
+	require.Len(t, flushed, 3)
+	require.Equal(t, []byte("join1"), flushed[0].Data)
+	require.Equal(t, "a", flushed[1].Key)
+	require.Equal(t, []byte("a2"), flushed[1].Data)
+	require.Equal(t, "b", flushed[2].Key)
+	require.Equal(t, []byte("b1"), flushed[2].Data)
+}
+
 // timerCanceler implements the TimerCanceler interface.
 type timerCanceler struct {
 	timer   *time.Timer
@@ -220,11 +351,18 @@ func TestClientLevelPingCustomTimerScheduler(t *testing.T) {
 	node.timerScheduler = &testTimerScheduler{}
 	defer func() { _ = node.Shutdown(context.Background()) }()
 	done := make(chan struct{})
+	// Short ping/pong durations so the test finishes quickly. The first ping
+	// fires in [PingInterval/2, PingInterval], then PongTimeout starts before
+	// DisconnectNoPong; total ≤ PingInterval + PongTimeout. Test purpose
+	// (custom scheduler is invoked and disconnect fires after the window) is
+	// duration-agnostic.
+	pingInterval := 1 * time.Second
+	pongTimeout := 500 * time.Millisecond
 	node.OnConnecting(func(context.Context, ConnectEvent) (ConnectReply, error) {
 		return ConnectReply{
 			PingPongConfig: &PingPongConfig{
-				PingInterval: 5 * time.Second,
-				PongTimeout:  3 * time.Second,
+				PingInterval: pingInterval,
+				PongTimeout:  pongTimeout,
 			},
 		}, nil
 	})
@@ -242,7 +380,300 @@ func TestClientLevelPingCustomTimerScheduler(t *testing.T) {
 	connectClientV2(t, client)
 	select {
 	case <-done:
-	case <-time.After(9 * time.Second):
+	case <-time.After(pingInterval + pongTimeout + time.Second):
 		t.Fatal("no disconnect in timeout")
+	}
+}
+
+// TestClientWritePublication exercises the experimental WritePublication API for both
+// JSON and Protobuf, bidi and unidirectional. It also verifies the no-subscription error.
+func TestClientWritePublication(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name           string
+		protocolType   ProtocolType
+		unidirectional bool
+	}{
+		{"JSON-bidi", ProtocolTypeJSON, false},
+		{"JSON-uni", ProtocolTypeJSON, true},
+		{"Protobuf-bidi", ProtocolTypeProtobuf, false},
+		{"Protobuf-uni", ProtocolTypeProtobuf, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			node := defaultTestNode()
+			defer func() { _ = node.Shutdown(context.Background()) }()
+
+			ctx, cancelFn := context.WithCancel(context.Background())
+			transport := newTestTransport(cancelFn)
+			transport.setProtocolType(tc.protocolType)
+			transport.setProtocolVersion(ProtocolVersion2)
+			transport.setUnidirectional(tc.unidirectional)
+			sink := make(chan []byte, 16)
+			transport.setSink(sink)
+
+			node.OnConnect(func(c *Client) {
+				c.OnSubscribe(func(_ SubscribeEvent, cb SubscribeCallback) {
+					cb(SubscribeReply{}, nil)
+				})
+			})
+
+			client := newTestConnectedClientWithTransport(t, ctx, node, transport, "user-write-pub")
+			subscribeClientV2(t, client, "writepub")
+
+			// drain any subscribe push.
+			drainTransport(sink, 200*time.Millisecond)
+
+			err := client.WritePublication("writepub",
+				&Publication{Data: []byte(`{"value":"hello"}`)},
+				StreamPosition{},
+			)
+			require.NoError(t, err)
+
+			received := waitForPayload(t, sink, "hello", 2*time.Second)
+			require.True(t, received, "publication payload not delivered")
+
+			// No subscription -> well-formed error returned without disconnecting.
+			err = client.WritePublication("not-subscribed",
+				&Publication{Data: []byte(`{"value":"x"}`)},
+				StreamPosition{},
+			)
+			require.ErrorIs(t, err, errNoSubscription)
+		})
+	}
+}
+
+// TestClientStateSnapshot exercises the StateSnapshot call with and without a handler
+// installed.
+func TestClientStateSnapshot(t *testing.T) {
+	t.Parallel()
+	node := defaultTestNode()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+	client := newTestClient(t, node, "u")
+
+	// No handler -> nil, nil.
+	snap, err := client.StateSnapshot()
+	require.NoError(t, err)
+	require.Nil(t, snap)
+
+	// Handler returns a value.
+	client.OnStateSnapshot(func() (any, error) {
+		return map[string]int{"queue_len": 5}, nil
+	})
+	snap, err = client.StateSnapshot()
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{"queue_len": 5}, snap)
+}
+
+// TestPerChannelWriterDelWriter verifies that delWriter both flushes pending items
+// (when requested) and removes the writer from the per-channel map.
+func TestPerChannelWriterDelWriter(t *testing.T) {
+	t.Parallel()
+
+	flushed := make(chan int, 4)
+	pcw := newPerChannelWriter(func(items []queue.Item) error {
+		flushed <- len(items)
+		return nil
+	})
+
+	// Add an item under one channel and one with no flush requested.
+	pcw.Add(queue.Item{Data: []byte("a")}, "ch1", ChannelBatchConfig{MaxSize: 100, MaxDelay: time.Hour})
+	// Sanity: writer exists.
+	require.NotNil(t, pcw.getWriter("ch1"))
+
+	// delWriter without flushing must drop pending items.
+	pcw.delWriter("ch1", false)
+	select {
+	case <-flushed:
+		t.Fatal("did not expect flush when flushRemaining=false")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Add to a different channel and remove with flush.
+	pcw.Add(queue.Item{Data: []byte("b")}, "ch2", ChannelBatchConfig{MaxSize: 100, MaxDelay: time.Hour})
+	pcw.delWriter("ch2", true)
+	select {
+	case n := <-flushed:
+		require.Equal(t, 1, n)
+	case <-time.After(time.Second):
+		t.Fatal("expected flush of remaining items")
+	}
+
+	// Removing a non-existent channel must be a no-op.
+	pcw.delWriter("never-existed", false)
+	pcw.Close(false)
+}
+
+// BenchmarkChannelBatchFanout measures the channel batching of a publication
+// delivered to many subscribers of one channel: each subscriber's writer gets
+// one item per window. Reported per window: CPU time of the process and
+// allocations, the part that grows with subscribers.
+func BenchmarkChannelBatchFanout(b *testing.B) {
+	const subscribers = 1000
+	config := ChannelBatchConfig{MaxDelay: 200 * time.Microsecond, MaxSize: 128}
+	var wg sync.WaitGroup
+	writers := make([]*perChannelWriter, subscribers)
+	for i := range writers {
+		writers[i] = newPerChannelWriter(func(items []queue.Item) error {
+			for range items {
+				wg.Done()
+			}
+			return nil
+		})
+	}
+	item := queue.Item{Channel: "news", FrameType: protocol.FrameTypePushPublication, Data: []byte("x")}
+	b.ReportAllocs()
+	cpu0 := processCPUTime()
+	for b.Loop() {
+		wg.Add(subscribers)
+		for _, w := range writers {
+			w.Add(item, "news", config)
+		}
+		wg.Wait()
+	}
+	b.ReportMetric(float64((processCPUTime()-cpu0).Nanoseconds())/float64(b.N)/subscribers, "cpu-ns/subscriber")
+	for _, w := range writers {
+		w.Close(false)
+	}
+}
+
+// collectingWriter returns a perChannelWriter which records what it flushes.
+func collectingWriter() (*perChannelWriter, func() []string) {
+	var mu sync.Mutex
+	var flushed []string
+	w := newPerChannelWriter(func(items []queue.Item) error {
+		mu.Lock()
+		for _, item := range items {
+			flushed = append(flushed, string(item.Data))
+		}
+		mu.Unlock()
+		return nil
+	})
+	return w, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), flushed...)
+	}
+}
+
+func pubItem(data string) queue.Item {
+	return queue.Item{FrameType: protocol.FrameTypePushPublication, Data: []byte(data)}
+}
+
+// TestChannelBatchWindow_SharedByWriters checks the writers of one channel
+// waiting for the same delay are flushed together, once the delay has passed,
+// each with its own items.
+func TestChannelBatchWindow_SharedByWriters(t *testing.T) {
+	t.Parallel()
+	channel := "window-shared-" + t.Name()
+	config := ChannelBatchConfig{MaxDelay: 50 * time.Millisecond}
+
+	const writers = 20
+	ws := make([]*perChannelWriter, writers)
+	gets := make([]func() []string, writers)
+	for i := range ws {
+		ws[i], gets[i] = collectingWriter()
+	}
+	started := time.Now()
+	for i, w := range ws {
+		w.Add(pubItem("a"+strconv.Itoa(i)), channel, config)
+		w.Add(pubItem("b"+strconv.Itoa(i)), channel, config)
+	}
+	for i := range ws {
+		require.Empty(t, gets[i](), "flushed before the delay")
+	}
+	require.Eventually(t, func() bool {
+		for i := range ws {
+			if len(gets[i]()) != 2 {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, time.Millisecond)
+	require.GreaterOrEqual(t, time.Since(started), config.MaxDelay)
+	for i := range ws {
+		require.Equal(t, []string{"a" + strconv.Itoa(i), "b" + strconv.Itoa(i)}, gets[i]())
+	}
+}
+
+// TestChannelBatchWindow_DelaysDoNotMix checks writers of one channel waiting
+// for different delays do not share a window: a writer is never held longer
+// than its own delay by another writer's.
+func TestChannelBatchWindow_DelaysDoNotMix(t *testing.T) {
+	t.Parallel()
+	channel := "window-delays-" + t.Name()
+	long, getLong := collectingWriter()
+	short, getShort := collectingWriter()
+	long.Add(pubItem("long"), channel, ChannelBatchConfig{MaxDelay: time.Hour})
+	short.Add(pubItem("short"), channel, ChannelBatchConfig{MaxDelay: 20 * time.Millisecond})
+
+	require.Eventually(t, func() bool { return len(getShort()) == 1 }, 5*time.Second, time.Millisecond)
+	require.Empty(t, getLong())
+	long.Close(false)
+}
+
+// TestChannelBatchWindow_SizeFlushThenDelay checks a writer which flushed for
+// size keeps waiting in its window, and what it collects next is flushed with
+// the window.
+func TestChannelBatchWindow_SizeFlushThenDelay(t *testing.T) {
+	t.Parallel()
+	channel := "window-size-" + t.Name()
+	w, get := collectingWriter()
+	config := ChannelBatchConfig{MaxSize: 2, MaxDelay: 30 * time.Millisecond}
+	w.Add(pubItem("1"), channel, config)
+	w.Add(pubItem("2"), channel, config) // size reached: flushed now
+	require.Equal(t, []string{"1", "2"}, get())
+	w.Add(pubItem("3"), channel, config)
+	require.Eventually(t, func() bool { return len(get()) == 3 }, 5*time.Second, time.Millisecond)
+	require.Equal(t, []string{"1", "2", "3"}, get())
+}
+
+// TestChannelBatchWindow_ClosedWriterNotFlushed checks a writer closed without
+// flushing, while it waits in a window, is not flushed when the window is.
+func TestChannelBatchWindow_ClosedWriterNotFlushed(t *testing.T) {
+	t.Parallel()
+	channel := "window-closed-" + t.Name()
+	config := ChannelBatchConfig{MaxDelay: 20 * time.Millisecond}
+	closed, getClosed := collectingWriter()
+	open, getOpen := collectingWriter()
+	closed.Add(pubItem("dropped"), channel, config)
+	open.Add(pubItem("kept"), channel, config)
+	closed.Close(false)
+
+	require.Eventually(t, func() bool { return len(getOpen()) == 1 }, 5*time.Second, time.Millisecond)
+	require.Empty(t, getClosed())
+}
+
+// TestChannelBatchWindow_Concurrent adds items to many writers of a few
+// channels from many goroutines. Every item must be flushed exactly once, and
+// each writer's items in the order it received them.
+func TestChannelBatchWindow_Concurrent(t *testing.T) {
+	t.Parallel()
+	const writers, items = 50, 200
+	ws := make([]*perChannelWriter, writers)
+	gets := make([]func() []string, writers)
+	for i := range ws {
+		ws[i], gets[i] = collectingWriter()
+	}
+	var wg sync.WaitGroup
+	for i := range ws {
+		wg.Go(func() {
+			channel := "window-concurrent-" + strconv.Itoa(i%3)
+			config := ChannelBatchConfig{MaxDelay: time.Millisecond, MaxSize: 7}
+			for j := range items {
+				ws[i].Add(pubItem(strconv.Itoa(j)), channel, config)
+				if j%50 == 0 {
+					time.Sleep(time.Millisecond)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	for i := range ws {
+		require.Eventually(t, func() bool { return len(gets[i]()) == items }, 5*time.Second, time.Millisecond, "writer %d", i)
+		got := gets[i]()
+		for j := range items {
+			require.Equal(t, strconv.Itoa(j), got[j], "writer %d item %d", i, j)
+		}
 	}
 }

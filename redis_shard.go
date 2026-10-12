@@ -23,6 +23,18 @@ type (
 const (
 	defaultRedisIOTimeout      = 4 * time.Second
 	defaultRedisConnectTimeout = time.Second
+
+	// sentinelTopologyRefreshInterval makes the Sentinel client periodically
+	// re-check its targets with Sentinels instead of relying solely on the
+	// +switch-master event. That event is the only way the client learns about
+	// a failover, and it can be missed — a demoted master keeps its connection
+	// alive and a role change sends no MOVED, so a client which missed the
+	// event stays pinned to a node that is now a read-only replica until
+	// restart. This is easy to hit with a Sentinel co-located with each Redis
+	// node (as in the Bitnami Redis Helm chart), where the client loses its
+	// Sentinel connection at the same moment the master dies and Redis PUB/SUB
+	// does not replay the missed message.
+	sentinelTopologyRefreshInterval = 5 * time.Second
 )
 
 type RedisShard struct {
@@ -222,9 +234,40 @@ func NewRedisShard(_ *Node, conf RedisShardConfig) (*RedisShard, error) {
 		AlwaysPipelining: true,
 		AlwaysRESP2:      conf.ForceRESP2,
 		MaxFlushDelay:    100 * time.Microsecond,
+		// Centrifuge issues Redis commands without per-request context
+		// deadlines and relies on IOTimeout to bound every call. rueidis
+		// retries read-only commands on network errors until the context is
+		// done — which, without a deadline, means a read command issued
+		// during a Redis outage never returns instead of failing within the
+		// IOTimeout envelope like writes do. Disable client-level retries
+		// entirely: Centrifuge surfaces errors to its callers, and reads and
+		// writes should fail the same way.
+		DisableRetry: true,
 		Dialer: net.Dialer{
 			Timeout: conf.ConnectTimeout,
+			// KeepAlive doubles as the rueidis keepalive PING cadence — the
+			// mechanism that detects a silently stalled connection (peer
+			// stops replying while TCP stays open) and errors out every
+			// pending command. Worst-case failure time for a command on a
+			// stalled connection is 2*KeepAlive + IOTimeout: a straggler
+			// reply can make one keepalive tick look active, only the next
+			// tick sends a PING, and the PING waits a full IOTimeout. The
+			// rueidis default of 1s gives 6s with the default 4s IOTimeout;
+			// 400ms keeps the worst case within 5s (4.8s) — the failure-time
+			// envelope Centrifuge callers rely on, since commands are issued
+			// without per-request context deadlines.
+			KeepAlive: 400 * time.Millisecond,
 		},
+	}
+
+	if conf.AuthCredentialsFn != nil {
+		options.AuthCredentialsFn = func(ctx rueidis.AuthCredentialsContext) (rueidis.AuthCredentials, error) {
+			creds, err := conf.AuthCredentialsFn(RedisAuthCredentialsContext{Address: ctx.Address})
+			if err != nil {
+				return rueidis.AuthCredentials{}, err
+			}
+			return rueidis.AuthCredentials{Username: creds.Username, Password: creds.Password}, nil
+		}
 	}
 
 	var isCluster bool
@@ -254,8 +297,11 @@ func NewRedisShard(_ *Node, conf RedisShardConfig) (*RedisShard, error) {
 			addressOpts.ClientOption, addressOpts.IsCluster, addressOpts.IsSentinel, addressOpts.ReplicaClientEnabled
 	}
 
-	if isSentinel && options.Sentinel.MasterSet == "" {
-		return nil, errors.New("sentinel master name must be configured for Redis Sentinel setup")
+	if isSentinel {
+		if options.Sentinel.MasterSet == "" {
+			return nil, errors.New("sentinel master name must be configured for Redis Sentinel setup")
+		}
+		options.Sentinel.TopologyRefreshInterval = sentinelTopologyRefreshInterval
 	}
 
 	client, err := rueidis.NewClient(options)
@@ -362,6 +408,23 @@ type RedisShardConfig struct {
 	// be initialized with the same options as the main client but with ReplicaOnly option
 	// set to true.
 	ReplicaClientEnabled bool
+
+	// AuthCredentialsFn is an optional function to dynamically provide auth credentials.
+	// When set, it is called by the Redis client to obtain credentials for each new connection,
+	// enabling short-lived token-based authentication (e.g. GCP IAM, AWS IAM).
+	AuthCredentialsFn func(RedisAuthCredentialsContext) (RedisAuthCredentials, error)
+}
+
+// RedisAuthCredentialsContext is passed to AuthCredentialsFn.
+type RedisAuthCredentialsContext struct {
+	// Address is the address of the Redis server being connected to.
+	Address net.Addr
+}
+
+// RedisAuthCredentials contains the credentials returned by AuthCredentialsFn.
+type RedisAuthCredentials struct {
+	Username string
+	Password string
 }
 
 type RedisShardMode string
@@ -394,8 +457,15 @@ func (s *RedisShard) string() string {
 }
 
 // consistentIndex is an adapted function from https://github.com/dgryski/go-jump
-// package by Damian Gryski. It consistently chooses a hash bucket number in the
-// range [0, numBuckets) for the given string. numBuckets must be >= 1.
+// package by Damian Gryski. It implements the Jump Consistent Hash algorithm
+// from the Google paper "A Fast, Minimal Memory, Consistent Hash Algorithm"
+// (Lamping & Veach, 2014).
+//
+// It consistently chooses a hash bucket number in the range [0, numBuckets)
+// for the given string. numBuckets must be >= 1.
+//
+// Key property: When adding a shard, only ~1/(n+1) keys are redistributed.
+// This is critical for minimizing data movement when scaling.
 func consistentIndex(s string, numBuckets int) int {
 	hash := fnv.New64a()
 	_, _ = hash.Write([]byte(s))
