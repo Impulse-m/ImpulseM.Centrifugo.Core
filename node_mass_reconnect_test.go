@@ -17,12 +17,14 @@ import (
 )
 
 const (
-	massReconnectChannels      int           = 10
-	massReconnectSubscribers   int           = 200
-	massReconnectPrePubs       int           = 3
-	massReconnectOutagePubs    int           = 2
-	massReconnectCheckDelay    time.Duration = time.Minute
-	massReconnectBrokerLatency time.Duration = 2 * time.Millisecond
+	massReconnectChannels    int           = 10
+	massReconnectSubscribers int           = 200
+	massReconnectPrePubs     int           = 3
+	massReconnectOutagePubs  int           = 2
+	massReconnectCheckDelay  time.Duration = time.Minute
+	// massReconnectBrokerLatency must exceed the time a slow CI runner needs to connect a client, otherwise
+	// recovery calls rarely overlap and the singleflight bound becomes timing dependent.
+	massReconnectBrokerLatency time.Duration = 20 * time.Millisecond
 	// massReconnectClockMargin is added on top of the check delay when advancing the injected clock.
 	// Client positionCheckTime is recorded from wall clock time, so a margin is needed to make the
 	// client-side check independent of whether the burst crossed a wall clock second boundary.
