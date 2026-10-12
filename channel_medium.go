@@ -183,8 +183,12 @@ func (c *channelMedium) broadcast(qp queuedPub) {
 	if qp.isInsufficientState {
 		c.hasSuspect = false
 	} else {
-		c.lastPosition = spToBroadcast
-		c.hasLast = true
+		// Monotone within an epoch: a publication that was still in flight when a marker moved lastPosition
+		// to the stream top must not move it back.
+		if !c.hasLast || spToBroadcast.Epoch != c.lastPosition.Epoch || spToBroadcast.Offset > c.lastPosition.Offset {
+			c.lastPosition = spToBroadcast
+			c.hasLast = true
+		}
 		if c.hasSuspect && spToBroadcast.Epoch == c.suspectTop.Epoch && spToBroadcast.Offset >= c.suspectTop.Offset {
 			c.hasSuspect = false
 		}

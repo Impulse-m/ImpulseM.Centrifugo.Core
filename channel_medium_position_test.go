@@ -151,6 +151,29 @@ func TestSharedPositionSyncNoMarkerLoopAfterRecovery(t *testing.T) {
 	require.Equal(t, 1, p.markers)
 }
 
+func TestChannelMediumLastPositionMonotoneAfterMarker(t *testing.T) {
+	p := newPositionTestMedium(t)
+	p.publish(testPos(6))
+	p.top = testPos(9)
+	p.tick()
+	require.True(t, p.check(t, testPos(6)))
+	p.tick()
+	require.False(t, p.check(t, testPos(6)))
+	require.Equal(t, 1, p.markers)
+
+	lastOffset := func() uint64 {
+		p.medium.mu.Lock()
+		defer p.medium.mu.Unlock()
+		return p.medium.lastPosition.Offset
+	}
+	// A publication still in flight when the marker fired must not move the Node position back.
+	p.publish(testPos(8))
+	require.Equal(t, uint64(9), lastOffset())
+	// A newer publication still advances it.
+	p.publish(testPos(10))
+	require.Equal(t, uint64(10), lastOffset())
+}
+
 func TestChannelMediumLastPositionSetAfterBroadcast(t *testing.T) {
 	p := newPositionTestMedium(t)
 	p.publish(testPos(6))
