@@ -192,21 +192,23 @@ func (c *channelMedium) broadcast(qp queuedPub) {
 		prevPub = nil
 	}
 	_ = c.node.handlePublication(c.channel, spToBroadcast, pubToBroadcast, prevPub, localPrevPub)
-	// Only after handlePublication returns every local subscriber has been updated, so lastPosition is set here.
-	c.mu.Lock()
-	if qp.isInsufficientState {
-		c.hasSuspect = false
-	} else {
-		// Monotone within an epoch: a publication that was still in flight when a marker moved lastPosition
-		// to the stream top must not move it back.
-		if !c.hasLast || spToBroadcast.Epoch != c.lastPosition.Epoch || spToBroadcast.Offset > c.lastPosition.Offset {
-			c.setLastPositionLocked(spToBroadcast)
-		}
-		if c.hasSuspect && spToBroadcast.Epoch == c.suspectTop.Epoch && spToBroadcast.Offset >= c.suspectTop.Offset {
+	if c.options.SharedPositionSync {
+		// Only after handlePublication returns every local subscriber has been updated, so lastPosition is set here.
+		c.mu.Lock()
+		if qp.isInsufficientState {
 			c.hasSuspect = false
+		} else {
+			// Monotone within an epoch: a publication that was still in flight when a marker moved lastPosition
+			// to the stream top must not move it back.
+			if !c.hasLast || spToBroadcast.Epoch != c.lastPosition.Epoch || spToBroadcast.Offset > c.lastPosition.Offset {
+				c.setLastPositionLocked(spToBroadcast)
+			}
+			if c.hasSuspect && spToBroadcast.Epoch == c.suspectTop.Epoch && spToBroadcast.Offset >= c.suspectTop.Offset {
+				c.hasSuspect = false
+			}
 		}
+		c.mu.Unlock()
 	}
-	c.mu.Unlock()
 	if useLocalLatestPub && qp.pub.Key == "" {
 		c.latestPublication = qp.pub
 	}
