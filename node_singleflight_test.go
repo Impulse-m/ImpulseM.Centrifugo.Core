@@ -188,3 +188,26 @@ func TestSingleFlightPresenceStatsMergesConcurrentCalls(t *testing.T) {
 	}
 	require.Greater(t, testutil.ToFloat64(node.metrics.singleflightMergedCount.WithLabelValues("presence_stats")), float64(0))
 }
+
+func TestSingleFlightNotSharedBetweenNodes(t *testing.T) {
+	releaseCh := make(chan struct{})
+	var callsA, callsB int32
+	nodeA := newSingleFlightTestNode(t)
+	nodeA.SetBroker(newBlockingHistoryBroker(releaseCh, &callsA, nil))
+	defer func() { _ = nodeA.Shutdown(t.Context()) }()
+	nodeB := newSingleFlightTestNode(t)
+	nodeB.SetBroker(newBlockingHistoryBroker(releaseCh, &callsB, nil))
+	defer func() { _ = nodeB.Shutdown(t.Context()) }()
+
+	callConcurrently(singleFlightConcurrentCalls, func() { close(releaseCh) }, func(i int) {
+		node := nodeA
+		if i%2 == 1 {
+			node = nodeB
+		}
+		_, err := node.History("singleflight-history-nodes", WithHistoryFilter(HistoryFilter{Limit: 10}))
+		require.NoError(t, err)
+	})
+
+	require.Equal(t, int32(1), atomic.LoadInt32(&callsA))
+	require.Equal(t, int32(1), atomic.LoadInt32(&callsB))
+}

@@ -91,6 +91,11 @@ type Node struct {
 	mediumLocks map[int]*sync.Mutex // Sharded locks for mediums map.
 
 	timerScheduler TimerScheduler
+
+	// Singleflight groups belong to the node, so nodes in one process never share results.
+	presenceGroup      singleflight.Group
+	presenceStatsGroup singleflight.Group
+	historyGroup       singleflight.Group
 }
 
 const (
@@ -1265,12 +1270,6 @@ func (n *Node) removePresence(ch string, clientID string, userID string) error {
 	return presenceManager.RemovePresence(ch, clientID, userID)
 }
 
-var (
-	presenceGroup      singleflight.Group
-	presenceStatsGroup singleflight.Group
-	historyGroup       singleflight.Group
-)
-
 // PresenceResult wraps presence.
 type PresenceResult struct {
 	Presence map[string]*ClientInfo
@@ -1292,7 +1291,7 @@ func (n *Node) Presence(ch string) (PresenceResult, error) {
 	}
 	n.metrics.incActionCount("presence", ch)
 	if n.config.UseSingleFlight {
-		result, err, shared := presenceGroup.Do(ch, func() (any, error) {
+		result, err, shared := n.presenceGroup.Do(ch, func() (any, error) {
 			return n.presence(ch, presenceManager)
 		})
 		if shared {
@@ -1383,7 +1382,7 @@ func (n *Node) PresenceStats(ch string) (PresenceStatsResult, error) {
 	}
 	n.metrics.incActionCount("presence_stats", ch)
 	if n.config.UseSingleFlight {
-		result, err, shared := presenceStatsGroup.Do(ch, func() (any, error) {
+		result, err, shared := n.presenceStatsGroup.Do(ch, func() (any, error) {
 			return n.presenceStats(ch, presenceManager)
 		})
 		if shared {
@@ -1462,7 +1461,7 @@ func (n *Node) History(ch string, opts ...HistoryOption) (HistoryResult, error) 
 		builder.WriteString(historyOpts.MetaTTL.String())
 		key := builder.String()
 
-		result, err, shared := historyGroup.Do(key, func() (any, error) {
+		result, err, shared := n.historyGroup.Do(key, func() (any, error) {
 			return n.history(ch, historyOpts)
 		})
 		if shared {
