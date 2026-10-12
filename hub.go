@@ -183,6 +183,10 @@ func (h *Hub) addSub(ch string, sub subInfo) (int64, bool, error) {
 	return h.subShards[index(ch, numHubShards)].addSub(ch, sub)
 }
 
+func (h *Hub) getSub(ch string, c *Client) (subInfo, bool) {
+	return h.subShards[index(ch, numHubShards)].getSub(ch, c)
+}
+
 // removeSub removes connection from clientHub subscriptions registry.
 func (h *Hub) removeSub(ch string, c *Client) (bool, bool) {
 	return h.subShards[index(ch, numHubShards)].removeSub(ch, c)
@@ -607,6 +611,14 @@ func (s *subShard) addSub(ch string, sub subInfo) (int64, bool, error) {
 		return chanID, true, nil
 	}
 	return chanID, false, nil
+}
+
+func (s *subShard) getSub(ch string, c *Client) (subInfo, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sub, ok := s.subs[ch][c.ID()]
+	return sub, ok
 }
 
 func (s *subShard) removeSubID(ch string) {

@@ -159,6 +159,10 @@ type ChannelContext struct {
 	flags             uint8
 	// Source is a source of subscription application can set in SubscribeHandler.
 	Source uint8
+	// ServerTagsFilter is a server tags filter currently applied to the subscription.
+	ServerTagsFilter *protocol.FilterNode
+	// clientTagsFilter is a tags filter the client provided on subscribe.
+	clientTagsFilter *protocol.FilterNode
 }
 
 func channelHasFlag(flags, flag uint8) bool {
@@ -724,6 +728,10 @@ func (c *Client) checkSubscriptionExpiration(channel string, channelContext Chan
 		cb := func(reply SubRefreshReply, err error) {
 			if err != nil {
 				resultCB(false)
+				return
+			}
+			if !c.updateSubTagsFilter(channel, reply.ServerTagsFilter) {
+				go c.handleInsufficientState(channel, channelHasFlag(channelContext.flags, flagServerSide))
 				return
 			}
 			newExpireAt := min(reply.ExpireAt, nowUnix+maxTTLSeconds)
@@ -1812,6 +1820,51 @@ func (c *Client) getSubscribedChannelContext(channel string) (ChannelContext, bo
 	return ctx, true
 }
 
+// updateSubTagsFilter applies server tags filter from sub refresh reply to the subscription
+// on channel. Returns false if the subscription must be unsubscribed with insufficient state.
+func (c *Client) updateSubTagsFilter(channel string, serverTf *protocol.FilterNode) bool {
+	if serverTf == nil {
+		return true
+	}
+	if err := filter.Validate(serverTf); err != nil {
+		c.node.logger.log(newErrorLogEntry(err, "invalid server tags filter on sub refresh", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+		return false
+	}
+
+	// Subscription lock serializes hub update with addSubscription/removeSubscription, so
+	// the hub entry can't be re-added after the channel has been unsubscribed.
+	mu := c.node.subLock(channel)
+	mu.Lock()
+	defer mu.Unlock()
+
+	c.mu.RLock()
+	chCtx, ok := c.channels[channel]
+	c.mu.RUnlock()
+	if !ok || !channelHasFlag(chCtx.flags, flagSubscribed) {
+		return true
+	}
+	sub, ok := c.node.hub.getSub(channel, c)
+	if !ok {
+		return true
+	}
+	if sub.deltaType != deltaTypeNone {
+		return false
+	}
+	sub.tagsFilter = combineTagsFilters(serverTf, chCtx.clientTagsFilter)
+	if _, _, err := c.node.hub.addSub(channel, sub); err != nil {
+		c.node.logger.log(newErrorLogEntry(err, "error updating subscription", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if currentChCtx, ok := c.channels[channel]; ok {
+		currentChCtx.ServerTagsFilter = serverTf
+		c.channels[channel] = currentChCtx
+	}
+	return true
+}
+
 func (c *Client) handleSubRefresh(req *protocol.SubRefreshRequest, cmd *protocol.Command, started time.Time, rw *replyWriter) error {
 	if c.eventHub.subRefreshHandler == nil {
 		return ErrorNotAvailable
@@ -1850,6 +1903,10 @@ func (c *Client) handleSubRefresh(req *protocol.SubRefreshRequest, cmd *protocol
 		if err != nil {
 			c.writeDisconnectOrErrorFlush(req.Channel, protocol.FrameTypeSubRefresh, cmd, err, started, rw)
 			return
+		}
+
+		if !c.updateSubTagsFilter(channel, reply.ServerTagsFilter) {
+			go c.handleAsyncUnsubscribe(channel, unsubscribeInsufficientState)
 		}
 
 		res := &protocol.SubRefreshResult{}
@@ -2953,6 +3010,29 @@ func isCacheRecovered(
 	return nil, recovered
 }
 
+// combineTagsFilters returns effective tags filter of subscription: server filter
+// is the security boundary and client filter can only narrow it further.
+func combineTagsFilters(serverTf, clientTf *protocol.FilterNode) *tagsFilter {
+	var f *protocol.FilterNode
+	switch {
+	case serverTf != nil && clientTf != nil:
+		f = &protocol.FilterNode{
+			Op:    filter.OpAnd,
+			Nodes: []*protocol.FilterNode{serverTf, clientTf},
+		}
+	case serverTf != nil:
+		f = serverTf
+	case clientTf != nil:
+		f = clientTf
+	default:
+		return nil
+	}
+	return &tagsFilter{
+		filter: f,
+		hash:   filter.Hash(f),
+	}
+}
+
 const (
 	subscriptionFlagChannelCompression = 1 << iota
 )
@@ -2993,6 +3073,14 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 
 	useID := reply.Options.AllowChannelCompaction && req.Flag&subscriptionFlagChannelCompression != 0
 	sub := subInfo{client: c, deltaType: deltaTypeNone, useID: useID}
+	serverTf := reply.Options.ServerTagsFilter
+	if serverTf != nil {
+		if err := filter.Validate(serverTf); err != nil {
+			c.node.logger.log(newErrorLogEntry(err, "invalid server tags filter", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+			return errorDisconnectContext(ErrorInternal, nil)
+		}
+	}
+	var clientTf *protocol.FilterNode
 	if req.Tf != nil {
 		if !reply.Options.AllowTagsFilter {
 			c.node.logger.log(newLogEntry(LogLevelInfo, "tags filter not allowed", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
@@ -3002,11 +3090,9 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 			c.node.logger.log(newLogEntry(LogLevelInfo, "invalid tags filter", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
 			return errorDisconnectContext(ErrorBadRequest, nil)
 		}
-		sub.tagsFilter = &tagsFilter{
-			filter: req.Tf,
-			hash:   filter.Hash(req.Tf),
-		}
+		clientTf = req.Tf
 	}
+	sub.tagsFilter = combineTagsFilters(serverTf, clientTf)
 
 	needPubSubSync := reply.Options.EnablePositioning || reply.Options.EnableRecovery
 	if needPubSubSync {
@@ -3016,7 +3102,8 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 		c.pubSubSync.StartBuffering(channel)
 	}
 
-	if req.Delta != "" {
+	// Delta compression is not negotiated when server tags filter is set.
+	if req.Delta != "" && serverTf == nil {
 		dt := DeltaType(req.Delta)
 		if slices.Contains(reply.Options.AllowedDeltaTypes, dt) {
 			res.Delta = true
@@ -3287,8 +3374,10 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 			Offset: latestOffset,
 			Epoch:  latestEpoch,
 		},
-		metaTTLSeconds: int64(reply.Options.HistoryMetaTTL.Seconds()),
-		Source:         reply.Options.Source,
+		metaTTLSeconds:   int64(reply.Options.HistoryMetaTTL.Seconds()),
+		Source:           reply.Options.Source,
+		ServerTagsFilter: serverTf,
+		clientTagsFilter: clientTf,
 	}
 	if reply.Options.EnableRecovery || reply.Options.EnablePositioning {
 		channelContext.positionCheckTime = time.Now().Unix()

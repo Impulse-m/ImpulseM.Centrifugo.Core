@@ -270,6 +270,10 @@ type SubRefreshReply struct {
 	ExpireAt int64
 	// Info is a new channel-scope info. Zero value means do not change previous one.
 	Info []byte
+	// ServerTagsFilter is a new server tags filter for the subscription. Nil value means do not
+	// change previous one. Invalid filter, or a filter set on a subscription with negotiated delta,
+	// leads to unsubscribe with insufficient state.
+	ServerTagsFilter *protocol.FilterNode
 }
 
 // SubRefreshCallback should be called as soon as handler decides what to do

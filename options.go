@@ -2,6 +2,8 @@ package centrifuge
 
 import (
 	"time"
+
+	"github.com/centrifugal/protocol"
 )
 
 // PublishOption is a type to represent various Publish options.
@@ -146,6 +148,10 @@ type SubscribeOptions struct {
 	// Important note here, since channel permissions are managed on channel level, tags filtering
 	// must be used as a bandwidth optimization, not an access control mechanism.
 	AllowTagsFilter bool
+	// ServerTagsFilter is a publication filter by tags set by the server. Publications not matching
+	// it are never delivered to the client. Client can not widen this filter: if AllowTagsFilter is
+	// true, client-side filter can only narrow it. Delta compression is not negotiated when set.
+	ServerTagsFilter *protocol.FilterNode
 }
 
 // SubscribeOption is a type to represent various Subscribe options.
