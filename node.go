@@ -1282,33 +1282,10 @@ func (n *Node) addSubscription(ch string, sub subInfo) (int64, error) {
 	acceptedLabels := []string{sub.client.metricName, n.metrics.getChannelNamespaceLabel(ch)}
 	n.metrics.subscriptionsAccepted.WithLabelValues(n.metrics.appendClientLabels(acceptedLabels, sub.client)...).Inc()
 	if first {
-		var createdMedium *channelMedium
-		if n.config.GetChannelMediumOptions != nil {
-			mediumOptions := n.config.GetChannelMediumOptions(ch)
-			if mediumOptions.isMediumEnabled() {
-				// Medium may still exist here if its teardown is pending in subDissolver. Keep it: it has been
-				// receiving all channel publications so far, replacing it would leak the old medium.
-				// Mediums of ch are stored and deleted only under subLock(ch), held here, so the check
-				// below cannot race with another creation for the same channel.
-				mediumMu := n.mediumLock(ch)
-				mediumMu.Lock()
-				_, exists := n.mediumShard(ch)[ch]
-				mediumMu.Unlock()
-				if !exists {
-					medium, err := newChannelMedium(ch, n, mediumOptions)
-					if err != nil {
-						n.rollbackSub(ch, sub)
-						return 0, err
-					}
-					medium.isMap = sub.isMap
-					medium.nowFn = n.nowTimeGetter
-					mediumMu.Lock()
-					n.mediumShard(ch)[ch] = medium
-					mediumMu.Unlock()
-					n.metrics.incChannelMediums()
-					createdMedium = medium
-				}
-			}
+		createdMedium, err := n.ensureChannelMedium(ch, sub.isMap)
+		if err != nil {
+			n.rollbackSub(ch, sub)
+			return 0, err
 		}
 
 		// Subscribe to appropriate broker based on subscription type.
@@ -1358,24 +1335,6 @@ func (n *Node) rollbackSub(ch string, sub subInfo) {
 	if empty, _, wasMap := n.hub.removeSub(ch, sub.client, sub.subGen); empty {
 		n.unsubscribeFromBrokerWhenEmpty(ch, wasMap)
 	}
-}
-
-// dropCreatedMedium tears down the medium created by a subscribe that failed to
-// complete. A medium that was already there before (kept for a pending teardown)
-// is left alone. Called with subLock(ch) held. Nil medium is a no-op.
-func (n *Node) dropCreatedMedium(ch string, medium *channelMedium) {
-	if medium == nil {
-		return
-	}
-	mediumMu := n.mediumLock(ch)
-	mediumMu.Lock()
-	defer mediumMu.Unlock()
-	if n.mediumShard(ch)[ch] != medium {
-		return
-	}
-	medium.close()
-	delete(n.mediumShard(ch), ch)
-	n.metrics.decChannelMediums()
 }
 
 // unsubscribeFromBrokerWhenEmpty unsubscribes the channel from its broker once
