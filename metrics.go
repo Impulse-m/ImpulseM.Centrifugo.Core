@@ -121,6 +121,16 @@ type metrics struct {
 	channelMediumsGauge           prometheus.Gauge
 	positionChecksCount           *prometheus.CounterVec
 
+	// Pre-resolved children of the vectors above, one per fixed label combination.
+	singleflightMergedHistory       prometheus.Counter
+	singleflightMergedPresence      prometheus.Counter
+	singleflightMergedPresenceStats prometheus.Counter
+	singleflightMergedMapState      prometheus.Counter
+	singleflightMergedMapStream     prometheus.Counter
+	singleflightMergedMapStats      prometheus.Counter
+	positionChecksShared            positionCheckCounters
+	positionChecksDirect            positionCheckCounters
+
 	messagesReceivedCountPublication prometheus.Counter
 	messagesReceivedCountJoin        prometheus.Counter
 	messagesReceivedCountLeave       prometheus.Counter
@@ -807,12 +817,12 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		Help:      "Number of calls served by a shared in-flight request when UseSingleFlight is enabled.",
 	}, []string{"op"})
 
-	m.singleflightMergedCount.WithLabelValues("history").Add(0)
-	m.singleflightMergedCount.WithLabelValues("presence").Add(0)
-	m.singleflightMergedCount.WithLabelValues("presence_stats").Add(0)
-	m.singleflightMergedCount.WithLabelValues("map_state").Add(0)
-	m.singleflightMergedCount.WithLabelValues("map_stream").Add(0)
-	m.singleflightMergedCount.WithLabelValues("map_stats").Add(0)
+	m.singleflightMergedHistory = m.singleflightMergedCount.WithLabelValues("history")
+	m.singleflightMergedPresence = m.singleflightMergedCount.WithLabelValues("presence")
+	m.singleflightMergedPresenceStats = m.singleflightMergedCount.WithLabelValues("presence_stats")
+	m.singleflightMergedMapState = m.singleflightMergedCount.WithLabelValues("map_state")
+	m.singleflightMergedMapStream = m.singleflightMergedCount.WithLabelValues("map_stream")
+	m.singleflightMergedMapStats = m.singleflightMergedCount.WithLabelValues("map_stats")
 
 	m.channelMediumsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: metricsNamespace,
@@ -828,11 +838,8 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		Help:      "Number of client channel position checks by result. Shared is true when the check was done by the channel medium for all channel subscribers.",
 	}, []string{"result", "shared"})
 
-	for _, result := range []string{"valid", "invalid", "error"} {
-		for _, shared := range []string{"true", "false"} {
-			m.positionChecksCount.WithLabelValues(result, shared).Add(0)
-		}
-	}
+	m.positionChecksShared = newPositionCheckCounters(m.positionChecksCount, "true")
+	m.positionChecksDirect = newPositionCheckCounters(m.positionChecksCount, "false")
 
 	m.pubSubLagHistogram = prometheus.NewHistogramVec(nativeHistogramOpts(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
@@ -1710,10 +1717,6 @@ type tagsFilterDroppedLabels struct {
 	ChannelNamespace string
 }
 
-func (m *metrics) incSingleflightMerged(op string) {
-	m.singleflightMergedCount.WithLabelValues(op).Inc()
-}
-
 func (m *metrics) incChannelMediums() {
 	m.channelMediumsGauge.Inc()
 }
@@ -1722,8 +1725,27 @@ func (m *metrics) decChannelMediums() {
 	m.channelMediumsGauge.Dec()
 }
 
-func (m *metrics) incPositionChecks(result string, shared bool) {
-	m.positionChecksCount.WithLabelValues(result, strconv.FormatBool(shared)).Inc()
+// positionCheckCounters holds pre-resolved position_checks_total counters for one value of the shared label.
+type positionCheckCounters struct {
+	valid   prometheus.Counter
+	invalid prometheus.Counter
+	failed  prometheus.Counter
+}
+
+func newPositionCheckCounters(vec *prometheus.CounterVec, shared string) positionCheckCounters {
+	return positionCheckCounters{
+		valid:   vec.WithLabelValues("valid", shared),
+		invalid: vec.WithLabelValues("invalid", shared),
+		failed:  vec.WithLabelValues("error", shared),
+	}
+}
+
+// forResult returns the counter for a check result.
+func (c positionCheckCounters) forResult(validPosition bool) prometheus.Counter {
+	if validPosition {
+		return c.valid
+	}
+	return c.invalid
 }
 
 func (m *metrics) incTagsFilterDropped(ch string, count int) {

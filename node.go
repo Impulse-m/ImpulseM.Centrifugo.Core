@@ -1611,7 +1611,7 @@ func (n *Node) Presence(ch string) (PresenceResult, error) {
 			return n.presence(ch, presenceManager)
 		})
 		if shared {
-			n.metrics.incSingleflightMerged("presence")
+			n.metrics.singleflightMergedPresence.Inc()
 		}
 		return result.(PresenceResult), err
 	}
@@ -1714,7 +1714,7 @@ func (n *Node) PresenceStats(ch string) (PresenceStatsResult, error) {
 			return n.presenceStats(ch, presenceManager)
 		})
 		if shared {
-			n.metrics.incSingleflightMerged("presence_stats")
+			n.metrics.singleflightMergedPresenceStats.Inc()
 		}
 		return result.(PresenceStatsResult), err
 	}
@@ -1824,7 +1824,7 @@ func (n *Node) historySingleFlight(ch string, opts HistoryOptions) (HistoryResul
 		return n.history(ch, opts)
 	})
 	if shared {
-		n.metrics.incSingleflightMerged("history")
+		n.metrics.singleflightMergedHistory.Inc()
 	}
 	// Return the result even when err != nil: history returns a populated
 	// HistoryResult together with ErrorUnrecoverablePosition, and recovery
@@ -1951,7 +1951,7 @@ func (n *Node) checkPosition(ch string, clientPosition StreamPosition, historyMe
 	if ok && medium.options.SharedPositionSync {
 		checked, validPosition, err := medium.CheckPosition(historyMetaTTL, clientPosition, n.config.ClientChannelPositionCheckDelay, posTime)
 		if err != nil {
-			n.metrics.incPositionChecks("error", true)
+			n.metrics.positionChecksShared.failed.Inc()
 			// Will be checked later.
 			return false, err
 		}
@@ -1959,37 +1959,29 @@ func (n *Node) checkPosition(ch string, clientPosition StreamPosition, historyMe
 			// Check was skipped, another check for the channel was performed within checkDelay.
 			return true, nil
 		}
-		n.metrics.incPositionChecks(positionCheckResult(validPosition), true)
+		n.metrics.positionChecksShared.forResult(validPosition).Inc()
 		return validPosition, nil
 	}
 	// No medium for channel or position sync disabled – check position over Broker.
 	if isMap {
 		streamTop, err := n.mapStreamTop(ch)
 		if err != nil {
-			n.metrics.incPositionChecks("error", false)
+			n.metrics.positionChecksDirect.failed.Inc()
 			return false, err
 		}
 		validPosition := streamTop.Epoch == clientPosition.Epoch && clientPosition.Offset == streamTop.Offset
-		n.metrics.incPositionChecks(positionCheckResult(validPosition), false)
+		n.metrics.positionChecksDirect.forResult(validPosition).Inc()
 		return validPosition, nil
 	}
 	streamTop, err := n.streamTop(ch, historyMetaTTL)
 	if err != nil {
-		n.metrics.incPositionChecks("error", false)
+		n.metrics.positionChecksDirect.failed.Inc()
 		// Will be checked later.
 		return false, err
 	}
 	validPosition := streamTop.Epoch == clientPosition.Epoch && clientPosition.Offset == streamTop.Offset
-	n.metrics.incPositionChecks(positionCheckResult(validPosition), false)
+	n.metrics.positionChecksDirect.forResult(validPosition).Inc()
 	return validPosition, nil
-}
-
-// positionCheckResult returns label value for position_checks_total metric.
-func positionCheckResult(validPosition bool) string {
-	if validPosition {
-		return "valid"
-	}
-	return "invalid"
 }
 
 // RemoveHistory removes channel history.
@@ -2277,7 +2269,7 @@ func (n *Node) MapStateRead(ctx context.Context, ch string, opts MapReadStateOpt
 			return mapBroker.ReadState(ctx, ch, opts)
 		})
 		if shared {
-			n.metrics.incSingleflightMerged("map_state")
+			n.metrics.singleflightMergedMapState.Inc()
 		}
 		if err != nil {
 			return MapStateResult{}, err
@@ -2329,7 +2321,7 @@ func (n *Node) MapStreamRead(ctx context.Context, ch string, opts MapReadStreamO
 			return mapBroker.ReadStream(ctx, ch, opts)
 		})
 		if shared {
-			n.metrics.incSingleflightMerged("map_stream")
+			n.metrics.singleflightMergedMapStream.Inc()
 		}
 		if e != nil {
 			return MapStreamResult{}, e
@@ -2416,7 +2408,7 @@ func (n *Node) MapStats(ctx context.Context, ch string) (MapStatsResult, error) 
 			return MapStatsResult{MapStats: stats}, nil
 		})
 		if shared {
-			n.metrics.incSingleflightMerged("map_stats")
+			n.metrics.singleflightMergedMapStats.Inc()
 		}
 		if err != nil {
 			return MapStatsResult{}, err
