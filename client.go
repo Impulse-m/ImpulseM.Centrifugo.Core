@@ -256,6 +256,7 @@ type Client struct {
 	session           string
 	user              string
 	info              []byte
+	tokenIdentity     TokenIdentity
 	storage           map[string]any
 	storageMu         sync.Mutex
 	metricName        string // Make a unique.Handle.
@@ -895,6 +896,13 @@ func (c *Client) Info() []byte {
 	return info
 }
 
+// TokenIdentity returns identity of the token connection was authenticated with.
+func (c *Client) TokenIdentity() TokenIdentity {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tokenIdentity
+}
+
 // ConnectedAtMS returns timestamp in milliseconds when client connected.
 func (c *Client) ConnectedAtMS() int64 {
 	return c.connectedAtMS
@@ -1527,6 +1535,9 @@ func (c *Client) expire() {
 				if reply.Info != nil {
 					c.info = reply.Info
 				}
+				if reply.TokenIdentity != nil && expireAt > nowUnix {
+					c.tokenIdentity = *reply.TokenIdentity
+				}
 				c.mu.Unlock()
 			}
 			c.checkExpired()
@@ -1706,6 +1717,9 @@ func (c *Client) handleRefresh(req *protocol.RefreshRequest, cmd *protocol.Comma
 				c.exp = expireAt
 				if len(info) > 0 {
 					c.info = info
+				}
+				if reply.TokenIdentity != nil {
+					c.tokenIdentity = *reply.TokenIdentity
 				}
 				duration := time.Duration(ttl)*time.Second + c.node.config.ClientExpiredCloseDelay
 				c.addExpireUpdate(duration, true)
@@ -2487,6 +2501,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	c.mu.Lock()
 	c.user = credentials.UserID
 	c.info = credentials.Info
+	c.tokenIdentity = credentials.TokenIdentity
 	c.exp = min(credentials.ExpireAt, time.Now().Unix()+maxTTLSeconds)
 
 	user := c.user

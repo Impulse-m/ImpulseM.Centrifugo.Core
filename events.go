@@ -116,6 +116,9 @@ type RefreshReply struct {
 	// Info allows modifying connection information,
 	// zero value means no modification of current connection Info.
 	Info []byte
+	// TokenIdentity allows replacing identity of the token connection was
+	// authenticated with. Nil means no modification of current TokenIdentity.
+	TokenIdentity *TokenIdentity
 }
 
 // RefreshCallback should be called as soon as handler decides what to do

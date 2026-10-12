@@ -17,6 +17,21 @@ type Credentials struct {
 	// In some cases having additional info can be an undesired overhead – but
 	// you are simply free to not use this field at all.
 	Info []byte
+	// TokenIdentity identifies the token connection was authenticated with. It is
+	// available through Client.TokenIdentity and is not sent to the client.
+	TokenIdentity TokenIdentity
+}
+
+// TokenIdentity identifies the token a connection was authenticated with. It is
+// set from Credentials at connect and can be replaced on refresh with
+// RefreshReply.TokenIdentity. Application uses it for token revocation checks.
+type TokenIdentity struct {
+	// Session is an identifier of the session the token was issued for.
+	Session [16]byte
+	// Generation is a revocation generation of the token.
+	Generation uint64
+	// IssuedAt is a Unix time in seconds when the token was issued.
+	IssuedAt int64
 }
 
 // credentialsContextKeyType is special type to safely use context for setting
