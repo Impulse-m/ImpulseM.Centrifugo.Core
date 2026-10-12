@@ -92,9 +92,6 @@ type channelMedium struct {
 	// regression confirms it (broker lost the stream tail, epoch kept).
 	regressTop StreamPosition
 	hasRegress bool
-	// markerTop is the stream top the last insufficient state marker set lastPosition to. Cleared together
-	// with hasRegress when lastPosition changes epoch.
-	markerTop StreamPosition
 }
 
 type nodeSubset interface {
@@ -345,7 +342,6 @@ func (c *channelMedium) CheckPosition(historyMetaTTL time.Duration, clientPositi
 			if !c.hasLast || streamTop.Epoch != c.lastPosition.Epoch || streamTop.Offset > c.lastPosition.Offset {
 				c.setLastPositionLocked(streamTop)
 			}
-			c.markerTop = streamTop
 			c.mu.Unlock()
 			c.broadcastInsufficientState()
 			return true, false, nil
@@ -383,7 +379,6 @@ func (c *channelMedium) checkAheadLocked(clientPosition, streamTop StreamPositio
 		} else if c.hasRegress && c.regressTop.Epoch == streamTop.Epoch {
 			c.hasRegress = false
 			c.setLastPositionLocked(streamTop)
-			c.markerTop = streamTop
 			return false, true
 		} else {
 			c.regressTop = streamTop
@@ -403,7 +398,6 @@ func (c *channelMedium) checkAheadLocked(clientPosition, streamTop StreamPositio
 func (c *channelMedium) setLastPositionLocked(sp StreamPosition) {
 	if c.hasLast && sp.Epoch != c.lastPosition.Epoch {
 		c.hasRegress = false
-		c.markerTop = StreamPosition{}
 	}
 	c.lastPosition = sp
 	c.hasLast = true
