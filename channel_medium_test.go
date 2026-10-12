@@ -152,7 +152,7 @@ func TestChannelMediumPositionSync(t *testing.T) {
 	channelMediumTimeNow = func() time.Time {
 		return time.Now().Add(time.Hour)
 	}
-	medium.CheckPosition(time.Second, StreamPosition{Offset: 1, Epoch: "test"}, time.Second)
+	_, _, _ = medium.CheckPosition(time.Second, StreamPosition{Offset: 1, Epoch: "test"}, time.Second)
 	channelMediumTimeNow = originalGetter
 	select {
 	case <-doneCh:
@@ -184,7 +184,7 @@ func TestChannelMediumPositionSyncRetry(t *testing.T) {
 	channelMediumTimeNow = func() time.Time {
 		return time.Now().Add(time.Hour)
 	}
-	medium.CheckPosition(time.Second, StreamPosition{Offset: 1, Epoch: "test"}, time.Second)
+	_, _, _ = medium.CheckPosition(time.Second, StreamPosition{Offset: 1, Epoch: "test"}, time.Second)
 	channelMediumTimeNow = originalGetter
 	select {
 	case <-doneCh:
