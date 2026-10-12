@@ -4729,6 +4729,489 @@ func TestTagsFilter_RecoverStream(t *testing.T) {
 	}
 }
 
+// tagsFilterTestNode returns node which applies the same subscribe options to every subscription.
+func tagsFilterTestNode(t *testing.T, options SubscribeOptions) *Node {
+	t.Helper()
+	node := defaultTestNode()
+	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
+
+	node.OnConnecting(func(context.Context, ConnectEvent) (ConnectReply, error) {
+		return ConnectReply{
+			Credentials: &Credentials{
+				UserID: "user",
+			},
+		}, nil
+	})
+	node.OnConnect(func(client *Client) {
+		client.OnSubscribe(func(_ SubscribeEvent, cb SubscribeCallback) {
+			cb(SubscribeReply{Options: options}, nil)
+		})
+	})
+	return node
+}
+
+// publishTagsFilterHistory publishes messages with tags to channel history.
+func publishTagsFilterHistory(t *testing.T, node *Node, channel string) {
+	t.Helper()
+	messages := []struct {
+		data string
+		tags map[string]string
+	}{
+		{`{"input": "msg1"}`, map[string]string{"env": "prod", "type": "log"}},
+		{`{"input": "msg2"}`, map[string]string{"env": "staging", "type": "log"}},
+		{`{"input": "msg3"}`, map[string]string{"env": "prod", "type": "error"}},
+		{`{"input": "msg4"}`, map[string]string{"env": "test", "type": "log"}},
+		{`{"input": "msg5"}`, map[string]string{"env": "prod", "type": "warn"}},
+	}
+	for _, msg := range messages {
+		_, err := node.Publish(channel, []byte(msg.data), WithTags(msg.tags), WithHistory(10, time.Minute))
+		require.NoError(t, err)
+	}
+}
+
+// hubTagsFilter returns tags filter registered in hub for client subscription on channel.
+func hubTagsFilter(t *testing.T, client *Client, channel string) *protocol.FilterNode {
+	t.Helper()
+	sub, ok := client.node.hub.getSub(channel, client)
+	require.True(t, ok, "subscription must be registered in hub")
+	if sub.tagsFilter == nil {
+		return nil
+	}
+	return sub.tagsFilter.filter
+}
+
+func TestTagsFilter_ServerFilterLive(t *testing.T) {
+	node := tagsFilterTestNode(t, SubscribeOptions{
+		// Server filter must not depend on AllowTagsFilter.
+		AllowTagsFilter:  false,
+		ServerTagsFilter: filter.Eq("env", "prod"),
+	})
+
+	transport := newTestTransport(func() {})
+	transport.sink = make(chan []byte, 100)
+	client := newTestClientCustomTransport(t, context.Background(), node, transport, "user")
+	connectClientV2(t, client)
+	subscribeClientV2(t, client, "test")
+
+	_, err := node.Publish("test", []byte(`{"text": "staging message"}`), WithTags(map[string]string{"env": "staging"}))
+	require.NoError(t, err)
+	_, err = node.Publish("test", []byte(`{"text": "prod message"}`), WithTags(map[string]string{"env": "prod"}))
+	require.NoError(t, err)
+
+	// Publications are delivered in order, so if the staging one was delivered it arrives first.
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case data := <-transport.sink:
+			require.NotContains(t, string(data), "staging message", "publication not matching server filter must not be delivered")
+			if strings.Contains(string(data), "prod message") {
+				return
+			}
+		case <-timeout:
+			require.FailNow(t, "matching publication was not delivered")
+		}
+	}
+}
+
+func TestTagsFilter_ServerFilterWithClientFilter(t *testing.T) {
+	tests := []struct {
+		name         string
+		clientFilter *protocol.FilterNode
+		expectedData []string
+	}{
+		{
+			name:         "server filter only",
+			clientFilter: nil,
+			expectedData: []string{`{"input": "msg1"}`, `{"input": "msg3"}`, `{"input": "msg5"}`},
+		},
+		{
+			name:         "client filter narrows server filter",
+			clientFilter: filter.Eq("type", "error"),
+			expectedData: []string{`{"input": "msg3"}`},
+		},
+		{
+			name:         "client filter can not widen server filter",
+			clientFilter: filter.Eq("env", "staging"),
+			expectedData: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := tagsFilterTestNode(t, SubscribeOptions{
+				AllowTagsFilter:   true,
+				EnableRecovery:    true,
+				RecoveryMode:      RecoveryModeStream,
+				EnablePositioning: true,
+				ServerTagsFilter:  filter.Eq("env", "prod"),
+			})
+			channel := "test"
+			publishTagsFilterHistory(t, node, channel)
+
+			transport := newTestTransport(func() {})
+			client := newTestClientCustomTransport(t, context.Background(), node, transport, "user")
+			connectClientV2(t, client)
+
+			rwWrapper := testReplyWriterWrapper()
+			err := client.handleSubscribe(&protocol.SubscribeRequest{
+				Channel: channel,
+				Tf:      tt.clientFilter,
+				Recover: true,
+			}, &protocol.Command{Id: 1}, time.Now(), rwWrapper.rw)
+			require.NoError(t, err)
+			require.Nil(t, rwWrapper.replies[0].Error)
+			require.NotNil(t, rwWrapper.replies[0].Subscribe)
+
+			recoveredPubs := rwWrapper.replies[0].Subscribe.Publications
+			require.Len(t, recoveredPubs, len(tt.expectedData))
+			for i, pub := range recoveredPubs {
+				require.Equal(t, tt.expectedData[i], string(pub.Data))
+			}
+		})
+	}
+}
+
+func TestTagsFilter_ServerFilterRecoverCache(t *testing.T) {
+	node := tagsFilterTestNode(t, SubscribeOptions{
+		// Server filter must not depend on AllowTagsFilter.
+		AllowTagsFilter:   false,
+		EnableRecovery:    true,
+		RecoveryMode:      RecoveryModeCache,
+		EnablePositioning: true,
+		ServerTagsFilter:  filter.Eq("env", "prod"),
+	})
+	channel := "test"
+
+	_, err := node.Publish(channel, []byte(`{"input": "msg1"}`), WithTags(map[string]string{"env": "prod"}), WithHistory(10, time.Minute))
+	require.NoError(t, err)
+	_, err = node.Publish(channel, []byte(`{"input": "msg2"}`), WithTags(map[string]string{"env": "staging"}), WithHistory(10, time.Minute))
+	require.NoError(t, err)
+	_, err = node.Publish(channel, []byte(`{"input": "msg3"}`), WithTags(map[string]string{"env": "prod"}), WithHistory(10, time.Minute))
+	require.NoError(t, err)
+	_, err = node.Publish(channel, []byte(`{"input": "msg4"}`), WithTags(map[string]string{"env": "staging"}), WithHistory(10, time.Minute))
+	require.NoError(t, err)
+
+	transport := newTestTransport(func() {})
+	client := newTestClientCustomTransport(t, context.Background(), node, transport, "user")
+	connectClientV2(t, client)
+
+	rwWrapper := testReplyWriterWrapper()
+	err = client.handleSubscribe(&protocol.SubscribeRequest{
+		Channel: channel,
+		Recover: true,
+	}, &protocol.Command{Id: 1}, time.Now(), rwWrapper.rw)
+	require.NoError(t, err)
+	require.NotNil(t, rwWrapper.replies[0].Subscribe)
+
+	subscribeResult := rwWrapper.replies[0].Subscribe
+	require.True(t, subscribeResult.Recovered)
+	require.Len(t, subscribeResult.Publications, 1)
+	require.Equal(t, `{"input": "msg3"}`, string(subscribeResult.Publications[0].Data), "Should recover the latest prod message (msg3)")
+}
+
+func TestTagsFilter_ServerFilterInvalid(t *testing.T) {
+	node := tagsFilterTestNode(t, SubscribeOptions{
+		// Val is required for eq comparison.
+		ServerTagsFilter: &protocol.FilterNode{Cmp: filter.CompareEQ, Key: "env"},
+	})
+
+	transport := newTestTransport(func() {})
+	client := newTestClientCustomTransport(t, context.Background(), node, transport, "user")
+	connectClientV2(t, client)
+
+	rwWrapper := testReplyWriterWrapper()
+	err := client.handleSubscribe(&protocol.SubscribeRequest{
+		Channel: "test",
+	}, &protocol.Command{Id: 1}, time.Now(), rwWrapper.rw)
+	require.NoError(t, err)
+	require.Len(t, rwWrapper.replies, 1)
+	require.NotNil(t, rwWrapper.replies[0].Error)
+	require.Equal(t, ErrorInternal.Code, rwWrapper.replies[0].Error.Code)
+	require.NotContains(t, client.ChannelsWithContext(), "test")
+}
+
+func TestTagsFilter_ServerSideSubscribeInvalid(t *testing.T) {
+	node := defaultTestNode()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	node.OnConnecting(func(context.Context, ConnectEvent) (ConnectReply, error) {
+		return ConnectReply{
+			Credentials: &Credentials{
+				UserID: "user",
+			},
+			Subscriptions: map[string]SubscribeOptions{
+				"test": {
+					// Val is required for eq comparison.
+					ServerTagsFilter: &protocol.FilterNode{Cmp: filter.CompareEQ, Key: "env"},
+				},
+			},
+		}, nil
+	})
+
+	transport := newTestTransport(func() {})
+	client := newTestClientCustomTransport(t, context.Background(), node, transport, "user")
+	rwWrapper := testReplyWriterWrapper()
+	err := client.connectCmd(&protocol.ConnectRequest{}, &protocol.Command{}, time.Now(), rwWrapper.rw)
+	require.Equal(t, ErrorInternal, err)
+}
+
+func TestTagsFilter_ServerSideSubscribeFromConnect(t *testing.T) {
+	node := defaultTestNode()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	node.OnConnecting(func(context.Context, ConnectEvent) (ConnectReply, error) {
+		return ConnectReply{
+			Credentials: &Credentials{
+				UserID: "user",
+			},
+			Subscriptions: map[string]SubscribeOptions{
+				"test": {
+					ServerTagsFilter: filter.Eq("env", "prod"),
+				},
+			},
+		}, nil
+	})
+
+	transport := newTestTransport(func() {})
+	client := newTestClientCustomTransport(t, context.Background(), node, transport, "user")
+	connectClientV2(t, client)
+
+	require.Equal(t, filter.Eq("env", "prod"), client.ChannelsWithContext()["test"].ServerTagsFilter)
+	require.Equal(t, filter.Eq("env", "prod"), hubTagsFilter(t, client, "test"))
+}
+
+func TestTagsFilter_ServerFilterDisablesDelta(t *testing.T) {
+	tests := []struct {
+		name          string
+		serverFilter  *protocol.FilterNode
+		expectedDelta bool
+	}{
+		{
+			name:          "delta negotiated without server filter",
+			serverFilter:  nil,
+			expectedDelta: true,
+		},
+		{
+			name:          "delta not negotiated with server filter",
+			serverFilter:  filter.Eq("env", "prod"),
+			expectedDelta: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := tagsFilterTestNode(t, SubscribeOptions{
+				AllowedDeltaTypes: []DeltaType{DeltaTypeFossil},
+				ServerTagsFilter:  tt.serverFilter,
+			})
+
+			transport := newTestTransport(func() {})
+			client := newTestClientCustomTransport(t, context.Background(), node, transport, "user")
+			connectClientV2(t, client)
+
+			rwWrapper := testReplyWriterWrapper()
+			err := client.handleSubscribe(&protocol.SubscribeRequest{
+				Channel: "test",
+				Delta:   string(DeltaTypeFossil),
+			}, &protocol.Command{Id: 1}, time.Now(), rwWrapper.rw)
+			require.NoError(t, err)
+			require.Nil(t, rwWrapper.replies[0].Error)
+			require.NotNil(t, rwWrapper.replies[0].Subscribe)
+			require.Equal(t, tt.expectedDelta, rwWrapper.replies[0].Subscribe.Delta)
+		})
+	}
+}
+
+// newTagsFilterRefreshClient returns connected client with client-side subscription refresh
+// on channel "test" subscribed with the given options.
+func newTagsFilterRefreshClient(t *testing.T, options SubscribeOptions, subRequest *protocol.SubscribeRequest) *Client {
+	t.Helper()
+	node := defaultTestNode()
+	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
+
+	node.OnConnecting(func(context.Context, ConnectEvent) (ConnectReply, error) {
+		return ConnectReply{
+			Credentials: &Credentials{
+				UserID: "user",
+			},
+			ClientSideRefresh: true,
+		}, nil
+	})
+	node.OnConnect(func(client *Client) {
+		client.OnSubscribe(func(_ SubscribeEvent, cb SubscribeCallback) {
+			cb(SubscribeReply{
+				Options:           options,
+				ClientSideRefresh: true,
+			}, nil)
+		})
+	})
+
+	transport := newTestTransport(func() {})
+	client := newTestClientCustomTransport(t, context.Background(), node, transport, "user")
+	connectClientV2(t, client)
+
+	subRequest.Channel = "test"
+	rwWrapper := testReplyWriterWrapper()
+	err := client.handleSubscribe(subRequest, &protocol.Command{Id: 1}, time.Now(), rwWrapper.rw)
+	require.NoError(t, err)
+	require.Nil(t, rwWrapper.replies[0].Error)
+	return client
+}
+
+// refreshTagsFilterSub performs client-side subscription refresh on channel "test"
+// replying with the given server tags filter (nil keeps current one).
+func refreshTagsFilterSub(t *testing.T, client *Client, serverTf *protocol.FilterNode) {
+	t.Helper()
+	client.OnSubRefresh(func(_ SubRefreshEvent, cb SubRefreshCallback) {
+		cb(SubRefreshReply{
+			ExpireAt:         time.Now().Unix() + 60,
+			ServerTagsFilter: serverTf,
+		}, nil)
+	})
+	rwWrapper := testReplyWriterWrapper()
+	err := client.handleSubRefresh(&protocol.SubRefreshRequest{
+		Channel: "test",
+		Token:   "test_token",
+	}, &protocol.Command{Id: 2}, time.Now(), rwWrapper.rw)
+	require.NoError(t, err)
+}
+
+func TestTagsFilter_SubRefreshReplacesServerFilter(t *testing.T) {
+	client := newTagsFilterRefreshClient(t, SubscribeOptions{
+		ServerTagsFilter: filter.Eq("env", "prod"),
+	}, &protocol.SubscribeRequest{})
+	require.Equal(t, filter.Eq("env", "prod"), hubTagsFilter(t, client, "test"))
+
+	refreshTagsFilterSub(t, client, filter.Eq("env", "staging"))
+
+	require.Equal(t, filter.Eq("env", "staging"), hubTagsFilter(t, client, "test"))
+	require.Equal(t, filter.Eq("env", "staging"), client.ChannelsWithContext()["test"].ServerTagsFilter)
+}
+
+func TestTagsFilter_SubRefreshNilKeepsServerFilter(t *testing.T) {
+	client := newTagsFilterRefreshClient(t, SubscribeOptions{
+		ServerTagsFilter: filter.Eq("env", "prod"),
+	}, &protocol.SubscribeRequest{})
+
+	refreshTagsFilterSub(t, client, nil)
+
+	require.Equal(t, filter.Eq("env", "prod"), hubTagsFilter(t, client, "test"))
+	require.Equal(t, filter.Eq("env", "prod"), client.ChannelsWithContext()["test"].ServerTagsFilter)
+}
+
+func TestTagsFilter_SubRefreshKeepsClientFilter(t *testing.T) {
+	client := newTagsFilterRefreshClient(t, SubscribeOptions{
+		AllowTagsFilter:  true,
+		ServerTagsFilter: filter.Eq("env", "prod"),
+	}, &protocol.SubscribeRequest{
+		Tf: filter.Eq("region", "us"),
+	})
+
+	refreshTagsFilterSub(t, client, filter.Eq("env", "staging"))
+
+	require.Equal(t, filter.And(filter.Eq("env", "staging"), filter.Eq("region", "us")), hubTagsFilter(t, client, "test"))
+}
+
+func TestTagsFilter_SubRefreshInvalidFilterUnsubscribes(t *testing.T) {
+	client := newTagsFilterRefreshClient(t, SubscribeOptions{
+		ServerTagsFilter: filter.Eq("env", "prod"),
+	}, &protocol.SubscribeRequest{})
+
+	// Val is required for eq comparison.
+	refreshTagsFilterSub(t, client, &protocol.FilterNode{Cmp: filter.CompareEQ, Key: "env"})
+
+	require.Eventually(t, func() bool {
+		_, ok := client.ChannelsWithContext()["test"]
+		return !ok
+	}, 5*time.Second, 10*time.Millisecond, "subscription must be unsubscribed")
+}
+
+func TestTagsFilter_SubRefreshAddFilterToDeltaUnsubscribes(t *testing.T) {
+	client := newTagsFilterRefreshClient(t, SubscribeOptions{
+		AllowedDeltaTypes: []DeltaType{DeltaTypeFossil},
+	}, &protocol.SubscribeRequest{
+		Delta: string(DeltaTypeFossil),
+	})
+	require.Nil(t, hubTagsFilter(t, client, "test"))
+
+	refreshTagsFilterSub(t, client, filter.Eq("env", "prod"))
+
+	require.Eventually(t, func() bool {
+		_, ok := client.ChannelsWithContext()["test"]
+		return !ok
+	}, 5*time.Second, 10*time.Millisecond, "subscription with delta must be unsubscribed")
+}
+
+// newTagsFilterServerSideRefreshClient returns connected client with server-side subscription
+// on channel "test" which refreshes through SubRefreshHandler replying with the given filter.
+func newTagsFilterServerSideRefreshClient(t *testing.T, refreshTf *protocol.FilterNode) *Client {
+	t.Helper()
+	return newTagsFilterServerSideRefreshClientWithTransport(t, newTestTransport(func() {}), refreshTf)
+}
+
+func newTagsFilterServerSideRefreshClientWithTransport(t *testing.T, transport *testTransport, refreshTf *protocol.FilterNode) *Client {
+	t.Helper()
+	node := defaultTestNode()
+	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
+
+	node.OnConnecting(func(context.Context, ConnectEvent) (ConnectReply, error) {
+		return ConnectReply{
+			Credentials: &Credentials{
+				UserID: "user",
+			},
+			Subscriptions: map[string]SubscribeOptions{
+				"test": {
+					ServerTagsFilter: filter.Eq("env", "prod"),
+					ExpireAt:         time.Now().Unix() + 60,
+				},
+			},
+		}, nil
+	})
+	node.OnConnect(func(client *Client) {
+		client.OnSubRefresh(func(_ SubRefreshEvent, cb SubRefreshCallback) {
+			cb(SubRefreshReply{
+				ExpireAt:         time.Now().Unix() + 60,
+				ServerTagsFilter: refreshTf,
+			}, nil)
+		})
+	})
+
+	client := newTestClientCustomTransport(t, context.Background(), node, transport, "user")
+	connectClientV2(t, client)
+	return client
+}
+
+func TestTagsFilter_ServerSideSubRefreshReplacesFilter(t *testing.T) {
+	client := newTagsFilterServerSideRefreshClient(t, filter.Eq("env", "staging"))
+	require.Equal(t, filter.Eq("env", "prod"), hubTagsFilter(t, client, "test"))
+
+	ctx, ok := client.getSubscribedChannelContext("test")
+	require.True(t, ok)
+	ctx.expireAt = time.Now().Unix() - 100
+	client.checkSubscriptionExpiration("test", ctx, 0, func(bool) {})
+
+	require.Equal(t, filter.Eq("env", "staging"), hubTagsFilter(t, client, "test"))
+	require.Equal(t, filter.Eq("env", "staging"), client.ChannelsWithContext()["test"].ServerTagsFilter)
+}
+
+func TestTagsFilter_ServerSideSubRefreshInvalidFilterUnsubscribes(t *testing.T) {
+	transport := newTestTransport(func() {})
+	client := newTagsFilterServerSideRefreshClientWithTransport(t, transport, &protocol.FilterNode{Cmp: filter.CompareEQ, Key: "env"})
+
+	ctx, ok := client.getSubscribedChannelContext("test")
+	require.True(t, ok)
+	ctx.expireAt = time.Now().Unix() - 100
+	client.checkSubscriptionExpiration("test", ctx, 0, func(bool) {})
+
+	// Server-side subscription can not be unsubscribed by client, so connection is closed.
+	select {
+	case <-transport.closeCh:
+		require.Equal(t, DisconnectInsufficientState, transport.disconnect)
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "connection must be closed with insufficient state")
+	}
+}
+
 func TestClient_RecoverCache(t *testing.T) {
 	node := defaultTestNode()
 	defer func() { _ = node.Shutdown(context.Background()) }()
