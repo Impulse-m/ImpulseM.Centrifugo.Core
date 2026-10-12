@@ -87,8 +87,9 @@ type Node struct {
 
 	emulationSurveyHandler *emulationSurveyHandler
 
-	mediums     map[string]*channelMedium
-	mediumLocks map[int]*sync.Mutex // Sharded locks for mediums map.
+	// mediums maps channel to its *channelMedium. Stored and deleted only under subLock(ch), so that
+	// creation and teardown of a channel medium are serialized per channel. Other goroutines only Load.
+	mediums sync.Map
 
 	timerScheduler TimerScheduler
 
@@ -100,7 +101,6 @@ type Node struct {
 
 const (
 	numSubLocks            = 16384
-	numMediumLocks         = 16384
 	numSubDissolverWorkers = 64
 )
 
@@ -158,11 +158,6 @@ func New(c Config) (*Node, error) {
 		subLocks[i] = &sync.Mutex{}
 	}
 
-	mediumLocks := make(map[int]*sync.Mutex, numMediumLocks)
-	for i := 0; i < numMediumLocks; i++ {
-		mediumLocks[i] = &sync.Mutex{}
-	}
-
 	if c.Name == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
@@ -190,8 +185,6 @@ func New(c Config) (*Node, error) {
 		subDissolver:   dissolve.New(numSubDissolverWorkers),
 		nowTimeGetter:  nowtime.Get,
 		surveyRegistry: make(map[uint64]chan survey),
-		mediums:        map[string]*channelMedium{},
-		mediumLocks:    mediumLocks,
 		timerScheduler: c.ClientTimerScheduler,
 	}
 	n.emulationSurveyHandler = newEmulationSurveyHandler(n)
@@ -243,8 +236,14 @@ func (n *Node) subLock(ch string) *sync.Mutex {
 	return n.subLocks[index(ch, numSubLocks)]
 }
 
-func (n *Node) mediumLock(ch string) *sync.Mutex {
-	return n.mediumLocks[index(ch, numMediumLocks)]
+// loadMedium returns the channel medium currently stored for ch, if any. Safe for any goroutine.
+func (n *Node) loadMedium(ch string) (*channelMedium, bool) {
+	v, ok := n.mediums.Load(ch)
+	if !ok {
+		return nil, false
+	}
+	medium, _ := v.(*channelMedium)
+	return medium, true
 }
 
 // SetController allows setting Controller implementation to use.
@@ -1063,27 +1062,28 @@ func (n *Node) addSubscription(ch string, sub subInfo) (int64, error) {
 		return 0, err
 	}
 	if first {
-		createdMedium := false
+		var createdMedium *channelMedium
 		if n.config.GetChannelMediumOptions != nil {
 			mediumOptions := n.config.GetChannelMediumOptions(ch)
 			if mediumOptions.isMediumEnabled() {
 				// Medium may still exist here if its teardown is pending in subDissolver. Keep it: it has been
 				// receiving all channel publications so far, replacing it would leak the old medium.
-				// Check and insert in one critical section, so correctness does not depend on subLock alone.
-				mediumMu := n.mediumLock(ch)
-				mediumMu.Lock()
-				if _, exists := n.mediums[ch]; !exists {
+				// Stores for ch happen only under subLock(ch), so the existence check below cannot race with
+				// another creation for the same channel. LoadOrStore covers the rest of the invariant.
+				if _, exists := n.loadMedium(ch); !exists {
 					medium, err := newChannelMedium(ch, n, mediumOptions)
 					if err != nil {
-						mediumMu.Unlock()
 						_, _ = n.hub.removeSub(ch, sub.client)
 						return 0, err
 					}
-					n.mediums[ch] = medium
-					n.metrics.incChannelMediums()
-					createdMedium = true
+					if _, loaded := n.mediums.LoadOrStore(ch, medium); loaded {
+						// Not expected under subLock: another medium is already stored, keep it.
+						medium.close()
+					} else {
+						n.metrics.incChannelMediums()
+						createdMedium = medium
+					}
 				}
-				mediumMu.Unlock()
 			}
 		}
 
@@ -1091,16 +1091,12 @@ func (n *Node) addSubscription(ch string, sub subInfo) (int64, error) {
 		err := n.getBroker(ch).Subscribe(ch)
 		if err != nil {
 			_, _ = n.hub.removeSub(ch, sub.client)
-			if createdMedium {
-				mediumMu := n.mediumLock(ch)
-				mediumMu.Lock()
-				medium, ok := n.mediums[ch]
-				if ok {
-					medium.close()
-					delete(n.mediums, ch)
+			if createdMedium != nil {
+				// Tear down only the medium created by this call.
+				if n.mediums.CompareAndDelete(ch, createdMedium) {
+					createdMedium.close()
 					n.metrics.decChannelMediums()
 				}
-				mediumMu.Unlock()
 			}
 			return 0, err
 		}
@@ -1140,15 +1136,14 @@ func (n *Node) removeSubscription(ch string, c *Client) error {
 				}
 				n.hub.removeSubID(ch)
 				if n.config.GetChannelMediumOptions != nil {
-					mediumMu := n.mediumLock(ch)
-					mediumMu.Lock()
-					medium, ok := n.mediums[ch]
-					if ok {
-						medium.close()
-						delete(n.mediums, ch)
+					// No subscribers and subLock(ch) is held, so no new subscriber can store a medium meanwhile:
+					// the medium stored now is the one belonging to this channel and it is torn down here.
+					if v, ok := n.mediums.LoadAndDelete(ch); ok {
+						if medium, isMedium := v.(*channelMedium); isMedium {
+							medium.close()
+						}
 						n.metrics.decChannelMediums()
 					}
-					mediumMu.Unlock()
 				}
 			}
 			return nil
@@ -1552,10 +1547,7 @@ func (n *Node) streamTop(ch string, historyMetaTTL time.Duration) (StreamPositio
 }
 
 func (n *Node) checkPosition(ch string, clientPosition StreamPosition, historyMetaTTL time.Duration) (bool, error) {
-	mu := n.mediumLock(ch)
-	mu.Lock()
-	medium, ok := n.mediums[ch]
-	mu.Unlock()
+	medium, ok := n.loadMedium(ch)
 	if !ok || !medium.options.SharedPositionSync {
 		// No medium for channel or position sync disabled – we then check position over Broker.
 		streamTop, err := n.streamTop(ch, historyMetaTTL)
@@ -1770,11 +1762,8 @@ func (n *Node) HandlePublication(ch string, pub *Publication, sp StreamPosition,
 		panic("nil Publication received, this must never happen")
 	}
 	if n.config.GetChannelMediumOptions != nil {
-		mu := n.mediumLock(ch) // Note, avoid using subLock in HandlePublication – this leads to the deadlock.
-		mu.Lock()
-		medium, ok := n.mediums[ch]
-		mu.Unlock()
-		if ok {
+		// Note, avoid using subLock in HandlePublication – this leads to the deadlock.
+		if medium, ok := n.loadMedium(ch); ok {
 			medium.broadcastPublication(pub, sp, delta, prevPub)
 			return nil
 		}
