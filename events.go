@@ -469,6 +469,10 @@ type CommandReadEvent struct {
 	Command *protocol.Command
 	// CommandSize is a size of command in bytes in its protocol representation.
 	CommandSize int
+	// Started is the time when processing of the command started. It is the same
+	// time Centrifuge uses for command duration metrics, so handlers may use it
+	// instead of calling time.Now() again.
+	Started time.Time
 }
 
 // CommandReadHandler allows setting a callback which will be called before

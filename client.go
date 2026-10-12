@@ -259,6 +259,7 @@ type Client struct {
 	tokenIdentity     TokenIdentity
 	storage           map[string]any
 	storageMu         sync.Mutex
+	extState          atomic.Pointer[extStateBox]
 	metricName        string // Make a unique.Handle.
 	metricVersion     string // Make a unique.Handle.
 	authenticated     bool
@@ -409,11 +410,12 @@ func hasFlag(flags, flag uint64) bool {
 	return flags&flag != 0
 }
 
-func (c *Client) issueCommandReadEvent(cmd *protocol.Command, size int) error {
+func (c *Client) issueCommandReadEvent(cmd *protocol.Command, size int, started time.Time) error {
 	if c.node.clientEvents.commandReadHandler != nil {
 		return c.node.clientEvents.commandReadHandler(c, CommandReadEvent{
 			Command:     cmd,
 			CommandSize: size,
+			Started:     started,
 		})
 	}
 	return nil
@@ -437,7 +439,7 @@ func (c *Client) unidirectionalConnect(connectRequest *protocol.ConnectRequest, 
 
 	if c.node.clientEvents.commandReadHandler != nil {
 		cmd = &protocol.Command{Id: 1, Connect: connectRequest}
-		err := c.issueCommandReadEvent(cmd, connectCmdSize)
+		err := c.issueCommandReadEvent(cmd, connectCmdSize, started)
 		if err != nil {
 			if c.node.clientEvents.commandProcessedHandler != nil {
 				c.handleCommandFinished(cmd, protocol.FrameTypeConnect, err, nil, started, "")
@@ -1382,7 +1384,7 @@ func (c *Client) dispatchCommand(cmd *protocol.Command, cmdSize int) (*Disconnec
 
 	var handleErr error
 
-	handleErr = c.issueCommandReadEvent(cmd, cmdSize)
+	handleErr = c.issueCommandReadEvent(cmd, cmdSize, started)
 	if handleErr != nil {
 		return c.handleCommandDispatchError(metricChannel, cmd, frameType, handleErr, started)
 	}
