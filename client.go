@@ -1949,6 +1949,15 @@ func redactCommand(cmd *protocol.Command) *protocol.Command {
 			cmd.Connect.Headers[k] = redacted
 		}
 	}
+	if cmd.Rpc != nil && len(cmd.Rpc.Headers) > 0 {
+		// Replace the map rather than writing into it: the handler may still read
+		// the headers through RPCEvent.Call, which shares this map.
+		redactedHeaders := make(map[string]string, len(cmd.Rpc.Headers))
+		for k := range cmd.Rpc.Headers {
+			redactedHeaders[k] = redacted
+		}
+		cmd.Rpc.Headers = redactedHeaders
+	}
 	if cmd.Subscribe != nil && cmd.Subscribe.Token != "" {
 		cmd.Subscribe.Token = redacted
 	}
@@ -2181,6 +2190,7 @@ func (c *Client) dispatchCommand(cmd *protocol.Command, cmdSize int) (*Disconnec
 
 func (c *Client) writeEncodedCommandReply(ch string, frameType protocol.FrameType, cmd *protocol.Command, rep *protocol.Reply, rw *replyWriter) {
 	rep.Id = cmd.Id
+	rep.Time = c.replyTime()
 	if rep.Error != nil {
 		if c.node.logEnabled(LogLevelInfo) {
 			c.node.logger.log(newLogEntry(LogLevelInfo, "client command error", map[string]any{"reply": fmt.Sprintf("%v", rep), "command": fmt.Sprintf("%v", redactCommand(cmd)), "client": c.ID(), "user": c.UserID(), "error": rep.Error.Message, "code": rep.Error.Code}))
@@ -2483,7 +2493,9 @@ func (c *Client) handleRefresh(req *protocol.RefreshRequest, cmd *protocol.Comma
 		info := reply.Info
 
 		res := &protocol.RefreshResult{
-			Expires: expireAt > 0,
+			Expires:   expireAt > 0,
+			User:      reply.User,
+			AuthClass: reply.AuthClass,
 		}
 
 		ttl := expireAt - nowUnix
@@ -3743,6 +3755,7 @@ func (c *Client) handleRPC(req *protocol.RPCRequest, cmd *protocol.Command, star
 	event := RPCEvent{
 		Method: req.Method,
 		Data:   req.Data,
+		Call:   rpcCallOptionsFromProto(req),
 	}
 
 	cb := func(reply RPCReply, err error) {
@@ -3751,7 +3764,8 @@ func (c *Client) handleRPC(req *protocol.RPCRequest, cmd *protocol.Command, star
 			return
 		}
 		result := &protocol.RPCResult{
-			Data: reply.Data,
+			Data:   reply.Data,
+			Cached: reply.Cached,
 		}
 		protoReply, err := c.getRPCCommandReply(result)
 		if err != nil {
@@ -3892,7 +3906,10 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 		clientSideRefresh bool
 		labels            map[string]string
 		// What the client declared about itself. An application may override it.
-		profile = req.GetProfile()
+		profile        = req.GetProfile()
+		replyFlags     int64
+		replyUser      string
+		replyAuthClass string
 	)
 
 	if c.node.clientEvents.connectingHandler != nil {
@@ -3905,6 +3922,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 			Profile:   profile,
 			Transport: c.transport,
 			Headers:   req.Headers,
+			Instance:  req.Instance,
 		}
 		if len(req.Subs) > 0 {
 			channels := make([]string, 0, len(req.Subs))
@@ -3947,6 +3965,9 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 		// by returning "" would be silently ignored, which is the direction a
 		// mistake must never fail in.
 		profile = reply.Profile
+		replyFlags = reply.Flags & req.Flag
+		replyUser = reply.User
+		replyAuthClass = reply.AuthClass
 		if len(reply.Subscriptions) > 0 {
 			subscriptions = make(map[string]SubscribeOptions, len(reply.Subscriptions))
 			for ch, opts := range reply.Subscriptions {
@@ -4099,7 +4120,9 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	// Tell the client which of the features it advertised were actually enabled.
 	// Advertising one is not enough: the node may have it turned off, or the
 	// engine may decline this particular connection.
-	res.Flag = acceptedFlags
+	res.Flag = acceptedFlags | replyFlags
+	res.User = replyUser
+	res.AuthClass = replyAuthClass
 	res.Dict = dict
 
 	if c.pingInterval > 0 {
