@@ -32,3 +32,5 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20240826202546-f6391c0de4c7 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240826202546-f6391c0de4c7 // indirect
 )
+
+replace github.com/centrifugal/protocol => github.com/Impulse-m/ImpulseM.Centrifugo.Protocol v0.23.2-0.20261013130323-70f37c2667eb
