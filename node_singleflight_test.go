@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -102,7 +101,7 @@ func TestSingleFlightHistoryMergesConcurrentCalls(t *testing.T) {
 		require.Equal(t, results[0].Publications[0], results[i].Publications[0])
 		require.Equal(t, results[0].StreamPosition, results[i].StreamPosition)
 	}
-	require.Greater(t, testutil.ToFloat64(node.metrics.singleflightMergedCount.WithLabelValues("history")), float64(0))
+	require.Greater(t, metricValue(t, node.metrics.singleflightMergedCount.WithLabelValues("history")), float64(0))
 }
 
 func TestSingleFlightHistoryDoesNotMergeDifferentOptions(t *testing.T) {
@@ -122,7 +121,7 @@ func TestSingleFlightHistoryDoesNotMergeDifferentOptions(t *testing.T) {
 	})
 
 	require.Equal(t, int32(len(optionsByIndex)), atomic.LoadInt32(&calls))
-	require.Equal(t, float64(0), testutil.ToFloat64(node.metrics.singleflightMergedCount.WithLabelValues("history")))
+	require.Equal(t, float64(0), metricValue(t, node.metrics.singleflightMergedCount.WithLabelValues("history")))
 }
 
 func TestSingleFlightHistoryDeliversErrorToAllWaiters(t *testing.T) {
@@ -162,7 +161,7 @@ func TestSingleFlightPresenceMergesConcurrentCalls(t *testing.T) {
 	for i := 0; i < singleFlightConcurrentCalls; i++ {
 		require.NoError(t, errs[i])
 	}
-	require.Greater(t, testutil.ToFloat64(node.metrics.singleflightMergedCount.WithLabelValues("presence")), float64(0))
+	require.Greater(t, metricValue(t, node.metrics.singleflightMergedCount.WithLabelValues("presence")), float64(0))
 }
 
 func TestSingleFlightPresenceStatsMergesConcurrentCalls(t *testing.T) {
@@ -186,7 +185,7 @@ func TestSingleFlightPresenceStatsMergesConcurrentCalls(t *testing.T) {
 		require.NoError(t, errs[i])
 		require.Equal(t, 1, results[i].NumClients)
 	}
-	require.Greater(t, testutil.ToFloat64(node.metrics.singleflightMergedCount.WithLabelValues("presence_stats")), float64(0))
+	require.Greater(t, metricValue(t, node.metrics.singleflightMergedCount.WithLabelValues("presence_stats")), float64(0))
 }
 
 func TestSingleFlightNotSharedBetweenNodes(t *testing.T) {

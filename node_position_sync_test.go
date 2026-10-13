@@ -10,11 +10,22 @@ import (
 
 	"github.com/centrifugal/protocol"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
 const positionSyncTestCheckDelay = time.Minute
+
+// metricValue returns the current value of a counter or a gauge, read the way upstream tests read metrics.
+func metricValue(t testing.TB, metric prometheus.Metric) float64 {
+	t.Helper()
+	var pb dto.Metric
+	require.NoError(t, metric.Write(&pb))
+	if pb.GetCounter() != nil {
+		return pb.GetCounter().GetValue()
+	}
+	return pb.GetGauge().GetValue()
+}
 
 // positionSyncTestStream is a stream top controlled by a test, served by TestBroker history.
 type positionSyncTestStream struct {
@@ -121,7 +132,7 @@ func TestSharedPositionSyncOneStreamTopRequestPerInterval(t *testing.T) {
 	const ch = "shared_check_channel"
 	const numSubscribers = 20
 	clients := subscribePositionSyncTestClients(t, node, ch, numSubscribers)
-	require.Equal(t, float64(1), testutil.ToFloat64(node.metrics.channelMediumsGauge))
+	require.Equal(t, float64(1), metricValue(t, node.metrics.channelMediumsGauge))
 
 	clientPosition := StreamPosition{Offset: 5, Epoch: "epoch"}
 
@@ -208,7 +219,7 @@ func TestSharedPositionSyncMediumCreateTeardownConcurrent(t *testing.T) {
 				return
 			default:
 			}
-			if v := int64(testutil.ToFloat64(node.metrics.channelMediumsGauge)); v > maxMediums.Load() {
+			if v := int64(metricValue(t, node.metrics.channelMediumsGauge)); v > maxMediums.Load() {
 				maxMediums.Store(v)
 			}
 			time.Sleep(time.Millisecond)
@@ -254,7 +265,7 @@ func TestSharedPositionSyncMediumCreateTeardownConcurrent(t *testing.T) {
 
 	// Last subscriber left the channel, medium must be torn down once the dissolver runs.
 	require.Eventually(t, func() bool {
-		return testutil.ToFloat64(node.metrics.channelMediumsGauge) == 0
+		return metricValue(t, node.metrics.channelMediumsGauge) == 0
 	}, 15*time.Second, 50*time.Millisecond)
 }
 
@@ -272,7 +283,7 @@ func TestSharedPositionSyncBrokerErrorCountedAsError(t *testing.T) {
 	valid, err := node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0, false, 0)
 	require.ErrorIs(t, err, errSingleFlightBoom)
 	require.False(t, valid)
-	require.Equal(t, float64(1), testutil.ToFloat64(node.metrics.positionChecksCount.WithLabelValues("error", "true")))
+	require.Equal(t, float64(1), metricValue(t, node.metrics.positionChecksCount.WithLabelValues("error", "true")))
 
 	// The interval is still consumed: no broker request until the next interval.
 	before := stream.historyCalls()
@@ -280,7 +291,7 @@ func TestSharedPositionSyncBrokerErrorCountedAsError(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, valid)
 	require.Equal(t, before, stream.historyCalls())
-	require.Equal(t, float64(1), testutil.ToFloat64(node.metrics.positionChecksCount.WithLabelValues("error", "true")))
+	require.Equal(t, float64(1), metricValue(t, node.metrics.positionChecksCount.WithLabelValues("error", "true")))
 }
 
 // TestNodeCheckPositionMapWithMediumTwoIntervalSemantics covers a map channel with shared position sync: a client
