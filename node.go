@@ -1566,13 +1566,9 @@ func (n *Node) Presence(ch string) (PresenceResult, error) {
 	}
 	n.metrics.incActionCount("presence", ch)
 	if n.config.UseSingleFlight {
-		result, err, shared := n.presenceGroup.Do(ch, func() (any, error) {
+		return singleflightDo(&n.presenceGroup, n.metrics.singleflightMergedPresence, ch, func() (PresenceResult, error) {
 			return n.presence(ch, presenceManager)
 		})
-		if shared {
-			n.metrics.singleflightMergedPresence.Inc()
-		}
-		return result.(PresenceResult), err
 	}
 	return n.presence(ch, presenceManager)
 }
@@ -1669,13 +1665,9 @@ func (n *Node) PresenceStats(ch string) (PresenceStatsResult, error) {
 	}
 	n.metrics.incActionCount("presence_stats", ch)
 	if n.config.UseSingleFlight {
-		result, err, shared := n.presenceStatsGroup.Do(ch, func() (any, error) {
+		return singleflightDo(&n.presenceStatsGroup, n.metrics.singleflightMergedPresenceStats, ch, func() (PresenceStatsResult, error) {
 			return n.presenceStats(ch, presenceManager)
 		})
-		if shared {
-			n.metrics.singleflightMergedPresenceStats.Inc()
-		}
-		return result.(PresenceStatsResult), err
 	}
 	return n.presenceStats(ch, presenceManager)
 }
@@ -1779,16 +1771,12 @@ func (n *Node) historySingleFlight(ch string, opts HistoryOptions) (HistoryResul
 	builder.WriteString(opts.MetaTTL.String())
 	key := builder.String()
 
-	result, err, shared := n.historyGroup.Do(key, func() (any, error) {
-		return n.history(ch, opts)
-	})
-	if shared {
-		n.metrics.singleflightMergedHistory.Inc()
-	}
 	// Return the result even when err != nil: history returns a populated
 	// HistoryResult together with ErrorUnrecoverablePosition, and recovery
 	// depends on the StreamPosition in it.
-	return result.(HistoryResult), err
+	return singleflightDo(&n.historyGroup, n.metrics.singleflightMergedHistory, key, func() (HistoryResult, error) {
+		return n.history(ch, opts)
+	})
 }
 
 // recoverHistory recovers publications since StreamPosition last seen by client.
@@ -2224,16 +2212,13 @@ func (n *Node) MapStateRead(ctx context.Context, ch string, opts MapReadStateOpt
 	n.metrics.incActionCount("map_state_read", ch)
 	if n.config.UseSingleFlight {
 		key := n.mapStateKey(ch, opts)
-		result, err, shared := n.mapStateGroup.Do(key, func() (any, error) {
+		result, err := singleflightDo(&n.mapStateGroup, n.metrics.singleflightMergedMapState, key, func() (MapStateResult, error) {
 			return mapBroker.ReadState(ctx, ch, opts)
 		})
-		if shared {
-			n.metrics.singleflightMergedMapState.Inc()
-		}
 		if err != nil {
 			return MapStateResult{}, err
 		}
-		return result.(MapStateResult), nil
+		return result, nil
 	}
 
 	return mapBroker.ReadState(ctx, ch, opts)
@@ -2276,16 +2261,13 @@ func (n *Node) MapStreamRead(ctx context.Context, ch string, opts MapReadStreamO
 	var err error
 	if n.config.UseSingleFlight {
 		key := n.mapStreamKey(ch, opts)
-		r, e, shared := n.mapStreamGroup.Do(key, func() (any, error) {
+		r, e := singleflightDo(&n.mapStreamGroup, n.metrics.singleflightMergedMapStream, key, func() (MapStreamResult, error) {
 			return mapBroker.ReadStream(ctx, ch, opts)
 		})
-		if shared {
-			n.metrics.singleflightMergedMapStream.Inc()
-		}
 		if e != nil {
 			return MapStreamResult{}, e
 		}
-		result = r.(MapStreamResult)
+		result = r
 	} else {
 		result, err = mapBroker.ReadStream(ctx, ch, opts)
 		if err != nil {
@@ -2359,20 +2341,17 @@ func (n *Node) MapStats(ctx context.Context, ch string) (MapStatsResult, error) 
 
 	n.metrics.incActionCount("map_stats", ch)
 	if n.config.UseSingleFlight {
-		result, err, shared := n.mapStatsGroup.Do(ch, func() (any, error) {
+		result, err := singleflightDo(&n.mapStatsGroup, n.metrics.singleflightMergedMapStats, ch, func() (MapStatsResult, error) {
 			stats, err := mapBroker.Stats(ctx, ch)
 			if err != nil {
 				return MapStatsResult{}, err
 			}
 			return MapStatsResult{MapStats: stats}, nil
 		})
-		if shared {
-			n.metrics.singleflightMergedMapStats.Inc()
-		}
 		if err != nil {
 			return MapStatsResult{}, err
 		}
-		return result.(MapStatsResult), nil
+		return result, nil
 	}
 
 	stats, err := mapBroker.Stats(ctx, ch)
