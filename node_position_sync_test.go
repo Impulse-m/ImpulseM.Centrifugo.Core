@@ -2,6 +2,7 @@ package centrifuge
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,31 @@ import (
 )
 
 const positionSyncTestCheckDelay = time.Minute
+
+var errPositionSyncTestBoom = errors.New("position sync test boom")
+
+// testClock is a goroutine-safe fake clock. Time moves only when it is set or advanced.
+type testClock struct {
+	unixNano atomic.Int64
+}
+
+func newTestClock(start time.Time) *testClock {
+	c := &testClock{}
+	c.set(start)
+	return c
+}
+
+func (c *testClock) now() time.Time {
+	return time.Unix(0, c.unixNano.Load())
+}
+
+func (c *testClock) set(t time.Time) {
+	c.unixNano.Store(t.UnixNano())
+}
+
+func (c *testClock) advance(d time.Duration) {
+	c.unixNano.Add(int64(d))
+}
 
 // metricValue returns the current value of a counter or a gauge, read the way upstream tests read metrics.
 func metricValue(t testing.TB, metric prometheus.Metric) float64 {
@@ -70,7 +96,7 @@ func (s *positionSyncTestStream) historyCalls() int32 {
 // clock is controlled by the returned setter so that position check intervals can be advanced in tests.
 func newPositionSyncTestNode(t *testing.T, stream *positionSyncTestStream) (*Node, func(time.Time)) {
 	t.Helper()
-	clock := time.Now()
+	clock := newTestClock(time.Now())
 	node, err := New(Config{
 		ClientChannelPositionCheckDelay: positionSyncTestCheckDelay,
 		GetChannelMediumOptions: func(_ string) ChannelMediumOptions {
@@ -82,9 +108,7 @@ func newPositionSyncTestNode(t *testing.T, stream *positionSyncTestStream) (*Nod
 	})
 	require.NoError(t, err)
 	// Channel mediums take their clock from the node.
-	node.nowTimeGetter = func() time.Time {
-		return clock
-	}
+	node.nowTimeGetter = clock.now
 	broker := NewTestBroker()
 	broker.historyFunc = stream.history
 	node.SetBroker(broker)
@@ -97,10 +121,7 @@ func newPositionSyncTestNode(t *testing.T, stream *positionSyncTestStream) (*Nod
 	t.Cleanup(func() {
 		_ = node.Shutdown(context.Background())
 	})
-	setClock := func(now time.Time) {
-		clock = now
-	}
-	return node, setClock
+	return node, clock.set
 }
 
 // subscribePositionSyncTestClients connects and subscribes n positioned clients to ch.
@@ -114,13 +135,6 @@ func subscribePositionSyncTestClients(t *testing.T, node *Node, ch string, n int
 		clients = append(clients, client)
 	}
 	return clients
-}
-
-func positionSyncTestIsSubscribed(client *Client, ch string) bool {
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	_, ok := client.channels[ch]
-	return ok
 }
 
 func TestSharedPositionSyncOneStreamTopRequestPerInterval(t *testing.T) {
@@ -143,7 +157,7 @@ func TestSharedPositionSyncOneStreamTopRequestPerInterval(t *testing.T) {
 		valid, err := node.checkPosition(ch, clientPosition, 0, false, 0)
 		require.NoError(t, err)
 		require.True(t, valid)
-		require.True(t, positionSyncTestIsSubscribed(client, ch))
+		require.True(t, client.IsSubscribed(ch))
 	}
 	require.Equal(t, int32(1), stream.historyCalls()-before)
 
@@ -188,7 +202,7 @@ func TestSharedPositionSyncSingleLaggingClientDoesNotAffectOthers(t *testing.T) 
 	// Only the lagging client is marked. Subscribers at the stream top must stay subscribed.
 	for _, other := range others {
 		require.Never(t, func() bool {
-			return !positionSyncTestIsSubscribed(other, ch)
+			return !other.IsSubscribed(ch)
 		}, 200*time.Millisecond, 20*time.Millisecond)
 	}
 }
@@ -278,10 +292,10 @@ func TestSharedPositionSyncBrokerErrorCountedAsError(t *testing.T) {
 	const ch = "error_check_channel"
 	subscribePositionSyncTestClients(t, node, ch, 1)
 
-	stream.setErr(errSingleFlightBoom)
+	stream.setErr(errPositionSyncTestBoom)
 	setClock(base.Add(positionSyncTestCheckDelay + time.Second))
 	valid, err := node.checkPosition(ch, StreamPosition{Offset: 5, Epoch: "epoch"}, 0, false, 0)
-	require.ErrorIs(t, err, errSingleFlightBoom)
+	require.ErrorIs(t, err, errPositionSyncTestBoom)
 	require.False(t, valid)
 	require.Equal(t, float64(1), metricValue(t, node.metrics.positionChecksCount.WithLabelValues("error", "true")))
 

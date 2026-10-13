@@ -34,26 +34,6 @@ const (
 	massReconnectTopCallsPerChannel int64 = 2
 )
 
-// massReconnectClock is a time source shared by the Node (nowTimeGetter), from which channel mediums
-// take their clock, so that the position check interval can be advanced deterministically.
-type massReconnectClock struct {
-	unixNano atomic.Int64
-}
-
-func newMassReconnectClock(start time.Time) *massReconnectClock {
-	c := &massReconnectClock{}
-	c.unixNano.Store(start.UnixNano())
-	return c
-}
-
-func (c *massReconnectClock) now() time.Time {
-	return time.Unix(0, c.unixNano.Load())
-}
-
-func (c *massReconnectClock) set(t time.Time) {
-	c.unixNano.Store(t.UnixNano())
-}
-
 // massReconnectCounts splits History calls of the Node by shape.
 type massReconnectCounts struct {
 	recovery  atomic.Int64
@@ -167,7 +147,7 @@ func massReconnectSubscribe(client *Client, ch string, pos StreamPosition, withR
 func runMassReconnectScenario(t *testing.T, mode massReconnectMode) massReconnectResult {
 	t.Helper()
 	start := time.Now()
-	clock := newMassReconnectClock(start)
+	clock := newTestClock(start)
 	config := Config{
 		ClientChannelPositionCheckDelay: massReconnectCheckDelay,
 		UseSingleFlight:                 mode.singleFlight,

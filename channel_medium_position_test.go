@@ -17,7 +17,7 @@ func testPos(offset uint64) StreamPosition {
 // positionTestMedium drives a channel medium with a fake Node: the stream top is set by the test, every
 // insufficient state marker is counted, and time moves only when tick is called.
 type positionTestMedium struct {
-	clock     time.Time
+	clock     *testClock
 	top       StreamPosition
 	topCalls  int
 	markers   int
@@ -27,7 +27,7 @@ type positionTestMedium struct {
 
 func newPositionTestMedium(t *testing.T) *positionTestMedium {
 	t.Helper()
-	p := &positionTestMedium{clock: time.Now()}
+	p := &positionTestMedium{clock: newTestClock(time.Now())}
 	node := &mockNode{
 		handlePublicationFunc: func(_ string, _ StreamPosition, pub, _, _ *Publication) error {
 			if pub.Offset == math.MaxUint64 {
@@ -45,11 +45,11 @@ func newPositionTestMedium(t *testing.T) *positionTestMedium {
 		},
 	}
 	p.medium = setupChannelMedium(t, ChannelMediumOptions{SharedPositionSync: true}, node)
-	p.medium.nowFn = func() time.Time { return p.clock }
+	p.medium.nowFn = p.clock.now
 	// The medium stamped its last check with the real clock on creation, slightly after p.clock was taken.
 	// Restamp it with the test clock, so one tick is exactly one check interval.
 	p.medium.mu.Lock()
-	p.medium.positionCheckTime = p.clock.UnixNano()
+	p.medium.positionCheckTime = p.clock.now().UnixNano()
 	p.medium.mu.Unlock()
 	return p
 }
@@ -61,14 +61,14 @@ func (p *positionTestMedium) publish(sp StreamPosition) {
 
 // tick moves time forward by one position check interval (1 second in these tests).
 func (p *positionTestMedium) tick() {
-	p.clock = p.clock.Add(time.Second)
+	p.clock.advance(time.Second)
 }
 
 // check runs CheckPosition for a client at position client, stamped with the current clock second, and
 // returns its validPosition.
 func (p *positionTestMedium) check(t *testing.T, client StreamPosition) bool {
 	t.Helper()
-	return p.checkAt(t, client, p.clock.Unix())
+	return p.checkAt(t, client, p.clock.now().Unix())
 }
 
 // checkAt runs CheckPosition for a client whose positionCheckTime is posTime (Unix seconds).
@@ -230,7 +230,7 @@ func TestSharedPositionSyncClientAheadOfCachedTopIsValid(t *testing.T) {
 	// Next interval: the top is fetched after the client was checked, and it is still 7 while the node is at 6.
 	// The client is not delivered by the node, so it is invalid. The node is not confirmed behind (the top is
 	// not ahead of lastPosition), so no marker is sent.
-	stamp := p.clock.Unix()
+	stamp := p.clock.now().Unix()
 	p.tick()
 	require.False(t, p.checkAt(t, testPos(8), stamp))
 	require.Equal(t, 0, p.markers)
@@ -268,7 +268,7 @@ func TestSharedPositionSyncClientAheadDeliveredByNodeIsValid(t *testing.T) {
 	p.publish(testPos(6))
 	p.publish(testPos(8))
 	p.top = testPos(7)
-	stamp := p.clock.Unix()
+	stamp := p.clock.now().Unix()
 	p.tick()
 
 	// The node delivered 8 already, so a client at 8 is valid even though the top was fetched after it.
