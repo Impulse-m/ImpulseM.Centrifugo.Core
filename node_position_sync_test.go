@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/centrifugal/protocol"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -280,4 +281,108 @@ func TestSharedPositionSyncBrokerErrorCountedAsError(t *testing.T) {
 	require.True(t, valid)
 	require.Equal(t, before, stream.historyCalls())
 	require.Equal(t, float64(1), testutil.ToFloat64(node.metrics.positionChecksCount.WithLabelValues("error", "true")))
+}
+
+// TestNodeCheckPositionMapWithMediumTwoIntervalSemantics covers a map channel with shared position sync: a client
+// ahead of the stream top with its check time before and after the top fetch, the first and the confirming
+// sighting of a mismatched epoch, and lastPosition after the mismatch is confirmed.
+func TestNodeCheckPositionMapWithMediumTwoIntervalSemantics(t *testing.T) {
+	t.Parallel()
+	node := defaultTestNode()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	node.config.Map.GetMapChannelOptions = func(channel string) MapChannelOptions {
+		return MapChannelOptions{
+			Mode:   MapModeRecoverable,
+			KeyTTL: 60 * time.Second,
+		}
+	}
+	node.config.GetChannelMediumOptions = func(channel string) ChannelMediumOptions {
+		return ChannelMediumOptions{
+			SharedPositionSync: true,
+		}
+	}
+	node.config.ClientChannelPositionCheckDelay = 0
+
+	mapBroker, err := NewMemoryMapBroker(node, MemoryMapBrokerConfig{})
+	require.NoError(t, err)
+	node.SetMapBroker(mapBroker)
+
+	ctx := context.Background()
+	channel := "test_map_medium_semantics"
+
+	// Publish data to create stream position.
+	result, err := mapBroker.Publish(ctx, channel, "key1", MapPublishOptions{
+		Data: []byte(`{"test": 1}`),
+	})
+	require.NoError(t, err)
+	streamPos := result.Position
+
+	// Create a subscription to trigger medium creation with isMap=true.
+	node.OnConnect(func(client *Client) {
+		client.OnSubscribe(func(e SubscribeEvent, cb SubscribeCallback) {
+			cb(SubscribeReply{
+				Options: SubscribeOptions{
+					Type:              SubscriptionTypeMap,
+					EnablePositioning: true,
+					HistoryMetaTTL:    200 * time.Second,
+				},
+			}, nil)
+		})
+	})
+	client := newTestConnectedClientV2(t, node, "user1")
+	subscribeMapClient(t, client, &protocol.SubscribeRequest{
+		Channel: channel,
+		Type:    int32(SubscriptionTypeMap),
+		Phase:   MapPhaseState,
+		Limit:   100,
+	})
+
+	// Correct position — valid.
+	isValid, err := node.checkPosition(channel, streamPos, 200*time.Second, true, 0)
+	require.NoError(t, err)
+	require.True(t, isValid)
+
+	// Client one position ahead of the top, checked in the same second as the fetch: valid.
+	isValid, err = node.checkPosition(channel, StreamPosition{
+		Offset: streamPos.Offset + 1,
+		Epoch:  streamPos.Epoch,
+	}, 200*time.Second, true, time.Now().Unix())
+	require.NoError(t, err)
+	require.True(t, isValid)
+
+	// Same client, checked two seconds before the fetch: invalid.
+	isValid, err = node.checkPosition(channel, StreamPosition{
+		Offset: streamPos.Offset + 1,
+		Epoch:  streamPos.Epoch,
+	}, 200*time.Second, true, time.Now().Unix()-2)
+	require.NoError(t, err)
+	require.False(t, isValid)
+
+	// Wrong epoch. The first sighting only marks the node suspect, so the client is valid.
+	isValid, err = node.checkPosition(channel, StreamPosition{
+		Offset: streamPos.Offset,
+		Epoch:  "wrong",
+	}, 200*time.Second, true, 0)
+	require.NoError(t, err)
+	require.True(t, isValid)
+
+	// The mismatch persists on the second check: the client is invalid and insufficient state is broadcast.
+	isValid, err = node.checkPosition(channel, StreamPosition{
+		Offset: streamPos.Offset,
+		Epoch:  "wrong",
+	}, 200*time.Second, true, 0)
+	require.NoError(t, err)
+	require.False(t, isValid)
+
+	// The confirmed mismatch moved the medium's lastPosition to the stream top.
+	mediumMu := node.mediumLock(channel)
+	mediumMu.Lock()
+	medium := node.mediumShard(channel)[channel]
+	mediumMu.Unlock()
+	require.NotNil(t, medium)
+	medium.mu.Lock()
+	lastPosition := medium.position.lastPosition
+	medium.mu.Unlock()
+	require.Equal(t, streamPos, lastPosition)
 }

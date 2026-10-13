@@ -1602,8 +1602,7 @@ func TestNodeCheckPositionMapWithMedium(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, isValid)
 
-	// Client one position ahead of the top. Fork: a client checked after the top was fetched is invalid, a client
-	// checked in the same second as the fetch is valid (see #11).
+	// Client one position ahead of the top. Fork: a client checked in the same second as the fetch is valid (see #11).
 	isValid, err = node.checkPosition(channel, StreamPosition{
 		Offset: streamPos.Offset + 1,
 		Epoch:  streamPos.Epoch,
@@ -1611,39 +1610,13 @@ func TestNodeCheckPositionMapWithMedium(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, isValid)
 
-	isValid, err = node.checkPosition(channel, StreamPosition{
-		Offset: streamPos.Offset + 1,
-		Epoch:  streamPos.Epoch,
-	}, 200*time.Second, true, time.Now().Unix()-2)
-	require.NoError(t, err)
-	require.False(t, isValid)
-
-	// Wrong epoch. Fork: the first sighting only marks the node suspect, so the client is valid. The mismatch
-	// persists on the second check: the client is invalid and insufficient state is broadcast (see #11).
+	// Wrong epoch. Fork: the first sighting only marks the node suspect, so the client is valid (see #11).
 	isValid, err = node.checkPosition(channel, StreamPosition{
 		Offset: streamPos.Offset,
 		Epoch:  "wrong",
 	}, 200*time.Second, true, 0)
 	require.NoError(t, err)
 	require.True(t, isValid)
-
-	isValid, err = node.checkPosition(channel, StreamPosition{
-		Offset: streamPos.Offset,
-		Epoch:  "wrong",
-	}, 200*time.Second, true, 0)
-	require.NoError(t, err)
-	require.False(t, isValid)
-
-	// The confirmed mismatch moved the medium's lastPosition to the stream top.
-	mediumMu := node.mediumLock(channel)
-	mediumMu.Lock()
-	medium := node.mediumShard(channel)[channel]
-	mediumMu.Unlock()
-	require.NotNil(t, medium)
-	medium.mu.Lock()
-	lastPosition := medium.position.lastPosition
-	medium.mu.Unlock()
-	require.Equal(t, streamPos, lastPosition)
 }
 
 func TestGetBroker(t *testing.T) {
