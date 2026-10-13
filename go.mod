@@ -15,7 +15,7 @@ require (
 	github.com/quagmt/udecimal v1.10.1
 	github.com/redis/rueidis v1.0.78
 	github.com/stretchr/testify v1.12.1
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.24.0
 	google.golang.org/protobuf v1.36.12
 )
 
