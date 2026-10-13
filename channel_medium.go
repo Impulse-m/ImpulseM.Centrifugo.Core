@@ -239,9 +239,6 @@ func (c *channelMedium) waitSendPub(delay time.Duration) bool {
 	return true
 }
 
-// close is called when the medium is removed from the Node. A publication that still reaches a closed medium
-// (it was fetched before the removal) is benign: it is broadcast to a hub that has no subscribers for the
-// channel anymore.
 func (c *channelMedium) close() {
 	close(c.closeCh)
 	// Unblock the writer goroutine. publicationQueue.Wait sleeps on a
