@@ -1,15 +1,8 @@
 package centrifuge
 
 import (
-	"time"
-
 	"github.com/centrifugal/protocol"
 )
-
-// ConnectionFlagRPCOptions is advertised by a client in ConnectRequest.Flag when it
-// sends the per-call RPC fields: headers, msg_id, ack, retransmit, after,
-// without_updates and cancel. Fork flags start at bit 32; upstream uses the low bits.
-const ConnectionFlagRPCOptions int64 = 1 << 32
 
 // RPCCallOptions carries per-call options the client sent with an RPC command.
 type RPCCallOptions struct {
@@ -41,11 +34,23 @@ func rpcCallOptionsFromProto(req *protocol.RPCRequest) RPCCallOptions {
 	}
 }
 
-// replyTime returns server time in Unix milliseconds for command replies, or zero
-// when Config.ReplyIncludeServerTime is disabled.
-func (c *Client) replyTime() int64 {
-	if !c.node.config.ReplyIncludeServerTime {
-		return 0
+func rpcResultFromReply(reply RPCReply) *protocol.RPCResult {
+	return &protocol.RPCResult{
+		Data:   reply.Data,
+		Cached: reply.Cached,
 	}
-	return time.Now().UnixMilli()
+}
+
+// redactRPCHeaders redacts RPC headers for logging. It replaces the map rather than
+// writing into it: the handler may still read the headers through RPCEvent.Call,
+// which shares this map.
+func redactRPCHeaders(cmd *protocol.Command) {
+	if cmd.Rpc == nil || len(cmd.Rpc.Headers) == 0 {
+		return
+	}
+	redactedHeaders := make(map[string]string, len(cmd.Rpc.Headers))
+	for k := range cmd.Rpc.Headers {
+		redactedHeaders[k] = redacted
+	}
+	cmd.Rpc.Headers = redactedHeaders
 }

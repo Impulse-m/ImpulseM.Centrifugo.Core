@@ -100,9 +100,7 @@ type Config struct {
 	// This field contains Unix timestamp in milliseconds and represents current server time. By default, server time
 	// is not included.
 	ClientConnectIncludeServerTime bool
-	// ReplyIncludeServerTime tells Centrifuge to set `time` field of command replies
-	// (not pushes) to current Unix timestamp in milliseconds. Disabled by default.
-	ReplyIncludeServerTime bool
+	ReplyIncludeServerTime         bool // set `time` of command replies (not pushes) to Unix ms; disabled by default
 	// ClientPresenceUpdateInterval sets an interval how often connected
 	// clients update presence information.
 	// Zero value means 25 * time.Second.

@@ -16,12 +16,9 @@ type Error struct {
 	Code      uint32
 	Message   string
 	Temporary bool
-	// AppCode is an application error code, zero means none.
-	AppCode int32
-	// AppType is an application error type, e.g. a classified error name.
-	AppType string
-	// Metadata carries allow-listed application trailers sent to the client.
-	Metadata map[string]string
+	AppCode   int32             // application error code, zero means none
+	AppType   string            // application error type
+	Metadata  map[string]string // allow-listed application trailers
 }
 
 func (e *Error) toProto() *protocol.Error {

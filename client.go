@@ -1949,15 +1949,7 @@ func redactCommand(cmd *protocol.Command) *protocol.Command {
 			cmd.Connect.Headers[k] = redacted
 		}
 	}
-	if cmd.Rpc != nil && len(cmd.Rpc.Headers) > 0 {
-		// Replace the map rather than writing into it: the handler may still read
-		// the headers through RPCEvent.Call, which shares this map.
-		redactedHeaders := make(map[string]string, len(cmd.Rpc.Headers))
-		for k := range cmd.Rpc.Headers {
-			redactedHeaders[k] = redacted
-		}
-		cmd.Rpc.Headers = redactedHeaders
-	}
+	redactRPCHeaders(cmd)
 	if cmd.Subscribe != nil && cmd.Subscribe.Token != "" {
 		cmd.Subscribe.Token = redacted
 	}
@@ -2493,10 +2485,9 @@ func (c *Client) handleRefresh(req *protocol.RefreshRequest, cmd *protocol.Comma
 		info := reply.Info
 
 		res := &protocol.RefreshResult{
-			Expires:   expireAt > 0,
-			User:      reply.User,
-			AuthClass: reply.AuthClass,
+			Expires: expireAt > 0,
 		}
+		applyRefreshReply(res, reply)
 
 		ttl := expireAt - nowUnix
 
@@ -3763,10 +3754,7 @@ func (c *Client) handleRPC(req *protocol.RPCRequest, cmd *protocol.Command, star
 			c.writeDisconnectOrErrorFlush("", protocol.FrameTypeRPC, cmd, err, started, rw)
 			return
 		}
-		result := &protocol.RPCResult{
-			Data:   reply.Data,
-			Cached: reply.Cached,
-		}
+		result := rpcResultFromReply(reply)
 		protoReply, err := c.getRPCCommandReply(result)
 		if err != nil {
 			c.logWriteInternalErrorFlush("", protocol.FrameTypeRPC, cmd, err, "error encoding rpc", started, rw)
@@ -3880,6 +3868,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	}
 	var acceptedFlags int64
 	var dict *protocol.Dictionary
+	var connectReply ConnectReply
 
 	c.mu.RLock()
 	authenticated := c.authenticated
@@ -3906,10 +3895,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 		clientSideRefresh bool
 		labels            map[string]string
 		// What the client declared about itself. An application may override it.
-		profile        = req.GetProfile()
-		replyFlags     int64
-		replyUser      string
-		replyAuthClass string
+		profile = req.GetProfile()
 	)
 
 	if c.node.clientEvents.connectingHandler != nil {
@@ -3965,9 +3951,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 		// by returning "" would be silently ignored, which is the direction a
 		// mistake must never fail in.
 		profile = reply.Profile
-		replyFlags = reply.Flags & req.Flag
-		replyUser = reply.User
-		replyAuthClass = reply.AuthClass
+		connectReply = reply
 		if len(reply.Subscriptions) > 0 {
 			subscriptions = make(map[string]SubscribeOptions, len(reply.Subscriptions))
 			for ch, opts := range reply.Subscriptions {
@@ -4120,9 +4104,8 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	// Tell the client which of the features it advertised were actually enabled.
 	// Advertising one is not enough: the node may have it turned off, or the
 	// engine may decline this particular connection.
-	res.Flag = acceptedFlags | replyFlags
-	res.User = replyUser
-	res.AuthClass = replyAuthClass
+	res.Flag = acceptedFlags
+	applyConnectReply(res, connectReply, req.Flag)
 	res.Dict = dict
 
 	if c.pingInterval > 0 {

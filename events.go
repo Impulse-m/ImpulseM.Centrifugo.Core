@@ -38,17 +38,15 @@ type ConnectEvent struct {
 	// client to server. It's up to the application to decide what to do
 	// with these headers.
 	Headers map[string]string
-	// Instance is the client-persisted install id sent on connect.
-	Instance string
+
+	Instance string // client-persisted install id, sent on connect
 }
 
 // ConnectReply contains reaction to ConnectEvent.
 type ConnectReply struct {
-	// Flags are fork connection flags the application enables; only bits the client advertised are applied.
-	Flags int64
-	// User and AuthClass are returned to the client in the connect result when set.
-	User      string
-	AuthClass string
+	Flags     int64  // extension connection flags, see connect_fields.go
+	User      string // returned in the connect result when set
+	AuthClass string // returned in the connect result when set
 	// Context allows returning a modified context.
 	Context context.Context
 	// Credentials should be set if app wants to authenticate connection.
@@ -172,9 +170,8 @@ type RefreshReply struct {
 	// TokenIdentity allows replacing identity of the token connection was
 	// authenticated with. Nil means no modification of current TokenIdentity.
 	TokenIdentity *TokenIdentity
-	// User and AuthClass are returned to the client in the refresh result when set.
-	User      string
-	AuthClass string
+	User          string // returned in the refresh result when set
+	AuthClass     string // returned in the refresh result when set
 }
 
 // RefreshCallback should be called as soon as handler decides what to do
@@ -488,16 +485,15 @@ type RPCEvent struct {
 	Method string
 	// Data contains RPC untouched payload.
 	Data []byte
-	// Call carries per-call options the client sent with the request.
-	Call RPCCallOptions
+	Call RPCCallOptions // per-call options sent with the request
 }
 
 // RPCReply contains fields determining the reaction on rpc request.
 type RPCReply struct {
 	// Data to return in RPC reply to client.
 	Data []byte
-	// Cached tells the client that the reply was answered from a dedup record.
-	Cached bool
+
+	Cached bool // answered from a dedup record
 }
 
 // RPCCallback should be called as soon as handler decides what to do
