@@ -1617,14 +1617,22 @@ func (c *Client) buildMapChannelFlags(deltaEnabled bool, delta string, isPresenc
 
 // setupMapPresenceAndJoin handles presence and join event setup for map subscriptions.
 func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) {
-	// Add presence if enabled (uses MapBroker for map channels).
-	if opts.EmitPresence {
-		info := &ClientInfo{
+	// One snapshot of the identity serves the presence and the join below. It is
+	// read only when one of them is enabled.
+	var info *ClientInfo
+	if opts.EmitPresence || opts.MapClientPresenceChannel != "" || opts.EmitJoinLeave {
+		c.mu.RLock()
+		info = &ClientInfo{
 			ClientID: c.uid,
-			UserID:   c.UserID(),
-			ConnInfo: c.connInfo(),
+			UserID:   c.user,
+			ConnInfo: c.info,
 			ChanInfo: opts.ChannelInfo,
 		}
+		c.mu.RUnlock()
+	}
+
+	// Add presence if enabled (uses MapBroker for map channels).
+	if opts.EmitPresence {
 		if err := c.node.addPresence(channel, c.uid, info); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error adding client presence", map[string]any{
 				"channel": channel, "user": c.UserID(), "client": c.uid,
@@ -1634,18 +1642,14 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 
 	// Add map client presence if channel is configured.
 	if opts.MapClientPresenceChannel != "" {
-		info := &ClientInfo{
-			ClientID: c.uid,
-			UserID:   c.UserID(),
-			ConnInfo: c.connInfo(),
-			ChanInfo: opts.ChannelInfo,
-		}
 		if err := c.addMapClientPresence(opts.MapClientPresenceChannel, info); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error adding map client presence", map[string]any{
 				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 		}
 	}
+
+	c.recheckPresenceIdentity(channel, opts.EmitPresence || opts.MapClientPresenceChannel != "", info)
 
 	// Add map user presence if channel is configured.
 	if opts.MapUserPresenceChannel != "" {
@@ -1662,12 +1666,6 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 	// the race to the broker — observers would see [leave, join] on the
 	// wire, corrupting any membership state derived from join/leave events.
 	if opts.EmitJoinLeave {
-		info := &ClientInfo{
-			ClientID: c.uid,
-			UserID:   c.UserID(),
-			ConnInfo: c.connInfo(),
-			ChanInfo: opts.ChannelInfo,
-		}
 		_ = c.node.publishJoin(channel, info)
 	}
 }
