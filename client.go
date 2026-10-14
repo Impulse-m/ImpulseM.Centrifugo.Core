@@ -304,9 +304,12 @@ type Client struct {
 	uid              string
 	session          string
 	user             string
-	info             []byte
-	tokenIdentity    TokenIdentity
-	storage          map[string]any
+	// userAtomic mirrors user for lock-free reads, because Rebind may change the
+	// user of a live client.
+	userAtomic    atomic.Pointer[string]
+	info          []byte
+	tokenIdentity TokenIdentity
+	storage       map[string]any
 	// profile is the application context this connection belongs to, resolved at
 	// connect: what an OnConnecting handler set, or failing that what the client
 	// declared. Empty means unclassified.
@@ -909,12 +912,12 @@ func (c *Client) removePresenceAndLeave(channel string, chCtx ChannelContext) {
 	if hasMapPresenceOrCleanup {
 		err := c.removeMapPresence(channel, chCtx)
 		if err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error removing channel presence", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+			c.node.logger.log(newErrorLogEntry(err, "error removing channel presence", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		}
 	} else if channelHasFlag(chCtx.flags, flagEmitPresence) {
-		err := c.node.removePresence(channel, c.uid, c.user)
+		err := c.node.removePresence(channel, c.uid, c.UserID())
 		if err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error removing channel presence", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+			c.node.logger.log(newErrorLogEntry(err, "error removing channel presence", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		}
 	}
 	if channelHasFlag(chCtx.flags, flagEmitJoinLeave) {
@@ -923,7 +926,7 @@ func (c *Client) removePresenceAndLeave(channel string, chCtx ChannelContext) {
 		c.mu.RUnlock()
 		_ = c.node.publishLeave(channel, &ClientInfo{
 			ClientID: c.uid,
-			UserID:   c.user,
+			UserID:   c.UserID(),
 			ConnInfo: connInfo,
 			ChanInfo: chCtx.info,
 		})
@@ -939,14 +942,14 @@ func (c *Client) publishJoinAndPresence(channel string, chCtx ChannelContext, cl
 	if chCtx.mapClientPresenceChannel != "" {
 		if err := c.addMapClientPresence(chCtx.mapClientPresenceChannel, clientInfo); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error adding map client presence", map[string]any{
-				"channel": channel, "user": c.user, "client": c.uid,
+				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 		}
 	}
 	if chCtx.mapUserPresenceChannel != "" {
 		if err := c.addMapUserPresence(chCtx.mapUserPresenceChannel); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error adding map user presence", map[string]any{
-				"channel": channel, "user": c.user, "client": c.uid,
+				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 		}
 	}
@@ -977,7 +980,7 @@ func (c *Client) updateChannelPresence(ch string, chCtx ChannelContext) (attempt
 
 	info := &ClientInfo{
 		ClientID: c.uid,
-		UserID:   c.user,
+		UserID:   c.UserID(),
 		ConnInfo: c.info,
 		ChanInfo: chCtx.info,
 	}
@@ -1088,7 +1091,7 @@ func (c *Client) updateChannelPresenceItem(item *channelTickItem) {
 	attempted, err := c.updateChannelPresence(item.channel, item.ctx)
 	if err != nil {
 		c.node.logger.log(newErrorLogEntry(err, "error updating presence for channel", map[string]any{
-			"channel": item.channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+			"channel": item.channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 	}
 	// Marked even on error: a partial success (node-level add landed, map
 	// presence update failed) must still be compensated if the channel was
@@ -1205,15 +1208,15 @@ func (c *Client) compensateRacedPresenceAfterSubscribe(ch string, item ChannelCo
 // the channel can't add presence before it.
 func (c *Client) removeRacedPresence(ch string, chCtx ChannelContext, node, mapClient bool) {
 	if node {
-		if err := c.node.removePresence(ch, c.uid, c.user); err != nil {
+		if err := c.node.removePresence(ch, c.uid, c.UserID()); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error removing raced channel presence", map[string]any{
-				"channel": ch, "user": c.user, "client": c.uid, "error": err.Error()}))
+				"channel": ch, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		}
 	}
 	if mapClient {
 		if _, err := c.node.MapRemove(context.Background(), chCtx.mapClientPresenceChannel, c.uid, MapRemoveOptions{}); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error removing raced map client presence", map[string]any{
-				"channel": ch, "user": c.user, "client": c.uid, "error": err.Error()}))
+				"channel": ch, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		}
 	}
 	// User presence is intentionally not removed: unsubscribe does not remove it
@@ -1478,7 +1481,7 @@ func (c *Client) updatePresence() {
 		if item.positionInvalid {
 			serverSide := channelHasFlag(channelContext.flags, flagServerSide)
 			if c.node.logger.enabled(LogLevelDebug) {
-				c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state from periodic check", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+				c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state from periodic check", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			}
 			if c.isAsyncUnsubscribe(serverSide) {
 				go func(ch string, subGen uint64) { c.handleAsyncUnsubscribe(ch, subGen, unsubscribeInsufficientState) }(channel, channelContext.subGen)
@@ -1568,9 +1571,20 @@ func (c *Client) sessionID() string {
 	return c.session
 }
 
-// UserID returns user id associated with client connection.
+// UserID returns user id associated with client connection. It takes no lock:
+// it reads the atomic mirror, so it is safe to call from any lock state.
 func (c *Client) UserID() string {
-	return c.user
+	if user := c.userAtomic.Load(); user != nil {
+		return *user
+	}
+	return ""
+}
+
+// storeUser sets the user and its lock-free mirror read by UserID. Lock must be
+// held outside.
+func (c *Client) storeUser(user string) {
+	c.user = user
+	c.userAtomic.Store(&user)
 }
 
 // Info returns connection info.
@@ -1722,7 +1736,7 @@ func (c *Client) Unsubscribe(ch string, unsubscribe ...Unsubscribe) {
 
 	err := c.unsubscribeWaiting(ch, unsub, nil, subscribeInProgressTimeout.get(), true, 0)
 	if err != nil {
-		c.node.logger.log(newErrorLogEntry(err, "error unsubscribe", map[string]any{"channel": ch, "user": c.user, "client": c.uid, "error": err.Error()}))
+		c.node.logger.log(newErrorLogEntry(err, "error unsubscribe", map[string]any{"channel": ch, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		go c.Disconnect(DisconnectServerError)
 		return
 	}
@@ -1932,7 +1946,7 @@ func (c *Client) clientInfo(ch string) *ClientInfo {
 	}
 	return &ClientInfo{
 		ClientID: c.uid,
-		UserID:   c.user,
+		UserID:   c.UserID(),
 		ConnInfo: c.info,
 		ChanInfo: channelInfo,
 	}
@@ -2280,7 +2294,7 @@ func (c *Client) expire() {
 					_ = c.close(*disconnect)
 					return
 				}
-				c.node.logger.log(newErrorLogEntry(err, "unexpected error from refresh handler", map[string]any{"user": c.user, "client": c.uid, "error": err.Error()}))
+				c.node.logger.log(newErrorLogEntry(err, "unexpected error from refresh handler", map[string]any{"user": c.UserID(), "client": c.uid, "error": err.Error()}))
 				_ = c.close(DisconnectServerError)
 				return
 			}
@@ -2555,7 +2569,7 @@ func (c *Client) onSubscribeErrorGen(channel string, expectGen uint64) {
 		// mints a non-zero generation before it can fail, so this is unreachable;
 		// refuse rather than corrupt state if a future caller gets it wrong.
 		c.node.logger.log(newLogEntry(LogLevelError, "subscribe rollback with zero generation", map[string]any{
-			"channel": channel, "user": c.user, "client": c.uid}))
+			"channel": channel, "user": c.UserID(), "client": c.uid}))
 		return
 	}
 	c.mu.Lock()
@@ -2780,7 +2794,7 @@ func (c *Client) waitPendingUnsubscribes(timeout time.Duration) {
 	if c.waitUntil(func() bool { return c.pendingUnsubscribes == 0 }, timeout) {
 		return
 	}
-	c.node.logger.log(newLogEntry(LogLevelWarn, "unsubscribe handler not finished within timeout, calling disconnect handler", map[string]any{"client": c.uid, "user": c.user, "timeout": timeout.String()}))
+	c.node.logger.log(newLogEntry(LogLevelWarn, "unsubscribe handler not finished within timeout, calling disconnect handler", map[string]any{"client": c.uid, "user": c.UserID(), "timeout": timeout.String()}))
 }
 
 // mustWaitAttemptEndsLocked tells a subscribe request, in the c.mu critical
@@ -2828,13 +2842,13 @@ func (c *Client) waitAttemptEnds(channel string, deadline time.Time) {
 		c.logLeaveNotFinished(channel)
 		return
 	}
-	c.node.logger.log(newLogEntry(LogLevelWarn, "unsubscribe handler not finished within timeout, calling subscribe handler", map[string]any{"channel": channel, "client": c.uid, "user": c.user, "timeout": pendingUnsubscribesSubscribeTimeout.get().String()}))
+	c.node.logger.log(newLogEntry(LogLevelWarn, "unsubscribe handler not finished within timeout, calling subscribe handler", map[string]any{"channel": channel, "client": c.uid, "user": c.UserID(), "timeout": pendingUnsubscribesSubscribeTimeout.get().String()}))
 }
 
 // logLeaveNotFinished logs a subscribe which stopped waiting for the leave of
 // the channel's previous subscription, see addPendingLeaveLocked.
 func (c *Client) logLeaveNotFinished(channel string) {
-	c.node.logger.log(newLogEntry(LogLevelWarn, "leave of previous subscription not finished within timeout, subscribing", map[string]any{"channel": channel, "client": c.uid, "user": c.user, "timeout": pendingUnsubscribesSubscribeTimeout.get().String()}))
+	c.node.logger.log(newLogEntry(LogLevelWarn, "leave of previous subscription not finished within timeout, subscribing", map[string]any{"channel": channel, "client": c.uid, "user": c.UserID(), "timeout": pendingUnsubscribesSubscribeTimeout.get().String()}))
 }
 
 // endSubscribeAttempt calls UnsubscribeHandler for a subscribe attempt allowed
@@ -2900,7 +2914,7 @@ func (c *Client) answerSubscribeCallback(channel string, subGen uint64, allowed 
 	c.mu.Lock()
 	if *answered {
 		c.mu.Unlock()
-		c.node.logger.log(newLogEntry(LogLevelError, "subscribe callback invoked more than once", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+		c.node.logger.log(newLogEntry(LogLevelError, "subscribe callback invoked more than once", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 		return false, false
 	}
 	*answered = true
@@ -3194,7 +3208,7 @@ func (c *Client) handleSubRefresh(req *protocol.SubRefreshRequest, cmd *protocol
 			// makes them resubscribe with the new filter.
 			// Only this subscription: a resubscribe may have come meanwhile.
 			if err := c.unsubscribeWaiting(channel, unsub, nil, subscribeInProgressTimeout.get(), true, ctx.subGen); err != nil {
-				c.node.logger.log(newErrorLogEntry(err, "error unsubscribe", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+				c.node.logger.log(newErrorLogEntry(err, "error unsubscribe", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 				go c.Disconnect(DisconnectServerError)
 			}
 		}
@@ -3414,7 +3428,7 @@ func (c *Client) cleanupMapKeyIfUnsubscribed(channel string) {
 	}
 	defer c.finishPendingLeave(channel)
 	if _, err := c.node.MapRemove(context.Background(), channel, c.uid, MapRemoveOptions{}); err != nil {
-		c.node.logger.log(newErrorLogEntry(err, "error cleaning up map state after unsubscribe", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+		c.node.logger.log(newErrorLogEntry(err, "error cleaning up map state after unsubscribe", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 	}
 }
 
@@ -3991,7 +4005,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	}
 
 	c.mu.Lock()
-	c.user = credentials.UserID
+	c.storeUser(credentials.UserID)
 	c.info = credentials.Info
 	c.tokenIdentity = credentials.TokenIdentity
 	c.exp = min(credentials.ExpireAt, time.Now().Unix()+maxTTLSeconds)
@@ -4006,7 +4020,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	}
 
 	if c.node.logEnabled(LogLevelDebug) {
-		c.node.logger.log(newLogEntry(LogLevelDebug, "client authenticated", map[string]any{"client": c.uid, "user": c.user}))
+		c.node.logger.log(newLogEntry(LogLevelDebug, "client authenticated", map[string]any{"client": c.uid, "user": c.UserID()}))
 	}
 
 	if userConnectionLimit > 0 && user != "" && len(c.node.hub.UserConnections(user)) >= userConnectionLimit {
@@ -4020,7 +4034,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 		now := time.Now().Unix()
 		if exp < now {
 			c.mu.RUnlock()
-			c.node.logger.log(newLogEntry(LogLevelInfo, "connection expiration must be greater than now", map[string]any{"client": c.uid, "user": c.UserID()}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "connection expiration must be greater than now", map[string]any{"client": c.uid, "user": user}))
 			return ErrorExpired
 		}
 		ttl = uint32(exp - now)
@@ -4395,7 +4409,7 @@ func (c *Client) startWriter(batchDelay time.Duration, maxMessagesInFrame int, q
 				defer writeMu.Unlock()
 				if err := c.transport.Write(item.Data); err != nil {
 					if c.node.logger.enabled(LogLevelTrace) {
-						c.node.logger.log(newLogEntry(LogLevelTrace, "client write failed", map[string]any{"client": c.uid, "user": c.user, "error": err.Error()}))
+						c.node.logger.log(newLogEntry(LogLevelTrace, "client write failed", map[string]any{"client": c.uid, "user": c.UserID(), "error": err.Error()}))
 					}
 					disconnect, ok := disconnectFromError(err)
 					if ok {
@@ -4465,7 +4479,7 @@ func (c *Client) startWriter(batchDelay time.Duration, maxMessagesInFrame int, q
 
 				if err != nil {
 					if c.node.logger.enabled(LogLevelTrace) {
-						c.node.logger.log(newLogEntry(LogLevelTrace, "client write failed", map[string]any{"client": c.uid, "user": c.user, "error": err.Error()}))
+						c.node.logger.log(newLogEntry(LogLevelTrace, "client write failed", map[string]any{"client": c.uid, "user": c.UserID(), "error": err.Error()}))
 					}
 					disconnect, ok := disconnectFromError(err)
 					if ok {
@@ -4698,7 +4712,7 @@ func (c *Client) getSubscribePushReply(channel string, res *protocol.SubscribeRe
 func (c *Client) validateSubscribeRequest(cmd *protocol.SubscribeRequest, waitDeadline *time.Time) (uint64, bool, *Error, *Disconnect) {
 	channel := cmd.Channel
 	if channel == "" {
-		c.node.logger.log(newLogEntry(LogLevelInfo, "channel required for subscribe", map[string]any{"user": c.user, "client": c.uid}))
+		c.node.logger.log(newLogEntry(LogLevelInfo, "channel required for subscribe", map[string]any{"user": c.UserID(), "client": c.uid}))
 		return 0, false, nil, &DisconnectBadRequest
 	}
 
@@ -4707,7 +4721,7 @@ func (c *Client) validateSubscribeRequest(cmd *protocol.SubscribeRequest, waitDe
 	channelLimit := config.ClientChannelLimit
 
 	if channelMaxLength > 0 && len(channel) > channelMaxLength {
-		c.node.logger.log(newLogEntry(LogLevelInfo, "channel too long", map[string]any{"max": channelMaxLength, "channel": channel, "user": c.user, "client": c.uid}))
+		c.node.logger.log(newLogEntry(LogLevelInfo, "channel too long", map[string]any{"max": channelMaxLength, "channel": channel, "user": c.UserID(), "client": c.uid}))
 		return 0, false, ErrorBadRequest, nil
 	}
 
@@ -4723,7 +4737,7 @@ func (c *Client) validateSubscribeRequest(cmd *protocol.SubscribeRequest, waitDe
 
 		if c.mapSubscribePendingLocked(channel) {
 			c.mu.Unlock()
-			c.node.logger.log(newLogEntry(LogLevelInfo, "client already subscribing on channel", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "client already subscribing on channel", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			return 0, false, ErrorAlreadySubscribed, nil
 		}
 
@@ -4736,14 +4750,14 @@ func (c *Client) validateSubscribeRequest(cmd *protocol.SubscribeRequest, waitDe
 		// If already fully subscribed, reject.
 		if inChannels {
 			c.mu.Unlock()
-			c.node.logger.log(newLogEntry(LogLevelInfo, "client already subscribed on channel", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "client already subscribed on channel", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			return 0, false, ErrorAlreadySubscribed, nil
 		}
 
 		// If already in map subscribing and this is an initial request, reject.
 		if inMapSubscribing && cmd.Cursor == "" && cmd.Phase == MapPhaseState {
 			c.mu.Unlock()
-			c.node.logger.log(newLogEntry(LogLevelInfo, "client already subscribing on channel", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "client already subscribing on channel", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			return 0, false, ErrorAlreadySubscribed, nil
 		}
 
@@ -4751,7 +4765,7 @@ func (c *Client) validateSubscribeRequest(cmd *protocol.SubscribeRequest, waitDe
 		numChannels := c.numChannelsLocked()
 		if channelLimit > 0 && numChannels >= channelLimit {
 			c.mu.Unlock()
-			c.node.logger.log(newLogEntry(LogLevelInfo, "maximum limit of channels per client reached", map[string]any{"limit": channelLimit, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "maximum limit of channels per client reached", map[string]any{"limit": channelLimit, "user": c.UserID(), "client": c.uid}))
 			return 0, false, ErrorLimitExceeded, nil
 		}
 		c.mu.Unlock()
@@ -4774,12 +4788,12 @@ func (c *Client) validateSubscribeRequest(cmd *protocol.SubscribeRequest, waitDe
 	}
 	if ok {
 		c.mu.Unlock()
-		c.node.logger.log(newLogEntry(LogLevelInfo, "client already subscribed on channel", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+		c.node.logger.log(newLogEntry(LogLevelInfo, "client already subscribed on channel", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 		return 0, false, ErrorAlreadySubscribed, nil
 	}
 	if channelLimit > 0 && numChannels >= channelLimit {
 		c.mu.Unlock()
-		c.node.logger.log(newLogEntry(LogLevelInfo, "maximum limit of channels per client reached", map[string]any{"limit": channelLimit, "user": c.user, "client": c.uid}))
+		c.node.logger.log(newLogEntry(LogLevelInfo, "maximum limit of channels per client reached", map[string]any{"limit": channelLimit, "user": c.UserID(), "client": c.uid}))
 		return 0, false, ErrorLimitExceeded, nil
 	}
 	// Put channel to a map to track duplicate subscriptions. This channel should
@@ -4928,9 +4942,9 @@ func (c *Client) removeSubscribePresence(channel string, flags uint16) {
 	if !channelHasFlag(flags, flagEmitPresence) {
 		return
 	}
-	if err := c.node.removePresence(channel, c.uid, c.user); err != nil {
+	if err := c.node.removePresence(channel, c.uid, c.UserID()); err != nil {
 		c.node.logger.log(newErrorLogEntry(err, "error removing presence on subscribe rollback", map[string]any{
-			"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+			"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 	}
 }
 
@@ -5130,7 +5144,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 
 	info := &ClientInfo{
 		ClientID: c.uid,
-		UserID:   c.user,
+		UserID:   c.UserID(),
 		ConnInfo: c.info,
 		ChanInfo: reply.Options.ChannelInfo,
 	}
@@ -5163,11 +5177,11 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 	sub := subInfo{client: c, deltaType: deltaTypeNone, useID: useID, subGen: subGen}
 	if req.Tf != nil {
 		if !reply.Options.AllowTagsFilter {
-			c.node.logger.log(newLogEntry(LogLevelInfo, "tags filter not allowed", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "tags filter not allowed", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			return errorDisconnectContext(ErrorBadRequest, nil)
 		}
 		if err := filter.Validate(req.Tf); err != nil {
-			c.node.logger.log(newLogEntry(LogLevelInfo, "invalid tags filter", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "invalid tags filter", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			return errorDisconnectContext(ErrorBadRequest, nil)
 		}
 		sub.tagsFilter = &tagsFilter{
@@ -5213,7 +5227,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 		if !ok || c.status == statusClosed {
 			c.mu.Unlock()
 			c.pubSubSync.CancelBuffering(pubSubBuf)
-			c.node.logger.log(newLogEntry(LogLevelInfo, "client closed or unsubscribed before adding subscription", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "client closed or unsubscribed before adding subscription", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			ctx.disconnect = &DisconnectServerError
 			return ctx
 		}
@@ -5221,7 +5235,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 	}
 	chanID, err := c.node.addSubscription(channel, sub)
 	if err != nil {
-		c.node.logger.log(newErrorLogEntry(err, "error adding subscription", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+		c.node.logger.log(newErrorLogEntry(err, "error adding subscription", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		c.pubSubSync.CancelBuffering(pubSubBuf)
 		var clientErr *Error
 		if errors.As(err, &clientErr) && !errors.Is(clientErr, ErrorInternal) {
@@ -5239,7 +5253,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 		if !ok || c.status == statusClosed {
 			c.mu.Unlock()
 			c.pubSubSync.CancelBuffering(pubSubBuf)
-			c.node.logger.log(newLogEntry(LogLevelInfo, "client closed or unsubscribed after adding subscription", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "client closed or unsubscribed after adding subscription", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			ctx.disconnect = &DisconnectServerError
 			return ctx
 		}
@@ -5252,7 +5266,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 		// reporting failure, and removal is idempotent.
 		presenceAdded = true
 		if err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error adding presence", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+			c.node.logger.log(newErrorLogEntry(err, "error adding presence", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 			c.pubSubSync.CancelBuffering(pubSubBuf)
 			ctx.disconnect = &DisconnectServerError
 			return ctx
@@ -5309,7 +5323,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 				var currentSP StreamPosition
 				latestPub, recoveredPub, currentSP, err = c.node.recoverCache(channel, reply.Options.HistoryMetaTTL, sub.tagsFilter, sub.serverTagsFilter)
 				if err != nil {
-					c.node.logger.log(newErrorLogEntry(err, "error on cache recover", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+					c.node.logger.log(newErrorLogEntry(err, "error on cache recover", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 					return handleErr(err)
 				}
 				latestOffset = currentSP.Offset
@@ -5320,14 +5334,14 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 				if latestPub == nil && c.node.clientEvents.cacheEmptyHandler != nil {
 					cacheReply, err := c.node.clientEvents.cacheEmptyHandler(CacheEmptyEvent{Channel: channel})
 					if err != nil {
-						c.node.logger.log(newErrorLogEntry(err, "error on cache empty", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+						c.node.logger.log(newErrorLogEntry(err, "error on cache empty", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 						return handleErr(err)
 					}
 					if cacheReply.Populated && !recovered {
 						// One more chance to recover in case we know cache was populated.
 						latestPub, recoveredPub, currentSP, err = c.node.recoverCache(channel, reply.Options.HistoryMetaTTL, sub.tagsFilter, sub.serverTagsFilter)
 						if err != nil {
-							c.node.logger.log(newErrorLogEntry(err, "error on populated cache recover", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+							c.node.logger.log(newErrorLogEntry(err, "error on populated cache recover", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 							return handleErr(err)
 						}
 						latestOffset = currentSP.Offset
@@ -5365,7 +5379,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 						res.Recovered = false
 						c.node.metrics.incRecover(res.Recovered, channel, false, c)
 					} else {
-						c.node.logger.log(newErrorLogEntry(err, "error on recover", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+						c.node.logger.log(newErrorLogEntry(err, "error on recover", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 						return handleErr(err)
 					}
 				} else {
@@ -5397,7 +5411,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 		} else {
 			streamTop, err := c.node.streamTop(channel, reply.Options.HistoryMetaTTL)
 			if err != nil {
-				c.node.logger.log(newErrorLogEntry(err, "error getting stream state for channel", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+				c.node.logger.log(newErrorLogEntry(err, "error getting stream state for channel", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 				return handleErr(err)
 			}
 			latestOffset = streamTop.Offset
@@ -5600,7 +5614,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 	}
 
 	if c.node.logger.enabled(LogLevelDebug) {
-		c.node.logger.log(newLogEntry(LogLevelDebug, "client subscribed to channel", map[string]any{"client": c.uid, "user": c.user, "channel": req.Channel}))
+		c.node.logger.log(newLogEntry(LogLevelDebug, "client subscribed to channel", map[string]any{"client": c.uid, "user": c.UserID(), "channel": req.Channel}))
 	}
 
 	ctx.result = res
@@ -5746,7 +5760,7 @@ func (c *Client) handleInsufficientStateDisconnect() {
 func (c *Client) handleAsyncUnsubscribe(ch string, subGen uint64, unsub Unsubscribe) {
 	err := c.unsubscribeWaiting(ch, unsub, nil, subscribeInProgressTimeout.get(), true, subGen)
 	if err != nil {
-		c.node.logger.log(newErrorLogEntry(err, "error async unsubscribing", map[string]any{"channel": ch, "user": c.user, "client": c.uid, "error": err.Error()}))
+		c.node.logger.log(newErrorLogEntry(err, "error async unsubscribing", map[string]any{"channel": ch, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		_ = c.close(DisconnectServerError)
 		return
 	}
@@ -5815,7 +5829,7 @@ func (c *Client) publicationDataUpdatePositionLocked(
 		// due to periodic sync. While connection channel is in the insufficient state we must
 		// skip publications coming to it. This mode may be useful to spread the resubscribe load.
 		if c.node.logger.enabled(LogLevelDebug) {
-			c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (lag)", map[string]any{"channel": ch, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (lag)", map[string]any{"channel": ch, "user": c.UserID(), "client": c.uid}))
 		}
 		// Tell client about insufficient state, can reconnect/resubscribe to recover the state.
 		go func() { c.handleInsufficientState(ch, serverSide) }()
@@ -5834,7 +5848,7 @@ func (c *Client) publicationDataUpdatePositionLocked(
 		} else {
 			// Real epoch mismatch (e.g. after Clear) — insufficient state.
 			if c.node.logger.enabled(LogLevelDebug) {
-				c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (epoch)", map[string]any{"channel": ch, "user": c.user, "client": c.uid, "epoch": pubEpoch, "expectedEpoch": channelContext.streamPosition.Epoch}))
+				c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (epoch)", map[string]any{"channel": ch, "user": c.UserID(), "client": c.uid, "epoch": pubEpoch, "expectedEpoch": channelContext.streamPosition.Epoch}))
 			}
 			go func() { c.handleInsufficientState(ch, serverSide) }()
 			return nil, false
@@ -5847,7 +5861,7 @@ func (c *Client) publicationDataUpdatePositionLocked(
 		// due to periodic sync. While connection channel is in the insufficient state we must
 		// skip publications coming to it. This mode may be useful to spread the resubscribe load.
 		if c.node.logger.enabled(LogLevelDebug) {
-			c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (offset)", map[string]any{"channel": ch, "user": c.user, "client": c.uid, "offset": pubOffset, "expectedOffset": nextExpectedOffset}))
+			c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (offset)", map[string]any{"channel": ch, "user": c.UserID(), "client": c.uid, "offset": pubOffset, "expectedOffset": nextExpectedOffset}))
 		}
 		// Tell client about insufficient state, can reconnect/resubscribe to recover the state.
 		go func() { c.handleInsufficientState(ch, serverSide) }()
@@ -6146,7 +6160,7 @@ func (c *Client) unsubscribeWaiting(channel string, unsubscribe Unsubscribe, dis
 			go func() {
 				_ = c.close(DisconnectServerError)
 			}()
-			c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for subscribe to finish", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for subscribe to finish", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			return nil
 		}
 	}
@@ -6208,7 +6222,7 @@ func (c *Client) unsubscribeWaiting(channel string, unsubscribe Unsubscribe, dis
 			if removedState {
 				c.endSubscribeAttempt(channel, &unsubscribe, disconnect)
 			}
-			c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for keyed subscribe to finish", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for keyed subscribe to finish", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			if disconnect == nil || !committed || current.subGen != targetSubGen {
 				go func() {
 					_ = c.close(DisconnectServerError)
@@ -6236,7 +6250,7 @@ func (c *Client) unsubscribeWaiting(channel string, unsubscribe Unsubscribe, dis
 		if trackDeadline.IsZero() {
 			trackDeadline = time.Now().Add(maxWaitTimeout)
 		} else if !time.Now().Before(trackDeadline) {
-			c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for shared poll track to finish", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for shared poll track to finish", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			break
 		}
 		c.mu.Unlock()
@@ -6360,7 +6374,7 @@ func (c *Client) unsubscribeWaiting(channel string, unsubscribe Unsubscribe, dis
 		c.finishPendingLeave(channel)
 	}
 	if err != nil {
-		c.node.logger.log(newErrorLogEntry(err, "error removing subscription", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+		c.node.logger.log(newErrorLogEntry(err, "error removing subscription", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		return err
 	}
 
@@ -6381,14 +6395,14 @@ func (c *Client) unsubscribeWaiting(channel string, unsubscribe Unsubscribe, dis
 	}
 
 	if c.node.logger.enabled(LogLevelDebug) {
-		c.node.logger.log(newLogEntry(LogLevelDebug, "client unsubscribed from channel", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+		c.node.logger.log(newLogEntry(LogLevelDebug, "client unsubscribed from channel", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 	}
 
 	return nil
 }
 
 func (c *Client) logDisconnectBadRequest(message string) error {
-	c.node.logger.log(newLogEntry(LogLevelInfo, message, map[string]any{"user": c.user, "client": c.uid}))
+	c.node.logger.log(newLogEntry(LogLevelInfo, message, map[string]any{"user": c.UserID(), "client": c.uid}))
 	return DisconnectBadRequest
 }
 
@@ -6436,5 +6450,5 @@ func disconnectFromError(err error) (*Disconnect, bool) {
 // which is not valid: the subscription is refused (or its refresh fails), as
 // matching publications against it is impossible.
 func (c *Client) logInvalidServerTagsFilter(channel string, err error) {
-	c.node.logger.log(newLogEntry(LogLevelError, "invalid server tags filter", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+	c.node.logger.log(newLogEntry(LogLevelError, "invalid server tags filter", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 }

@@ -118,13 +118,13 @@ func (c *Client) validateAndCreateTagsFilter(req *protocol.SubscribeRequest, all
 	}
 	if !allowTagsFilter {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "tags filter not allowed for map channel", map[string]any{
-			"channel": channel, "user": c.user, "client": c.uid,
+			"channel": channel, "user": c.UserID(), "client": c.uid,
 		}))
 		return nil, ErrorBadRequest
 	}
 	if err := filter.Validate(req.Tf); err != nil {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "invalid tags filter for map channel", map[string]any{
-			"channel": channel, "user": c.user, "client": c.uid,
+			"channel": channel, "user": c.UserID(), "client": c.uid,
 		}))
 		return nil, ErrorBadRequest
 	}
@@ -224,7 +224,7 @@ func (c *Client) waitAllMapSubscribesPending(timeout time.Duration) {
 		return
 	}
 	if !c.waitUntil(func() bool { return len(c.tracking.mapSubscribePending) == 0 }, timeout) {
-		c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for map subscribe to finish", map[string]any{"user": c.user, "client": c.uid}))
+		c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for map subscribe to finish", map[string]any{"user": c.UserID(), "client": c.uid}))
 	}
 }
 
@@ -245,7 +245,7 @@ func (c *Client) waitChannelMapSubscribePending(channel string, timeout time.Dur
 		go func() {
 			_ = c.close(DisconnectServerError)
 		}()
-		c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for map subscribe to finish", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+		c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for map subscribe to finish", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 	}
 }
 
@@ -306,7 +306,7 @@ func (c *Client) handleMapSubscribeCommand(
 	c.sweepExpiredMapSubscribing(req.Channel)
 	if c.sweptMapContinuation(req) {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "map subscribe catch-up timeout", map[string]any{
-			"channel": req.Channel, "user": c.user, "client": c.uid,
+			"channel": req.Channel, "user": c.UserID(), "client": c.uid,
 		}))
 		return DisconnectSlow
 	}
@@ -324,7 +324,7 @@ func (c *Client) handleMapSubscribeCommand(
 		catchUpChOpts, _ := c.node.resolveMapChannelOptions(req.Channel)
 		if c.isMapCatchUpExpired(state, catchUpChOpts) {
 			c.node.logger.log(newLogEntry(LogLevelInfo, "map subscribe catch-up timeout", map[string]any{
-				"channel": req.Channel, "user": c.user, "client": c.uid,
+				"channel": req.Channel, "user": c.UserID(), "client": c.uid,
 			}))
 			c.cleanupMapSubscribing(req.Channel)
 			return DisconnectSlow
@@ -340,7 +340,7 @@ func (c *Client) handleMapSubscribeCommand(
 		catchUpChOpts, _ := c.node.resolveMapChannelOptions(req.Channel)
 		if c.isMapCatchUpExpired(state, catchUpChOpts) {
 			c.node.logger.log(newLogEntry(LogLevelInfo, "map subscribe catch-up timeout", map[string]any{
-				"channel": req.Channel, "user": c.user, "client": c.uid,
+				"channel": req.Channel, "user": c.UserID(), "client": c.uid,
 			}))
 			c.cleanupMapSubscribing(req.Channel)
 			return DisconnectSlow
@@ -373,7 +373,7 @@ func (c *Client) handleMapSubscribeCommand(
 		c.mu.Lock()
 		if attempt.answered {
 			c.mu.Unlock()
-			c.node.logger.log(newLogEntry(LogLevelError, "subscribe callback invoked more than once", map[string]any{"channel": req.Channel, "user": c.user, "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelError, "subscribe callback invoked more than once", map[string]any{"channel": req.Channel, "user": c.UserID(), "client": c.uid}))
 			return
 		}
 		attempt.answered = true
@@ -459,7 +459,7 @@ func (c *Client) handleMapSubscribe(
 	default:
 		c.cleanupContinuationMapSubscribing(channel, attempt)
 		c.node.logger.log(newLogEntry(LogLevelInfo, "invalid map phase", map[string]any{
-			"channel": channel, "phase": req.Phase, "user": c.user, "client": c.uid,
+			"channel": channel, "phase": req.Phase, "user": c.UserID(), "client": c.uid,
 		}))
 		return ErrorBadRequest
 	}
@@ -539,7 +539,7 @@ func (c *Client) handleMapStatePhase(
 		c.mu.RUnlock()
 		if !ok {
 			c.node.logger.log(newLogEntry(LogLevelInfo, "map subscription not authorized", map[string]any{
-				"channel": channel, "user": c.user, "client": c.uid,
+				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 			return ErrorPermissionDenied
 		}
@@ -574,7 +574,7 @@ func (c *Client) handleMapStatePhase(
 			return ErrorUnrecoverablePosition
 		}
 		c.node.logger.log(newErrorLogEntry(err, "error reading map state", map[string]any{
-			"channel": channel, "user": c.user, "client": c.uid,
+			"channel": channel, "user": c.UserID(), "client": c.uid,
 		}))
 		c.cleanupMapSubscribing(channel)
 		return ErrorInternal
@@ -876,7 +876,7 @@ func (c *Client) handleMapTransitionToLive(
 		c.pubSubSync.CancelBuffering(pubSubBuf)
 		c.cleanupMapSubscribingState(channel, ourState)
 		c.node.logger.log(newErrorLogEntry(err, "error adding map subscription", map[string]any{
-			"channel": channel, "user": c.user, "client": c.uid,
+			"channel": channel, "user": c.UserID(), "client": c.uid,
 		}))
 		var clientErr *Error
 		if errors.As(err, &clientErr) && !errors.Is(clientErr, ErrorInternal) {
@@ -932,7 +932,7 @@ func (c *Client) handleMapTransitionToLive(
 				return ErrorUnrecoverablePosition
 			}
 			c.node.logger.log(newErrorLogEntry(err, "error reading stream for live phase", map[string]any{
-				"channel": channel, "user": c.user, "client": c.uid,
+				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 			return ErrorInternal
 		}
@@ -1084,7 +1084,7 @@ func (c *Client) handleMapTransitionToLive(
 	if err != nil {
 		rollback(true)
 		c.node.logger.log(newErrorLogEntry(err, "error encoding map subscribe reply", map[string]any{
-			"channel": channel, "user": c.user, "client": c.uid,
+			"channel": channel, "user": c.UserID(), "client": c.uid,
 		}))
 		return ErrorInternal
 	}
@@ -1221,7 +1221,7 @@ func (c *Client) handleMapStreamPhase(
 			// No existing state and not recovering (or a continuation whose
 			// reservation is gone) - permission denied.
 			c.node.logger.log(newLogEntry(LogLevelInfo, "map subscription not authorized for stream", map[string]any{
-				"channel": channel, "user": c.user, "client": c.uid,
+				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 			return ErrorPermissionDenied
 		}
@@ -1300,7 +1300,7 @@ func (c *Client) handleMapStreamPhase(
 				return ErrorUnrecoverablePosition
 			}
 			c.node.logger.log(newErrorLogEntry(err, "error getting stream position", map[string]any{
-				"channel": channel, "user": c.user, "client": c.uid,
+				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 			c.cleanupMapSubscribing(channel)
 			return ErrorInternal
@@ -1341,7 +1341,7 @@ func (c *Client) handleMapStreamPhase(
 			return ErrorUnrecoverablePosition
 		}
 		c.node.logger.log(newErrorLogEntry(err, "error reading map stream", map[string]any{
-			"channel": channel, "user": c.user, "client": c.uid,
+			"channel": channel, "user": c.UserID(), "client": c.uid,
 		}))
 		c.cleanupMapSubscribing(channel)
 		return ErrorInternal
@@ -1621,13 +1621,13 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 	if opts.EmitPresence {
 		info := &ClientInfo{
 			ClientID: c.uid,
-			UserID:   c.user,
+			UserID:   c.UserID(),
 			ConnInfo: c.info,
 			ChanInfo: opts.ChannelInfo,
 		}
 		if err := c.node.addPresence(channel, c.uid, info); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error adding client presence", map[string]any{
-				"channel": channel, "user": c.user, "client": c.uid,
+				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 		}
 	}
@@ -1636,13 +1636,13 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 	if opts.MapClientPresenceChannel != "" {
 		info := &ClientInfo{
 			ClientID: c.uid,
-			UserID:   c.user,
+			UserID:   c.UserID(),
 			ConnInfo: c.info,
 			ChanInfo: opts.ChannelInfo,
 		}
 		if err := c.addMapClientPresence(opts.MapClientPresenceChannel, info); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error adding map client presence", map[string]any{
-				"channel": channel, "user": c.user, "client": c.uid,
+				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 		}
 	}
@@ -1651,7 +1651,7 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 	if opts.MapUserPresenceChannel != "" {
 		if err := c.addMapUserPresence(opts.MapUserPresenceChannel); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error adding map user presence", map[string]any{
-				"channel": channel, "user": c.user, "client": c.uid,
+				"channel": channel, "user": c.UserID(), "client": c.uid,
 			}))
 		}
 	}
@@ -1664,7 +1664,7 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 	if opts.EmitJoinLeave {
 		info := &ClientInfo{
 			ClientID: c.uid,
-			UserID:   c.user,
+			UserID:   c.UserID(),
 			ConnInfo: c.info,
 			ChanInfo: opts.ChannelInfo,
 		}
@@ -1683,7 +1683,7 @@ func (c *Client) writeMapSubscribeReply(
 	protoReply, err := c.getSubscribeCommandReply(res)
 	if err != nil {
 		c.node.logger.log(newErrorLogEntry(err, "error encoding map subscribe reply", map[string]any{
-			"channel": channel, "user": c.user, "client": c.uid,
+			"channel": channel, "user": c.UserID(), "client": c.uid,
 		}))
 		return ErrorInternal
 	}
@@ -1970,14 +1970,14 @@ func (c *Client) addMapClientPresence(presenceChannel string, info *ClientInfo) 
 // No-op for anonymous connections (empty user ID) — user-presence has no
 // meaningful key without a user ID, and MapPublish would reject the empty key.
 func (c *Client) addMapUserPresence(presenceChannel string) error {
-	if c.user == "" {
+	if c.UserID() == "" {
 		return nil
 	}
 	// Use KeyModeIfNew with RefreshTTLOnSuppress to:
 	// - Publish JOIN event only if this is a new user
 	// - Refresh TTL without publishing if user already exists
 	// KeyTTL is configured in GetMapChannelOptions for presence channels.
-	_, err := c.node.MapPublish(presenceContext(c.ctx), presenceChannel, c.user, MapPublishOptions{
+	_, err := c.node.MapPublish(presenceContext(c.ctx), presenceChannel, c.UserID(), MapPublishOptions{
 		KeyMode:              KeyModeIfNew,
 		RefreshTTLOnSuppress: true,
 	})
@@ -2007,8 +2007,8 @@ func (c *Client) updateMapPresence(info *ClientInfo, ctx ChannelContext) error {
 
 	// Update user presence if channel is configured. Skip for anonymous
 	// connections (empty user ID) — user-presence is keyless without a user.
-	if ctx.mapUserPresenceChannel != "" && c.user != "" {
-		_, err := c.node.MapPublish(presenceContext(c.ctx), ctx.mapUserPresenceChannel, c.user, MapPublishOptions{
+	if ctx.mapUserPresenceChannel != "" && c.UserID() != "" {
+		_, err := c.node.MapPublish(presenceContext(c.ctx), ctx.mapUserPresenceChannel, c.UserID(), MapPublishOptions{
 			KeyMode:              KeyModeIfNew,
 			RefreshTTLOnSuppress: true,
 		})
@@ -2026,8 +2026,8 @@ func (c *Client) updateMapPresence(info *ClientInfo, ctx ChannelContext) error {
 func (c *Client) removeMapPresence(channel string, ctx ChannelContext) error {
 	// Remove from :presence if EmitPresence is enabled.
 	if channelHasFlag(ctx.flags, flagEmitPresence) {
-		if err := c.node.removePresence(channel, c.uid, c.user); err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error removing channel presence", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+		if err := c.node.removePresence(channel, c.uid, c.UserID()); err != nil {
+			c.node.logger.log(newErrorLogEntry(err, "error removing channel presence", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		}
 	}
 
@@ -2036,7 +2036,7 @@ func (c *Client) removeMapPresence(channel string, ctx ChannelContext) error {
 	if ctx.mapClientPresenceChannel != "" {
 		_, err := c.node.MapRemove(context.Background(), ctx.mapClientPresenceChannel, c.uid, MapRemoveOptions{})
 		if err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error removing map clients presence", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+			c.node.logger.log(newErrorLogEntry(err, "error removing map clients presence", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		}
 	}
 
@@ -2050,7 +2050,7 @@ func (c *Client) removeMapPresence(channel string, ctx ChannelContext) error {
 	if channelHasFlag(ctx.flags, flagCleanupOnUnsubscribe) {
 		_, err := c.node.MapRemove(context.Background(), channel, c.uid, MapRemoveOptions{})
 		if err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error cleaning up map state on unsubscribe", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
+			c.node.logger.log(newErrorLogEntry(err, "error cleaning up map state on unsubscribe", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 		}
 	}
 

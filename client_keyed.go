@@ -611,7 +611,7 @@ func (c *Client) handleUntrack(req *protocol.SubRefreshRequest, cmd *protocol.Co
 	// Untracking before that commit would leave the keys tracked although the
 	// client untracked them.
 	if !c.waitTrackRequests(channel, untrackTrackTimeout.get()) {
-		c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for shared poll track before untrack", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
+		c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for shared poll track before untrack", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 	}
 
 	var actualUntrack []string
@@ -799,7 +799,7 @@ func (c *Client) checkTrackExpiration(channel string, delay time.Duration) {
 
 	if c.node.logger.enabled(LogLevelInfo) {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "track keys expired",
-			map[string]any{"channel": channel, "client": c.uid, "user": c.user, "num_keys": len(expiredKeys)}))
+			map[string]any{"channel": channel, "client": c.uid, "user": c.UserID(), "num_keys": len(expiredKeys)}))
 	}
 }
 
