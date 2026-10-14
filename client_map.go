@@ -1622,7 +1622,7 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 		info := &ClientInfo{
 			ClientID: c.uid,
 			UserID:   c.UserID(),
-			ConnInfo: c.info,
+			ConnInfo: c.connInfo(),
 			ChanInfo: opts.ChannelInfo,
 		}
 		if err := c.node.addPresence(channel, c.uid, info); err != nil {
@@ -1637,7 +1637,7 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 		info := &ClientInfo{
 			ClientID: c.uid,
 			UserID:   c.UserID(),
-			ConnInfo: c.info,
+			ConnInfo: c.connInfo(),
 			ChanInfo: opts.ChannelInfo,
 		}
 		if err := c.addMapClientPresence(opts.MapClientPresenceChannel, info); err != nil {
@@ -1665,7 +1665,7 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 		info := &ClientInfo{
 			ClientID: c.uid,
 			UserID:   c.UserID(),
-			ConnInfo: c.info,
+			ConnInfo: c.connInfo(),
 			ChanInfo: opts.ChannelInfo,
 		}
 		_ = c.node.publishJoin(channel, info)

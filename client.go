@@ -974,12 +974,13 @@ func (c *Client) updateChannelPresence(ch string, chCtx ChannelContext) (attempt
 		c.mu.RUnlock()
 		return false, nil
 	}
+	connInfo := c.info
 	c.mu.RUnlock()
 
 	info := &ClientInfo{
 		ClientID: c.uid,
 		UserID:   c.UserID(),
-		ConnInfo: c.info,
+		ConnInfo: connInfo,
 		ChanInfo: chCtx.info,
 	}
 
@@ -5136,7 +5137,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 	info := &ClientInfo{
 		ClientID: c.uid,
 		UserID:   c.UserID(),
-		ConnInfo: c.info,
+		ConnInfo: c.connInfo(),
 		ChanInfo: reply.Options.ChannelInfo,
 	}
 

@@ -115,6 +115,14 @@ func (c *Client) Rebind(opts RebindOptions) error {
 	return nil
 }
 
+// connInfo returns the connection info under the read lock, because Rebind and
+// refresh may replace it on a live client. Lock must not be held outside.
+func (c *Client) connInfo() []byte {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.info
+}
+
 // storeUser sets the user and its lock-free mirror read by UserID. Lock must be
 // held outside.
 func (c *Client) storeUser(user string) {
