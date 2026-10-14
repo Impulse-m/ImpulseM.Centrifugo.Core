@@ -304,12 +304,10 @@ type Client struct {
 	uid              string
 	session          string
 	user             string
-	// userAtomic mirrors user for lock-free reads, because Rebind may change the
-	// user of a live client.
-	userAtomic    atomic.Pointer[string]
-	info          []byte
-	tokenIdentity TokenIdentity
-	storage       map[string]any
+	userAtomic       atomic.Pointer[string] // mirrors user for lock-free reads, because Rebind may change the user of a live client
+	info             []byte
+	tokenIdentity    TokenIdentity
+	storage          map[string]any
 	// profile is the application context this connection belongs to, resolved at
 	// connect: what an OnConnecting handler set, or failing that what the client
 	// declared. Empty means unclassified.
@@ -1946,7 +1944,7 @@ func (c *Client) clientInfo(ch string) *ClientInfo {
 	}
 	return &ClientInfo{
 		ClientID: c.uid,
-		UserID:   c.UserID(),
+		UserID:   c.user,
 		ConnInfo: c.info,
 		ChanInfo: channelInfo,
 	}
@@ -4034,7 +4032,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 		now := time.Now().Unix()
 		if exp < now {
 			c.mu.RUnlock()
-			c.node.logger.log(newLogEntry(LogLevelInfo, "connection expiration must be greater than now", map[string]any{"client": c.uid, "user": user}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "connection expiration must be greater than now", map[string]any{"client": c.uid, "user": c.UserID()}))
 			return ErrorExpired
 		}
 		ttl = uint32(exp - now)
@@ -5829,7 +5827,7 @@ func (c *Client) publicationDataUpdatePositionLocked(
 		// due to periodic sync. While connection channel is in the insufficient state we must
 		// skip publications coming to it. This mode may be useful to spread the resubscribe load.
 		if c.node.logger.enabled(LogLevelDebug) {
-			c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (lag)", map[string]any{"channel": ch, "user": c.UserID(), "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (lag)", map[string]any{"channel": ch, "user": c.user, "client": c.uid}))
 		}
 		// Tell client about insufficient state, can reconnect/resubscribe to recover the state.
 		go func() { c.handleInsufficientState(ch, serverSide) }()
@@ -5848,7 +5846,7 @@ func (c *Client) publicationDataUpdatePositionLocked(
 		} else {
 			// Real epoch mismatch (e.g. after Clear) — insufficient state.
 			if c.node.logger.enabled(LogLevelDebug) {
-				c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (epoch)", map[string]any{"channel": ch, "user": c.UserID(), "client": c.uid, "epoch": pubEpoch, "expectedEpoch": channelContext.streamPosition.Epoch}))
+				c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (epoch)", map[string]any{"channel": ch, "user": c.user, "client": c.uid, "epoch": pubEpoch, "expectedEpoch": channelContext.streamPosition.Epoch}))
 			}
 			go func() { c.handleInsufficientState(ch, serverSide) }()
 			return nil, false
@@ -5861,7 +5859,7 @@ func (c *Client) publicationDataUpdatePositionLocked(
 		// due to periodic sync. While connection channel is in the insufficient state we must
 		// skip publications coming to it. This mode may be useful to spread the resubscribe load.
 		if c.node.logger.enabled(LogLevelDebug) {
-			c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (offset)", map[string]any{"channel": ch, "user": c.UserID(), "client": c.uid, "offset": pubOffset, "expectedOffset": nextExpectedOffset}))
+			c.node.logger.log(newLogEntry(LogLevelDebug, "client insufficient state (offset)", map[string]any{"channel": ch, "user": c.user, "client": c.uid, "offset": pubOffset, "expectedOffset": nextExpectedOffset}))
 		}
 		// Tell client about insufficient state, can reconnect/resubscribe to recover the state.
 		go func() { c.handleInsufficientState(ch, serverSide) }()
@@ -6250,7 +6248,7 @@ func (c *Client) unsubscribeWaiting(channel string, unsubscribe Unsubscribe, dis
 		if trackDeadline.IsZero() {
 			trackDeadline = time.Now().Add(maxWaitTimeout)
 		} else if !time.Now().Before(trackDeadline) {
-			c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for shared poll track to finish", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
+			c.node.logger.log(newLogEntry(LogLevelInfo, "timeout waiting for shared poll track to finish", map[string]any{"channel": channel, "user": c.user, "client": c.uid}))
 			break
 		}
 		c.mu.Unlock()
