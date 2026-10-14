@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/centrifugal/protocol"
 	"github.com/stretchr/testify/require"
 )
 
@@ -179,14 +180,79 @@ func TestClientRebindPresenceSynchronous(t *testing.T) {
 	require.Equal(t, "old", removed)
 }
 
-func TestClientRebindInfo(t *testing.T) {
+// rebindInfoBroker keeps the ClientInfo of the last publication and of the last
+// leave the node sent. The memory broker does the work.
+type rebindInfoBroker struct {
+	*MemoryBroker
+	mu        sync.Mutex
+	published *ClientInfo
+	left      *ClientInfo
+}
+
+func (b *rebindInfoBroker) Publish(ch string, data []byte, opts PublishOptions) (PublishResult, error) {
+	b.mu.Lock()
+	b.published = opts.ClientInfo
+	b.mu.Unlock()
+	return b.MemoryBroker.Publish(ch, data, opts)
+}
+
+func (b *rebindInfoBroker) PublishLeave(ch string, info *ClientInfo) error {
+	b.mu.Lock()
+	b.left = info
+	b.mu.Unlock()
+	return b.MemoryBroker.PublishLeave(ch, info)
+}
+
+func (b *rebindInfoBroker) lastPublished() *ClientInfo {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.published
+}
+
+func (b *rebindInfoBroker) lastLeft() *ClientInfo {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.left
+}
+
+func newRebindInfoNode(t *testing.T, presenceManager PresenceManager) (*Node, *rebindInfoBroker) {
+	node, err := New(Config{})
+	require.NoError(t, err)
+	memory, err := NewMemoryBroker(node, MemoryBrokerConfig{})
+	require.NoError(t, err)
+	broker := &rebindInfoBroker{MemoryBroker: memory}
+	node.SetBroker(broker)
+	node.SetPresenceManager(presenceManager)
+	require.NoError(t, node.Run())
+	return node, broker
+}
+
+// publishInfo publishes from the client to the channel and returns the
+// ClientInfo the node published with.
+func publishInfo(t *testing.T, client *Client, broker *rebindInfoBroker) *ClientInfo {
+	rwWrapper := testReplyWriterWrapper()
+	err := client.handlePublish(&protocol.PublishRequest{
+		Channel: "test",
+		Data:    []byte(`{}`),
+	}, &protocol.Command{}, time.Now(), rwWrapper.rw)
+	require.NoError(t, err)
+	require.Nil(t, rwWrapper.replies[0].Error)
+	return broker.lastPublished()
+}
+
+// TestRebindReplacesInfo checks that a Rebind replaces the connection info in
+// the presence, the publications and the leave of the connection. Nil clears it.
+func TestRebindReplacesInfo(t *testing.T) {
 	recorder := &rebindPresenceRecorder{TestPresenceManager: NewTestPresenceManager()}
-	node := nodeWithPresenceManager(recorder)
+	node, broker := newRebindInfoNode(t, recorder)
 	defer func() { _ = node.Shutdown(context.Background()) }()
 
 	client := newTestClientV2(t, node, "old")
 	client.OnSubscribe(func(event SubscribeEvent, cb SubscribeCallback) {
-		cb(SubscribeReply{Options: SubscribeOptions{EmitPresence: true}}, nil)
+		cb(SubscribeReply{Options: SubscribeOptions{EmitPresence: true, EmitJoinLeave: true}}, nil)
+	})
+	client.OnPublish(func(event PublishEvent, cb PublishCallback) {
+		cb(PublishReply{Options: PublishOptions{ClientInfo: event.ClientInfo}}, nil)
 	})
 	connectClientV2(t, client)
 	client.mu.Lock()
@@ -194,20 +260,106 @@ func TestClientRebindInfo(t *testing.T) {
 	client.mu.Unlock()
 	subscribeClientV2(t, client, "test")
 	require.Equal(t, []byte(`{"name":"old"}`), recorder.info())
+	require.Equal(t, []byte(`{"name":"old"}`), publishInfo(t, client, broker).ConnInfo)
 
-	// The new info replaces the old one in the presence the rebind writes.
+	// A token rebind without expiration shows its info in presence and publications.
 	require.NoError(t, client.Rebind(RebindOptions{UserID: "new", Info: []byte(`{"name":"new"}`)}))
 	require.Equal(t, []byte(`{"name":"new"}`), recorder.info())
-	client.mu.RLock()
-	require.Equal(t, []byte(`{"name":"new"}`), []byte(client.clientInfo("test").ConnInfo))
-	client.mu.RUnlock()
+	require.Equal(t, []byte(`{"name":"new"}`), publishInfo(t, client, broker).ConnInfo)
 
-	// Nil clears it, so an anonymous connection does not keep the user's info.
+	// An expiring rebind replaces the info too.
+	expireAt := time.Now().Add(time.Hour).Unix()
+	require.NoError(t, client.Rebind(RebindOptions{UserID: "new", ExpireAt: expireAt, Info: []byte(`{"name":"expiring"}`)}))
+	require.Equal(t, []byte(`{"name":"expiring"}`), recorder.info())
+	require.Equal(t, []byte(`{"name":"expiring"}`), publishInfo(t, client, broker).ConnInfo)
+
+	// The leave carries the user and the info the connection has when it leaves.
+	client.Unsubscribe("test")
+	require.Equal(t, "new", broker.lastLeft().UserID)
+	require.Equal(t, []byte(`{"name":"expiring"}`), broker.lastLeft().ConnInfo)
+
+	// Nil clears the info of an anonymous connection in presence, publications and leave.
+	subscribeClientV2(t, client, "test")
 	require.NoError(t, client.Rebind(RebindOptions{UserID: ""}))
 	require.Nil(t, recorder.info())
-	client.mu.RLock()
-	require.Nil(t, client.info)
-	client.mu.RUnlock()
+	require.Nil(t, publishInfo(t, client, broker).ConnInfo)
+	client.Unsubscribe("test")
+	require.Equal(t, "", broker.lastLeft().UserID)
+	require.Nil(t, broker.lastLeft().ConnInfo)
+}
+
+// heldPresenceRecorder holds the first AddPresence of the node until release is
+// closed, and keeps the presence entry of each client.
+type heldPresenceRecorder struct {
+	*TestPresenceManager
+	mu      sync.Mutex
+	hold    bool
+	entered chan struct{}
+	release chan struct{}
+	entries map[string]*ClientInfo
+}
+
+func (r *heldPresenceRecorder) AddPresence(_ string, clientID string, info *ClientInfo) error {
+	r.mu.Lock()
+	hold := r.hold
+	r.hold = false
+	r.mu.Unlock()
+	if hold {
+		close(r.entered)
+		<-r.release
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.entries[clientID] = info
+	return nil
+}
+
+func (r *heldPresenceRecorder) RemovePresence(_ string, clientID string, _ string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.entries, clientID)
+	return nil
+}
+
+func (r *heldPresenceRecorder) entry(clientID string) *ClientInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.entries[clientID]
+}
+
+// TestRebindDuringSubscribePresenceAdd rebinds a connection while its subscribe
+// adds presence, before the channel is committed. The presence the subscribe
+// adds carries the identity read before the rebind, so the entry is moved to the
+// new identity after the commit.
+func TestRebindDuringSubscribePresenceAdd(t *testing.T) {
+	recorder := &heldPresenceRecorder{
+		TestPresenceManager: NewTestPresenceManager(),
+		hold:                true,
+		entered:             make(chan struct{}),
+		release:             make(chan struct{}),
+		entries:             map[string]*ClientInfo{},
+	}
+	node := nodeWithPresenceManager(recorder)
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	client := newTestConnectedClientV2(t, node, "old")
+	client.mu.Lock()
+	client.info = []byte(`{"name":"old"}`)
+	client.mu.Unlock()
+
+	subscribed := make(chan error, 1)
+	go func() {
+		subscribed <- client.Subscribe("test", WithEmitPresence(true))
+	}()
+	<-recorder.entered
+	require.NoError(t, client.Rebind(RebindOptions{UserID: "new", Info: []byte(`{"name":"new"}`)}))
+	close(recorder.release)
+	require.NoError(t, <-subscribed)
+
+	entry := recorder.entry(client.uid)
+	require.NotNil(t, entry)
+	require.Equal(t, "new", entry.UserID)
+	require.Equal(t, []byte(`{"name":"new"}`), entry.ConnInfo)
 }
 
 // TestClientRebindRaces runs Rebind concurrently with UserID readers, the keyed
