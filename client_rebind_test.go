@@ -15,16 +15,24 @@ import (
 // removed by the node.
 type rebindPresenceRecorder struct {
 	*TestPresenceManager
-	mu      sync.Mutex
-	added   string
-	removed string
+	mu        sync.Mutex
+	added     string
+	addedInfo []byte
+	removed   string
 }
 
 func (r *rebindPresenceRecorder) AddPresence(_ string, _ string, info *ClientInfo) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.added = info.UserID
+	r.addedInfo = info.ConnInfo
 	return nil
+}
+
+func (r *rebindPresenceRecorder) info() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.addedInfo
 }
 
 func (r *rebindPresenceRecorder) RemovePresence(_ string, _ string, userID string) error {
@@ -169,6 +177,37 @@ func TestClientRebindPresenceSynchronous(t *testing.T) {
 	added, removed := recorder.users()
 	require.Equal(t, "new", added)
 	require.Equal(t, "old", removed)
+}
+
+func TestClientRebindInfo(t *testing.T) {
+	recorder := &rebindPresenceRecorder{TestPresenceManager: NewTestPresenceManager()}
+	node := nodeWithPresenceManager(recorder)
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	client := newTestClientV2(t, node, "old")
+	client.OnSubscribe(func(event SubscribeEvent, cb SubscribeCallback) {
+		cb(SubscribeReply{Options: SubscribeOptions{EmitPresence: true}}, nil)
+	})
+	connectClientV2(t, client)
+	client.mu.Lock()
+	client.info = []byte(`{"name":"old"}`)
+	client.mu.Unlock()
+	subscribeClientV2(t, client, "test")
+	require.Equal(t, []byte(`{"name":"old"}`), recorder.info())
+
+	// The new info replaces the old one in the presence the rebind writes.
+	require.NoError(t, client.Rebind(RebindOptions{UserID: "new", Info: []byte(`{"name":"new"}`)}))
+	require.Equal(t, []byte(`{"name":"new"}`), recorder.info())
+	client.mu.RLock()
+	require.Equal(t, []byte(`{"name":"new"}`), []byte(client.clientInfo("test").ConnInfo))
+	client.mu.RUnlock()
+
+	// Nil clears it, so an anonymous connection does not keep the user's info.
+	require.NoError(t, client.Rebind(RebindOptions{UserID: ""}))
+	require.Nil(t, recorder.info())
+	client.mu.RLock()
+	require.Nil(t, client.info)
+	client.mu.RUnlock()
 }
 
 // TestClientRebindRaces runs Rebind concurrently with UserID readers, the keyed

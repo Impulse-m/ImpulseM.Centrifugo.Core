@@ -29,6 +29,9 @@ type RebindOptions struct {
 	ExpireAt int64
 	// TokenIdentity is the identity of the token the connection holds now.
 	TokenIdentity TokenIdentity
+	// Info is the new connection info, sent as ConnInfo in presence, join, leave
+	// and publications. It always replaces the old info: nil clears it.
+	Info []byte
 }
 
 // rebindPresence is a subscribed channel whose presence moves on rebind.
@@ -42,7 +45,7 @@ type rebindPresence struct {
 //
 // Channels are not touched: the caller decides which channels to keep. Join was
 // published with the old user and stays so. Leave and publication ClientInfo
-// carry the new user from the rebind on. Presence is rewritten synchronously
+// carry the new user and the new info from the rebind on. Presence is rewritten synchronously
 // before Rebind returns: node presence entries are moved from the old user to
 // the new one, and map client presence entries are removed and added again. Map
 // user-presence keys of the old user are not removed; they expire by TTL.
@@ -83,6 +86,7 @@ func (c *Client) Rebind(opts RebindOptions) error {
 	oldUser := c.user
 	c.storeUser(opts.UserID)
 	c.tokenIdentity = opts.TokenIdentity
+	c.info = opts.Info
 	c.exp = min(opts.ExpireAt, nowUnix+maxTTLSeconds)
 	if c.exp == 0 {
 		c.nextExpire = 0
