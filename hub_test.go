@@ -172,7 +172,7 @@ func TestHub(t *testing.T) {
 	h := newHub(nil, m, 0)
 	c, err := newClient(context.Background(), defaultTestNode(), newTestTransport(func() {}))
 	require.NoError(t, err)
-	c.user = "test"
+	c.storeUser("test")
 	removed := h.remove(c)
 	require.False(t, removed)
 	h.add(c)
@@ -1167,7 +1167,7 @@ func TestHubSharding(t *testing.T) {
 		for i := 0; i < numUsers; i++ {
 			c, err := newClient(context.Background(), n, newTestTransport(func() {}))
 			require.NoError(t, err)
-			c.user = strconv.Itoa(i)
+			c.storeUser(strconv.Itoa(i))
 			require.NoError(t, err)
 			n.hub.add(c)
 			for _, ch := range channels {
