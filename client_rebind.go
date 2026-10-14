@@ -1,6 +1,7 @@
 package centrifuge
 
 import (
+	"bytes"
 	"errors"
 	"sync/atomic"
 	"time"
@@ -29,26 +30,28 @@ type RebindOptions struct {
 	ExpireAt int64
 	// TokenIdentity is the identity of the token the connection holds now.
 	TokenIdentity TokenIdentity
-	// Info is the new connection info, sent as ConnInfo in presence, join, leave
-	// and publications. It always replaces the old info: nil clears it.
+	// Info is the new connection info. It is sent as ConnInfo in presence, leave
+	// and publications from the rebind on; join keeps the info it was published
+	// with. It always replaces the old info: nil clears it. Rebind copies it, so
+	// the caller may reuse the buffer after Rebind returns.
 	Info []byte
 }
 
 // rebindPresence is a subscribed channel whose presence moves on rebind.
 type rebindPresence struct {
-	channel  string
-	ctx      ChannelContext
-	connInfo []byte
+	channel string
+	ctx     ChannelContext
 }
 
 // Rebind moves a live connection to another user without reconnecting.
 //
 // Channels are not touched: the caller decides which channels to keep. Join was
-// published with the old user and stays so. Leave and publication ClientInfo
-// carry the new user and the new info from the rebind on. Presence is rewritten synchronously
-// before Rebind returns: node presence entries are moved from the old user to
-// the new one, and map client presence entries are removed and added again. Map
-// user-presence keys of the old user are not removed; they expire by TTL.
+// published with the old user and info and stays so. Leave and publication
+// ClientInfo carry the new user and the new info from the rebind on. Presence is
+// rewritten synchronously before Rebind returns: node presence entries are moved
+// from the old user to the new one, and map client presence entries are removed
+// and added again. Map user-presence keys of the old user are not removed; they
+// expire by TTL.
 //
 // Map client presence emits a leave and then a join for the connection on
 // rebind, because its entry is removed and added again. A channel unsubscribed
@@ -64,6 +67,10 @@ type rebindPresence struct {
 //
 // The user index of the hub moves with the connection. connectionsInflight is
 // unchanged. Expiration is re-armed from ExpireAt, and ExpireAt zero disarms it.
+//
+// Rebind must not run concurrently with a refresh reply of the same connection:
+// a reply built for the old token could write its info and token identity after
+// the rebind. Callers serialize the two.
 func (c *Client) Rebind(opts RebindOptions) error {
 	nowUnix := time.Now().Unix()
 	if opts.ExpireAt < 0 || (opts.ExpireAt > 0 && opts.ExpireAt <= nowUnix) {
@@ -86,7 +93,7 @@ func (c *Client) Rebind(opts RebindOptions) error {
 	oldUser := c.user
 	c.storeUser(opts.UserID)
 	c.tokenIdentity = opts.TokenIdentity
-	c.info = opts.Info
+	c.info = bytes.Clone(opts.Info)
 	c.exp = min(opts.ExpireAt, nowUnix+maxTTLSeconds)
 	if c.exp == 0 {
 		c.nextExpire = 0
@@ -106,7 +113,7 @@ func (c *Client) Rebind(opts RebindOptions) error {
 		if !channelHasFlag(chCtx.flags, flagEmitPresence|flagMapClientPresence|flagMapUserPresence) {
 			continue
 		}
-		presences = append(presences, rebindPresence{channel: channel, ctx: chCtx, connInfo: c.info})
+		presences = append(presences, rebindPresence{channel: channel, ctx: chCtx})
 	}
 	if c.authenticated {
 		c.node.hub.rebind(c, oldUser, opts.UserID)
@@ -143,10 +150,16 @@ func (c *Client) storeUser(user string) {
 // recheck after the add covers the case where it ran before the add: if the
 // channel is no longer subscribed, the entry just added is removed again.
 func (c *Client) rewritePresence(p rebindPresence, oldUser string) {
-	newUser := c.UserID()
 	if f := testHookRebindBeforePresence.Load(); f != nil {
 		(*f)(p.channel)
 	}
+	c.movePresence(p, oldUser)
+}
+
+// movePresence moves the presence of one channel from oldUser to the current
+// user of the connection, with the current info. c.mu must not be held.
+func (c *Client) movePresence(p rebindPresence, oldUser string) {
+	newUser := c.UserID()
 	c.removeChannelPresence(p, oldUser)
 	if _, err := c.updateChannelPresence(p.channel, p.ctx); err != nil {
 		c.node.logger.log(newErrorLogEntry(err, "error updating presence for channel on rebind", map[string]any{
