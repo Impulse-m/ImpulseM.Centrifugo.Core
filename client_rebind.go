@@ -2,6 +2,7 @@ package centrifuge
 
 import (
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,9 +17,9 @@ var ErrRebindExpired = errors.New("rebind expiration must be zero or in the futu
 // UserConnectionLimit connections on the node.
 var ErrRebindUserLimit = errors.New("user connection limit reached")
 
-// testHookRebindPresenceAdded, if non-nil, is called by rewritePresence before a
+// testHookRebindBeforePresence, if set, runs in rewritePresence before a
 // channel's presence moves. Tests use it to run an Unsubscribe at that point.
-var testHookRebindPresenceAdded func(channel string)
+var testHookRebindBeforePresence atomic.Pointer[func(channel string)]
 
 // RebindOptions describe the identity a live connection takes over in Client.Rebind.
 type RebindOptions struct {
@@ -50,6 +51,10 @@ type rebindPresence struct {
 // rebind, because its entry is removed and added again. A channel unsubscribed
 // while its presence moves is not left with a stale entry.
 //
+// Rebind holds connectMu while it rewrites presence, so a concurrent close of the
+// same connection waits for that I/O, which is bounded by the presence backend
+// timeouts. Rebind is rare (a login or a logout), so this is accepted.
+//
 // The user-connection limit is checked before the locks are taken, so concurrent
 // rebinds of different connections to the same full user can exceed the limit
 // by the number of racing rebinds.
@@ -62,7 +67,7 @@ func (c *Client) Rebind(opts RebindOptions) error {
 		return ErrRebindExpired
 	}
 	limit := c.node.config.UserConnectionLimit
-	if limit > 0 && opts.UserID != "" && opts.UserID != c.UserID() && len(c.node.hub.UserConnections(opts.UserID)) >= limit {
+	if limit > 0 && opts.UserID != "" && opts.UserID != c.UserID() && c.node.hub.numUserConnections(opts.UserID) >= limit {
 		return ErrRebindUserLimit
 	}
 
@@ -110,6 +115,13 @@ func (c *Client) Rebind(opts RebindOptions) error {
 	return nil
 }
 
+// storeUser sets the user and its lock-free mirror read by UserID. Lock must be
+// held outside.
+func (c *Client) storeUser(user string) {
+	c.user = user
+	c.userAtomic.Store(&user)
+}
+
 // rewritePresence moves the presence of one channel from oldUser to the user
 // the connection has now. connectMu must be held, c.mu must not be: presence
 // calls go to the PresenceManager and the map broker.
@@ -120,48 +132,34 @@ func (c *Client) Rebind(opts RebindOptions) error {
 // channel is no longer subscribed, the entry just added is removed again.
 func (c *Client) rewritePresence(p rebindPresence, oldUser string) {
 	newUser := c.UserID()
-	if testHookRebindPresenceAdded != nil {
-		testHookRebindPresenceAdded(p.channel)
+	if f := testHookRebindBeforePresence.Load(); f != nil {
+		(*f)(p.channel)
 	}
+	c.removeChannelPresence(p, oldUser)
+	if _, err := c.updateChannelPresence(p.channel, p.ctx); err != nil {
+		c.node.logger.log(newErrorLogEntry(err, "error updating presence for channel on rebind", map[string]any{
+			"channel": p.channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
+	}
+	if c.isSubscribed(p.channel) {
+		return
+	}
+	// Unsubscribed while the presence moved: undo what was just added.
+	c.removeChannelPresence(p, newUser)
+}
+
+// removeChannelPresence removes the node presence of the connection on the
+// channel for user, and its map client presence. Map user presence is not
+// removed: like unsubscribe, it expires by TTL.
+func (c *Client) removeChannelPresence(p rebindPresence, user string) {
 	if channelHasFlag(p.ctx.flags, flagEmitPresence) {
-		if err := c.node.removePresence(p.channel, c.uid, oldUser); err != nil {
+		if err := c.node.removePresence(p.channel, c.uid, user); err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error removing channel presence on rebind", map[string]any{"channel": p.channel, "client": c.uid, "error": err.Error()}))
-		}
-		info := &ClientInfo{ClientID: c.uid, UserID: newUser, ConnInfo: p.connInfo, ChanInfo: p.ctx.info}
-		if err := c.node.addPresence(p.channel, c.uid, info); err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error adding channel presence on rebind", map[string]any{"channel": p.channel, "client": c.uid, "error": err.Error()}))
 		}
 	}
 	if p.ctx.mapClientPresenceChannel != "" {
 		_, err := c.node.MapRemove(presenceContext(c.ctx), p.ctx.mapClientPresenceChannel, c.uid, MapRemoveOptions{})
 		if err != nil {
 			c.node.logger.log(newErrorLogEntry(err, "error removing map client presence on rebind", map[string]any{"channel": p.channel, "client": c.uid, "error": err.Error()}))
-		}
-		info := &ClientInfo{ClientID: c.uid, UserID: newUser, ConnInfo: p.connInfo, ChanInfo: p.ctx.info}
-		if err := c.addMapClientPresence(p.ctx.mapClientPresenceChannel, info); err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error adding map client presence on rebind", map[string]any{"channel": p.channel, "client": c.uid, "error": err.Error()}))
-		}
-	}
-	if p.ctx.mapUserPresenceChannel != "" {
-		if err := c.addMapUserPresence(p.ctx.mapUserPresenceChannel); err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error adding map user presence on rebind", map[string]any{"channel": p.channel, "client": c.uid, "error": err.Error()}))
-		}
-	}
-
-	if c.isSubscribed(p.channel) {
-		return
-	}
-	// Unsubscribed while the presence moved: undo what was just added. Map user
-	// presence is not removed on unsubscribe either, so it expires by TTL.
-	if channelHasFlag(p.ctx.flags, flagEmitPresence) {
-		if err := c.node.removePresence(p.channel, c.uid, newUser); err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error removing channel presence after rebind", map[string]any{"channel": p.channel, "client": c.uid, "error": err.Error()}))
-		}
-	}
-	if p.ctx.mapClientPresenceChannel != "" {
-		_, err := c.node.MapRemove(presenceContext(c.ctx), p.ctx.mapClientPresenceChannel, c.uid, MapRemoveOptions{})
-		if err != nil {
-			c.node.logger.log(newErrorLogEntry(err, "error removing map client presence after rebind", map[string]any{"channel": p.channel, "client": c.uid, "error": err.Error()}))
 		}
 	}
 }

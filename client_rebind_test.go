@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -432,13 +433,14 @@ func TestClientRebindUnsubscribeDuringPresenceMove(t *testing.T) {
 	require.Len(t, res.Presence, 1)
 
 	var once sync.Once
-	testHookRebindPresenceAdded = func(channel string) {
+	hook := func(channel string) {
 		once.Do(func() { client.Unsubscribe(channel) })
 	}
-	defer func() { testHookRebindPresenceAdded = nil }()
+	testHookRebindBeforePresence.Store(&hook)
+	t.Cleanup(func() { testHookRebindBeforePresence.Store(nil) })
 
 	require.NoError(t, client.Rebind(RebindOptions{UserID: "new"}))
-	testHookRebindPresenceAdded = nil
+	testHookRebindBeforePresence.Store(nil)
 
 	require.False(t, client.isSubscribed("test"))
 	requireNoPresence(t, node, "test")
@@ -490,4 +492,50 @@ func TestClientRebindSubscribeUnsubscribeLoop(t *testing.T) {
 
 	require.False(t, client.isSubscribed("loop"))
 	requireNoPresence(t, node, "loop")
+}
+
+// unsubscribeOnAddPresence runs an Unsubscribe of the channel from inside the
+// first AddPresence call, after updateChannelPresence has checked the channel is
+// still subscribed and before the entry is written.
+type unsubscribeOnAddPresence struct {
+	*MemoryPresenceManager
+	client *Client
+	armed  atomic.Bool
+}
+
+func (p *unsubscribeOnAddPresence) AddPresence(ch string, clientID string, info *ClientInfo) error {
+	if p.armed.CompareAndSwap(true, false) {
+		p.client.Unsubscribe(ch)
+	}
+	return p.MemoryPresenceManager.AddPresence(ch, clientID, info)
+}
+
+// TestClientRebindUnsubscribeInsideAddPresence covers the window the subscription
+// recheck exists for: an unsubscribe lands between the membership check and the
+// add of the moved presence. The entry written after the unsubscribe must be
+// removed again, so the channel ends with no presence entry.
+func TestClientRebindUnsubscribeInsideAddPresence(t *testing.T) {
+	node, err := New(Config{LogHandler: func(LogEntry) {}})
+	require.NoError(t, err)
+	mem, err := NewMemoryPresenceManager(node, MemoryPresenceManagerConfig{})
+	require.NoError(t, err)
+	pm := &unsubscribeOnAddPresence{MemoryPresenceManager: mem}
+	node.SetPresenceManager(pm)
+	require.NoError(t, node.Run())
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	client := newTestClientV2(t, node, "old")
+	client.OnSubscribe(func(event SubscribeEvent, cb SubscribeCallback) {
+		cb(SubscribeReply{Options: SubscribeOptions{EmitPresence: true}}, nil)
+	})
+	connectClientV2(t, client)
+	subscribeClientV2(t, client, "test")
+	pm.client = client
+	pm.armed.Store(true)
+
+	require.NoError(t, client.Rebind(RebindOptions{UserID: "new"}))
+	require.False(t, pm.armed.Load(), "the unsubscribe hook must have run during Rebind")
+
+	require.False(t, client.isSubscribed("test"))
+	requireNoPresence(t, node, "test")
 }

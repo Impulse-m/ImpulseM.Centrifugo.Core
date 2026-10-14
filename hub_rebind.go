@@ -31,6 +31,12 @@ func (h *Hub) rebind(c *Client, oldUser, newUser string) {
 	h.connShards[lowIdx].mu.Unlock()
 }
 
+// numUserConnections returns how many connections the user has on this node,
+// without copying the set the way UserConnections does.
+func (h *Hub) numUserConnections(user string) int {
+	return h.connShards[index(user, numHubShards)].numUserConnections(user)
+}
+
 // dropUser removes uid from the user index entry of user. Lock must be held.
 func (h *connShard) dropUser(uid string, user string) {
 	userConns, ok := h.users[user]
@@ -49,4 +55,11 @@ func (h *connShard) addUser(uid string, user string) {
 		h.users[user] = make(map[string]struct{})
 	}
 	h.users[user][uid] = struct{}{}
+}
+
+// numUserConnections returns the number of connections indexed under user.
+func (h *connShard) numUserConnections(user string) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.users[user])
 }

@@ -1578,13 +1578,6 @@ func (c *Client) UserID() string {
 	return ""
 }
 
-// storeUser sets the user and its lock-free mirror read by UserID. Lock must be
-// held outside.
-func (c *Client) storeUser(user string) {
-	c.user = user
-	c.userAtomic.Store(&user)
-}
-
 // Info returns connection info.
 func (c *Client) Info() []byte {
 	c.mu.Lock()
