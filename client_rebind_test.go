@@ -390,3 +390,104 @@ func TestClientRebindCrossShardOpposite(t *testing.T) {
 		require.Equal(t, 1, found)
 	}
 }
+
+// newMemoryPresenceNode returns a node with the in-memory presence manager, so
+// the presence entries of a channel can be inspected directly.
+func newMemoryPresenceNode(t *testing.T) *Node {
+	node, err := New(Config{LogHandler: func(LogEntry) {}})
+	require.NoError(t, err)
+	pm, err := NewMemoryPresenceManager(node, MemoryPresenceManagerConfig{})
+	require.NoError(t, err)
+	node.SetPresenceManager(pm)
+	require.NoError(t, node.Run())
+	return node
+}
+
+// requireNoPresence waits until the channel has no memory presence entry. A
+// stale entry never goes away, so the wait only ends early on the correct state.
+func requireNoPresence(t *testing.T, node *Node, channel string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		res, err := node.Presence(channel)
+		return err == nil && len(res.Presence) == 0
+	}, 5*time.Second, 5*time.Millisecond)
+}
+
+// TestClientRebindUnsubscribeDuringPresenceMove runs an Unsubscribe of the channel
+// at the point where Rebind starts moving its presence, so the unsubscribe removes
+// presence before the new user's entry is written. Afterwards the channel has no
+// presence entry, and the client is not subscribed.
+func TestClientRebindUnsubscribeDuringPresenceMove(t *testing.T) {
+	node := newMemoryPresenceNode(t)
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	client := newTestClientV2(t, node, "old")
+	client.OnSubscribe(func(event SubscribeEvent, cb SubscribeCallback) {
+		cb(SubscribeReply{Options: SubscribeOptions{EmitPresence: true}}, nil)
+	})
+	connectClientV2(t, client)
+	subscribeClientV2(t, client, "test")
+	res, err := node.Presence("test")
+	require.NoError(t, err)
+	require.Len(t, res.Presence, 1)
+
+	var once sync.Once
+	testHookRebindPresenceAdded = func(channel string) {
+		once.Do(func() { client.Unsubscribe(channel) })
+	}
+	defer func() { testHookRebindPresenceAdded = nil }()
+
+	require.NoError(t, client.Rebind(RebindOptions{UserID: "new"}))
+	testHookRebindPresenceAdded = nil
+
+	require.False(t, client.isSubscribed("test"))
+	requireNoPresence(t, node, "test")
+}
+
+// TestClientRebindSubscribeUnsubscribeLoop races Rebind with repeated server-side
+// subscribe and leave of a channel with presence. Once the loop is over, the
+// channel has no presence entry.
+func TestClientRebindSubscribeUnsubscribeLoop(t *testing.T) {
+	node := newMemoryPresenceNode(t)
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	client := newTestClientV2(t, node, "a")
+	connectClientV2(t, client)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = client.Subscribe("loop", WithEmitPresence(true))
+			client.Unsubscribe("loop")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			user := "a"
+			if i%2 == 1 {
+				user = "b"
+			}
+			if err := client.Rebind(RebindOptions{UserID: user}); err != nil {
+				t.Errorf("unexpected rebind error: %v", err)
+				return
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("deadlock: Rebind racing with subscribe and leave did not finish")
+	}
+
+	require.False(t, client.isSubscribed("loop"))
+	requireNoPresence(t, node, "loop")
+}
