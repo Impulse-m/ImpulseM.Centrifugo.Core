@@ -126,6 +126,14 @@ func (c *Client) Rebind(opts RebindOptions) error {
 	return nil
 }
 
+// connInfo returns the connection info under the read lock, because Rebind and
+// refresh may replace it on a live client. Lock must not be held outside.
+func (c *Client) connInfo() []byte {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.info
+}
+
 // storeUser sets the user and its lock-free mirror read by UserID. Lock must be
 // held outside.
 func (c *Client) storeUser(user string) {
@@ -162,27 +170,6 @@ func (c *Client) movePresence(p rebindPresence, oldUser string) {
 	}
 	// Unsubscribed while the presence moved: undo what was just added.
 	c.removeChannelPresence(p, newUser)
-}
-
-// recheckPresenceIdentity moves the presence of a committed channel when the
-// identity its presence was added with is no longer the connection's. The add
-// of a subscribe reads the identity before it runs, and a Rebind that runs
-// meanwhile may move presence before the add lands; the add then leaves the
-// old identity behind. presence reports whether the add carried ClientInfo,
-// added is the snapshot the add used. The caller runs it after the commit, and
-// c.mu must not be held.
-func (c *Client) recheckPresenceIdentity(channel string, presence bool, added *ClientInfo) {
-	if !presence || added == nil {
-		return
-	}
-	c.mu.RLock()
-	cur, ok := c.channels[channel]
-	stale := c.user != added.UserID || !bytes.Equal(c.info, added.ConnInfo)
-	c.mu.RUnlock()
-	if !stale || !ok || !channelHasFlag(cur.flags, flagSubscribed) {
-		return
-	}
-	c.movePresence(rebindPresence{channel: channel, ctx: cur}, added.UserID)
 }
 
 // removeChannelPresence removes the node presence of the connection on the

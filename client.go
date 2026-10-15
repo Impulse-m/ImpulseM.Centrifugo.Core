@@ -4350,7 +4350,6 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 			// resurrect state for a subscription that was never installed.
 			continue
 		}
-		c.recheckPresenceIdentity(channel, channelHasFlag(subCtx.channelContext.flags, flagEmitPresence|flagMapClientPresence), subCtx.clientInfo)
 		if subCtx.clientInfo != nil {
 			// Synchronous: see comment on the same call in handleSubscribe.
 			// A spawned goroutine racing a disconnect's publishLeave can land
@@ -4607,7 +4606,6 @@ func (c *Client) Subscribe(channel string, opts ...SubscribeOption) error {
 	if !committed {
 		return DisconnectServerError
 	}
-	c.recheckPresenceIdentity(channel, channelHasFlag(subCtx.channelContext.flags, flagEmitPresence|flagMapClientPresence), subCtx.clientInfo)
 	defer c.finishJoin(channel, subCtx.channelContext)
 	if writeErr != nil {
 		if subscribingCh != nil {
@@ -5136,6 +5134,13 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 
 	channel := req.Channel
 
+	info := &ClientInfo{
+		ClientID: c.uid,
+		UserID:   c.UserID(),
+		ConnInfo: c.connInfo(),
+		ChanInfo: reply.Options.ChannelInfo,
+	}
+
 	useID := reply.Options.AllowChannelCompaction && req.Flag&subscriptionFlagChannelCompression != 0
 	// One generation per subscription attempt, carried into both the hub entry
 	// (subInfo.subGen) and the client channel context (ChannelContext.subGen), so
@@ -5160,17 +5165,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 			c.channels[channel] = resv
 		}
 	}
-	// The user and the info of the presence and the join are read in this lock
-	// section, so both come from the same state of a concurrent Rebind.
-	user := c.user
-	connInfo := c.info
 	c.mu.Unlock()
-	info := &ClientInfo{
-		ClientID: c.uid,
-		UserID:   user,
-		ConnInfo: connInfo,
-		ChanInfo: reply.Options.ChannelInfo,
-	}
 	sub := subInfo{client: c, deltaType: deltaTypeNone, useID: useID, subGen: subGen}
 	if req.Tf != nil {
 		if !reply.Options.AllowTagsFilter {
@@ -5593,7 +5588,6 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 			ctx.disconnect = &DisconnectServerError
 			return ctx
 		}
-		c.recheckPresenceIdentity(channel, channelHasFlag(channelContext.flags, flagEmitPresence|flagMapClientPresence), info)
 		if subscribingCh != nil {
 			// Release any unsubscribe waiting on this in-flight subscribe. Deferred
 			// to subscribeCmd's return (matching the prior behavior); by this point
