@@ -28,6 +28,7 @@ type RedisPresenceManager struct {
 	remPresenceScript   *rueidis.Lua
 	presenceScript      *rueidis.Lua
 	presenceStatsScript *rueidis.Lua
+	state               *presenceState
 }
 
 // RedisPresenceManagerConfig is a config for RedisPresenceManager.
@@ -68,6 +69,10 @@ type RedisPresenceManagerConfig struct {
 	// LoadSHA1 enables loading SHA1 from Redis via SCRIPT LOAD instead of calculating
 	// it on the client side. This is useful for FIPS compliance.
 	LoadSHA1 bool
+
+	// ChannelState enables channel state events (occupied, vacated) for the channels
+	// Enabled reports. Nil keeps the presence manager as it is.
+	ChannelState *RedisChannelStateConfig
 }
 
 var (
@@ -125,14 +130,28 @@ func NewRedisPresenceManager(n *Node, config RedisPresenceManagerConfig) (*Redis
 		presenceScript:      rueidis.NewLuaScript(presenceScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
 		presenceStatsScript: rueidis.NewLuaScript(presenceStatsScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
 	}
+	if config.ChannelState != nil {
+		state, err := newPresenceState(m, *config.ChannelState)
+		if err != nil {
+			return nil, err
+		}
+		m.state = state
+		go state.worker.run()
+	}
 	return m, nil
 }
 
-func (m *RedisPresenceManager) Close(_ context.Context) error {
+func (m *RedisPresenceManager) Close(ctx context.Context) error {
+	if m.state != nil {
+		return m.state.close(ctx)
+	}
 	return nil
 }
 
 func (m *RedisPresenceManager) getShard(channel string) *RedisShard {
+	if m.state != nil && m.state.enabled(channel) {
+		return m.state.shardOf(m.state.partition(channel))
+	}
 	if !m.sharding {
 		return m.shards[0]
 	}
@@ -187,6 +206,9 @@ func (m *RedisPresenceManager) useHashFieldTTLArg() string {
 }
 
 func (m *RedisPresenceManager) addPresence(s *RedisShard, ch string, uid string, info *ClientInfo) error {
+	if m.state != nil && m.state.enabled(ch) {
+		return m.state.addPresence(s, ch, uid, info)
+	}
 	keys, args, err := m.addPresenceScriptKeysArgs(s, ch, uid, info)
 	if err != nil {
 		return err
@@ -220,6 +242,9 @@ func (m *RedisPresenceManager) removePresenceScriptKeysArgs(s *RedisShard, ch st
 }
 
 func (m *RedisPresenceManager) removePresence(s *RedisShard, ch string, clientID string, userID string) error {
+	if m.state != nil && m.state.enabled(ch) {
+		return m.state.removePresence(s, ch, clientID, userID)
+	}
 	keys, args, err := m.removePresenceScriptKeysArgs(s, ch, clientID, userID)
 	if err != nil {
 		return err
@@ -370,6 +395,10 @@ func (m *RedisPresenceManager) PresenceStats(ch string) (PresenceStats, error) {
 // checkChannel refuses a channel whose keys could not share a slot. Presence
 // keys are tagged by channel in any cluster - see errRedisUnsupportedChannel.
 func (m *RedisPresenceManager) checkChannel(ch string) error {
+	if m.state != nil && m.state.enabled(ch) {
+		// The keys of the channel are tagged by its partition, not by the channel.
+		return nil
+	}
 	if m.getShard(ch).isCluster {
 		return checkRedisChannelTag(ch)
 	}
@@ -377,6 +406,9 @@ func (m *RedisPresenceManager) checkChannel(ch string) error {
 }
 
 func (m *RedisPresenceManager) presenceHashKey(s *RedisShard, ch string) channelID {
+	if m.state != nil && m.state.enabled(ch) {
+		return m.state.stateHashKey(ch)
+	}
 	if !s.isCluster {
 		// Fast path: simple concatenation is optimal for non-cluster
 		return channelID(m.config.Prefix + ".presence.data." + ch)
@@ -393,6 +425,9 @@ func (m *RedisPresenceManager) presenceHashKey(s *RedisShard, ch string) channel
 }
 
 func (m *RedisPresenceManager) presenceSetKey(s *RedisShard, ch string) channelID {
+	if m.state != nil && m.state.enabled(ch) {
+		return m.state.stateSetKey(ch)
+	}
 	if !s.isCluster {
 		// Fast path: simple concatenation is optimal for non-cluster
 		return channelID(m.config.Prefix + ".presence.expire." + ch)
@@ -409,6 +444,9 @@ func (m *RedisPresenceManager) presenceSetKey(s *RedisShard, ch string) channelI
 }
 
 func (m *RedisPresenceManager) userSetKey(s *RedisShard, ch string) channelID {
+	if m.state != nil && m.state.enabled(ch) {
+		return m.state.stateUserSetKey(ch)
+	}
 	if !s.isCluster {
 		// Fast path: simple concatenation is optimal for non-cluster
 		return channelID(m.config.Prefix + ".presence.user.expire." + ch)
@@ -425,6 +463,9 @@ func (m *RedisPresenceManager) userSetKey(s *RedisShard, ch string) channelID {
 }
 
 func (m *RedisPresenceManager) userHashKey(s *RedisShard, ch string) channelID {
+	if m.state != nil && m.state.enabled(ch) {
+		return m.state.stateUserHashKey(ch)
+	}
 	if !s.isCluster {
 		// Fast path: simple concatenation is optimal for non-cluster
 		return channelID(m.config.Prefix + ".presence.user.clients." + ch)
