@@ -134,25 +134,6 @@ func TestClientRefreshTokenIdentityNotChangedOnFailure(t *testing.T) {
 	})
 }
 
-// A refresh to a token without expiration still replaces the identity: a session
-// revocation must reach the session the connection holds now.
-func TestClientRefreshTokenIdentityWithoutExpiration(t *testing.T) {
-	node := defaultTestNode()
-	defer func() { _ = node.Shutdown(context.Background()) }()
-
-	startIdentity := TokenIdentity{Session: [16]byte{1}, Generation: 1, IssuedAt: 100}
-	newIdentity := TokenIdentity{Session: [16]byte{2}, Generation: 2, IssuedAt: 200}
-	client := newTokenIdentityServerRefreshTestClient(t, node, startIdentity, func(_ RefreshEvent, cb RefreshCallback) {
-		cb(RefreshReply{
-			TokenIdentity: &newIdentity,
-		}, nil)
-	})
-
-	client.expire()
-	require.False(t, client.status == statusClosed)
-	require.Equal(t, newIdentity, client.TokenIdentity())
-}
-
 func newTokenIdentityClientSideRefreshTestClient(t *testing.T, node *Node, identity TokenIdentity, refreshHandler RefreshHandler) *Client {
 	t.Helper()
 	node.OnConnecting(func(ctx context.Context, event ConnectEvent) (ConnectReply, error) {

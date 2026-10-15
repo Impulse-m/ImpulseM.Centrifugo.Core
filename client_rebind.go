@@ -138,11 +138,13 @@ func (c *Client) connInfo() []byte {
 	return c.info
 }
 
-// storeRefreshIdentity replaces the token identity after a refresh to a token
-// without expiration, which updates neither the expiration nor the info. A
+// storeRefreshIdentity replaces the token identity after a client-side refresh to
+// a token without expiration, which updates neither the expiration nor the info:
+// a connection which had an expiration still expires at it, as upstream. A
 // session revocation checks the identity the connection holds now, so a refresh
-// to another session must replace it whatever the expiration. Lock must not be
-// held outside.
+// to another session must replace it whatever the expiration. The server-side
+// refresh runs at expiration, where a reply without one closes the connection,
+// so it needs no such branch. Lock must not be held outside.
 func (c *Client) storeRefreshIdentity(identity TokenIdentity) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

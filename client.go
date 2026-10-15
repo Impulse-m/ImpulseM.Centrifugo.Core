@@ -2306,8 +2306,6 @@ func (c *Client) expire() {
 					c.tokenIdentity = *reply.TokenIdentity
 				}
 				c.mu.Unlock()
-			} else if reply.TokenIdentity != nil {
-				c.storeRefreshIdentity(*reply.TokenIdentity)
 			}
 			c.checkExpired()
 		}
