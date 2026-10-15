@@ -82,16 +82,7 @@ func (w *channelStateWorker) leaseCycle() {
 	ctx, cancel := context.WithTimeout(context.Background(), w.state.leaseTTL)
 	defer cancel()
 
-	for p, part := range w.owned {
-		renewed, err := w.renewLease(ctx, p)
-		if err != nil {
-			w.state.metrics.incChannelStateSweepErrors()
-			w.logError(err, "channel state lease renew failed", p)
-		}
-		if err != nil || !renewed {
-			w.stopPartition(p, part)
-		}
-	}
+	w.renewOwned(ctx)
 
 	share := w.share()
 	if len(w.owned) > share {
@@ -103,6 +94,43 @@ func (w *channelStateWorker) leaseCycle() {
 		w.acquire(ctx, share)
 	}
 	w.state.metrics.setChannelStatePartitionsOwned(len(w.owned))
+}
+
+// renewOwned renews the leases of the owned partitions, one pipeline per shard, so that the
+// renewals of a node take one round trip however many partitions it owns. A partition whose
+// lease is not renewed is stopped: another node may own it now.
+func (w *channelStateWorker) renewOwned(ctx context.Context) {
+	byShard := make(map[*RedisShard][]int)
+	for p := range w.owned {
+		sh := w.state.shardOf(p)
+		byShard[sh] = append(byShard[sh], p)
+	}
+
+	ttl := strconv.FormatInt(w.state.leaseTTL.Milliseconds(), 10)
+	var lost []int
+	for sh, partitions := range byShard {
+		execs := make([]rueidis.LuaExec, 0, len(partitions))
+		for _, p := range partitions {
+			execs = append(execs, rueidis.LuaExec{
+				Keys: []string{w.leaseKey(p)},
+				Args: []string{w.node.uid, ttl},
+			})
+		}
+		results := w.state.renewScript.ExecMulti(ctx, sh.client, execs...)
+		for i, res := range results {
+			renewed, err := res.AsInt64()
+			if err != nil {
+				w.state.metrics.incChannelStateSweepErrors()
+				w.logError(err, "channel state lease renew failed", partitions[i])
+			}
+			if err != nil || renewed != 1 {
+				lost = append(lost, partitions[i])
+			}
+		}
+	}
+	for _, p := range lost {
+		w.stopPartition(p, w.owned[p])
+	}
 }
 
 // releaseAll stops every owned partition and releases its lease. It runs once, on stop.
@@ -126,24 +154,62 @@ func (w *channelStateWorker) share() int {
 	return (w.state.numPartitions + nodes - 1) / nodes
 }
 
-// acquire takes free partitions, in random order, until the node owns its share.
+// acquire takes free partitions until the node owns its share. The lease attempts of a shard
+// go out in one pipeline, in random order, so a node takes its partitions in one round trip per
+// shard. A lease taken beyond the share is released at once.
 func (w *channelStateWorker) acquire(ctx context.Context, share int) {
+	free := make(map[*RedisShard][]int)
 	for _, p := range rand.Perm(w.state.numPartitions) { //nolint:gosec // Partition order is only a fairness hint; not security-sensitive.
-		if len(w.owned) >= share {
-			return
-		}
 		if _, ok := w.owned[p]; ok {
 			continue
 		}
-		acquired, err := w.acquireLease(ctx, p)
-		if err != nil {
-			w.state.metrics.incChannelStateSweepErrors()
-			w.logError(err, "channel state lease acquire failed", p)
-			return
+		sh := w.state.shardOf(p)
+		free[sh] = append(free[sh], p)
+	}
+
+	var taken []int
+	var errPartition int
+	var firstErr error
+	for sh, partitions := range free {
+		cmds := make([]rueidis.Completed, 0, len(partitions))
+		for _, p := range partitions {
+			cmds = append(cmds, sh.client.B().Set().Key(w.leaseKey(p)).Value(w.node.uid).Nx().PxMilliseconds(w.state.leaseTTL.Milliseconds()).Build())
 		}
-		if acquired {
-			w.startPartition(p)
+		for i, res := range sh.client.DoMulti(ctx, cmds...) {
+			err := res.Error()
+			if rueidis.IsRedisNil(err) {
+				// Another node holds the lease.
+				continue
+			}
+			if err != nil {
+				w.state.metrics.incChannelStateSweepErrors()
+				if firstErr == nil {
+					firstErr = err
+					errPartition = partitions[i]
+				}
+				continue
+			}
+			taken = append(taken, partitions[i])
 		}
+	}
+	if firstErr != nil {
+		w.logError(firstErr, "channel state lease acquire failed", errPartition)
+	}
+
+	for _, p := range taken {
+		if len(w.owned) >= share {
+			w.releaseTaken(ctx, p)
+			continue
+		}
+		w.startPartition(p)
+	}
+}
+
+// releaseTaken gives back a lease the node took but does not need.
+func (w *channelStateWorker) releaseTaken(ctx context.Context, p int) {
+	if err := w.releaseLease(ctx, p); err != nil {
+		w.state.metrics.incChannelStateSweepErrors()
+		w.logError(err, "channel state lease release failed", p)
 	}
 }
 
@@ -318,37 +384,6 @@ func (w *channelStateWorker) ack(ctx context.Context, sh *RedisShard, p int, ids
 
 func (w *channelStateWorker) leaseKey(p int) string {
 	return string(w.state.partitionKey(p, "lease"))
-}
-
-// acquireLease takes the lease of the partition when nobody holds it.
-func (w *channelStateWorker) acquireLease(ctx context.Context, p int) (bool, error) {
-	sh := w.state.shardOf(p)
-	err := sh.client.Do(
-		ctx,
-		sh.client.B().Set().Key(w.leaseKey(p)).Value(w.node.uid).Nx().PxMilliseconds(w.state.leaseTTL.Milliseconds()).Build(),
-	).Error()
-	if rueidis.IsRedisNil(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// renewLease extends the lease of the partition. It reports false when this node does not hold it.
-func (w *channelStateWorker) renewLease(ctx context.Context, p int) (bool, error) {
-	sh := w.state.shardOf(p)
-	renewed, err := w.state.renewScript.Exec(
-		ctx,
-		sh.client,
-		[]string{w.leaseKey(p)},
-		[]string{w.node.uid, strconv.FormatInt(w.state.leaseTTL.Milliseconds(), 10)},
-	).AsInt64()
-	if err != nil {
-		return false, err
-	}
-	return renewed == 1, nil
 }
 
 func (w *channelStateWorker) releaseLease(ctx context.Context, p int) error {
