@@ -2306,6 +2306,8 @@ func (c *Client) expire() {
 					c.tokenIdentity = *reply.TokenIdentity
 				}
 				c.mu.Unlock()
+			} else if reply.TokenIdentity != nil {
+				c.storeRefreshIdentity(*reply.TokenIdentity)
 			}
 			c.checkExpired()
 		}
@@ -2520,6 +2522,8 @@ func (c *Client) handleRefresh(req *protocol.RefreshRequest, cmd *protocol.Comma
 				c.writeDisconnectOrErrorFlush("", protocol.FrameTypeRefresh, cmd, ErrorExpired, started, rw)
 				return
 			}
+		} else if reply.TokenIdentity != nil {
+			c.storeRefreshIdentity(*reply.TokenIdentity)
 		}
 
 		protoReply, err := c.getRefreshCommandReply(res)
