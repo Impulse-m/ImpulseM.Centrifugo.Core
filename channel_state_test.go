@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,16 @@ func newTestChannelStateNode(tb testing.TB, prefix string, state RedisChannelSta
 	return node, pm
 }
 
+// testStatePrefixes numbers the prefixes of the channel state tests.
+var testStatePrefixes atomic.Uint64
+
+// getUniqueStatePrefix returns a prefix no other channel state test uses. getUniquePrefix seeds
+// its letters from the clock, so calls at the same moment (parallel tests) can return one prefix,
+// and two nodes on one prefix share their partition leases.
+func getUniqueStatePrefix() string {
+	return getUniquePrefix() + "-" + strconv.FormatUint(testStatePrefixes.Add(1), 10)
+}
+
 func testOwnedPartitions(tb testing.TB, node *Node) int {
 	tb.Helper()
 	return int(testGaugeValue(tb, node.metrics.channelStatePartitionsOwned))
@@ -49,7 +60,7 @@ func TestRedisChannelStateRetryDelivery(t *testing.T) {
 	collector := &testChannelStateCollector{}
 	collector.setFailures(2)
 	node := testNode(t)
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), testChannelStateConfig(collector), 0, false, 6379)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	require.NoError(t, pm.AddPresence("retry", "client-1", &ClientInfo{}))
 	require.Eventually(t, func() bool {
@@ -74,7 +85,7 @@ func TestRedisChannelStateStreamCap(t *testing.T) {
 	state.NumPartitions = 1
 	state.MaxStreamLength = 3
 	node := testNode(t)
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), state, 0, false, 6379)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
 
 	channels := []string{"cap-1", "cap-2", "cap-3", "cap-4", "cap-5"}
 	for _, ch := range channels {
@@ -98,7 +109,7 @@ func TestRedisChannelStateStreamCap(t *testing.T) {
 
 func TestRedisChannelStateTwoNodes(t *testing.T) {
 	t.Parallel()
-	prefix := getUniquePrefix()
+	prefix := getUniqueStatePrefix()
 	collector := &testChannelStateCollector{}
 	state := testChannelStateConfig(collector)
 	state.NumPartitions = 8
@@ -160,7 +171,7 @@ func TestRedisChannelStateClose(t *testing.T) {
 
 	state := testChannelStateConfig(collector)
 	pm, err := NewRedisPresenceManager(node, RedisPresenceManagerConfig{
-		Prefix:       getUniquePrefix(),
+		Prefix:       getUniqueStatePrefix(),
 		Shards:       []*RedisShard{s},
 		ChannelState: &state,
 	})

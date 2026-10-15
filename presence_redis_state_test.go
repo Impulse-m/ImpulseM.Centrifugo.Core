@@ -180,7 +180,7 @@ func testGaugeValue(tb testing.TB, gauge prometheus.Gauge) float64 {
 func testOccupiedVacated(t *testing.T, port int, hashFieldTTL bool) {
 	collector := &testChannelStateCollector{}
 	node := testNode(t)
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), testChannelStateConfig(collector), 0, hashFieldTTL, port)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, hashFieldTTL, port)
 
 	const ch = "occupied-vacated"
 	require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
@@ -205,7 +205,7 @@ func TestRedisChannelStateOccupiedOnce(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
 	node := testNode(t)
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), testChannelStateConfig(collector), 0, false, 6379)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	const ch = "occupied-once"
 	addAt := time.Now()
@@ -234,7 +234,7 @@ func TestRedisChannelStateResubscribeCancelsVacated(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
 	node := testNode(t)
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), testChannelStateConfig(collector), 0, false, 6379)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	const ch = "resubscribe"
 	require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
@@ -260,7 +260,7 @@ func TestRedisChannelStateOrderPerChannel(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
 	node := testNode(t)
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), testChannelStateConfig(collector), 0, false, 6379)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	const ch = "order"
 	require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
@@ -294,7 +294,7 @@ func TestRedisChannelStateExpiredPresence(t *testing.T) {
 	collector := &testChannelStateCollector{}
 	node := testNode(t)
 	const presenceTTL = time.Second
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), testChannelStateConfig(collector), presenceTTL, false, 6379)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), presenceTTL, false, 6379)
 
 	const ch = "expired"
 	addAt := time.Now()
@@ -323,7 +323,7 @@ func TestRedisChannelStateStaleEntriesDoNotKeepOccupied(t *testing.T) {
 	collector := &testChannelStateCollector{}
 	node := testNode(t)
 	const presenceTTL = time.Second
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), testChannelStateConfig(collector), presenceTTL, false, 6379)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), presenceTTL, false, 6379)
 
 	const ch = "stale"
 	require.NoError(t, pm.AddPresence(ch, "client-a", &ClientInfo{}))
@@ -362,7 +362,7 @@ func TestRedisChannelStateAddAfterPresenceKeyExpired(t *testing.T) {
 	state := testChannelStateConfig(collector)
 	// The sweep runs once in the window of the test, after the second add.
 	state.SweepInterval = 2 * time.Second
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), state, presenceTTL, false, 6379)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, presenceTTL, false, 6379)
 
 	const ch = "late-add"
 	require.NoError(t, pm.AddPresence(ch, "client-a", &ClientInfo{}))
@@ -385,7 +385,7 @@ func TestRedisChannelStateRepeatedRemoveSendsOneVacated(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
 	node := testNode(t)
-	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), testChannelStateConfig(collector), 0, false, 6379)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	const ch = "repeated-remove"
 	require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
@@ -419,7 +419,7 @@ func TestRedisChannelStateDisabledChannelKeysUnchanged(t *testing.T) {
 		return strings.HasPrefix(channel, "state:")
 	}
 	node := testNode(t)
-	prefix := getUniquePrefix()
+	prefix := getUniqueStatePrefix()
 	pm := newTestRedisPresenceStateManager(t, node, prefix, state, 0, false, 6379)
 
 	require.NoError(t, pm.AddPresence("plain", "client-1", &ClientInfo{}))
@@ -445,7 +445,7 @@ func TestRedisChannelStateDisabledChannelKeysUnchanged(t *testing.T) {
 
 	// A presence manager without ChannelState keeps no state at all.
 	node2 := testNode(t)
-	pm2 := NewTestRedisPresenceManagerWithPrefix(t, node2, getUniquePrefix(), false, false, 6379)
+	pm2 := NewTestRedisPresenceManagerWithPrefix(t, node2, getUniqueStatePrefix(), false, false, 6379)
 	require.Nil(t, pm2.state)
 	require.NoError(t, pm2.AddPresence("plain", "client-1", &ClientInfo{}))
 }
@@ -458,7 +458,7 @@ func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
 
 	before := runtime.NumGoroutine()
 	pm, err := NewRedisPresenceManager(node, RedisPresenceManagerConfig{
-		Prefix: getUniquePrefix(),
+		Prefix: getUniqueStatePrefix(),
 		Shards: []*RedisShard{s},
 	})
 	require.NoError(t, err)
@@ -476,7 +476,7 @@ func TestRedisChannelStateCluster(t *testing.T) {
 		IOTimeout:        10 * time.Second,
 	})
 	require.NoError(t, err)
-	pm := newTestRedisPresenceStateManagerWithShards(t, node, getUniquePrefix(), testChannelStateConfig(collector), 0, false, []*RedisShard{s})
+	pm := newTestRedisPresenceStateManagerWithShards(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, []*RedisShard{s})
 	waitForChannelStatePartitions(t, node, 0)
 
 	channels := []string{"cluster-a", "cluster-b", "cluster-c", "cluster-d", "cluster-e"}
@@ -498,7 +498,7 @@ func TestRedisChannelStateCluster(t *testing.T) {
 func BenchmarkRedisPresenceStateAdd(b *testing.B) {
 	collector := &testChannelStateCollector{}
 	node := benchNode(b)
-	pm := newTestRedisPresenceStateManager(b, node, getUniquePrefix(), testChannelStateConfig(collector), 0, false, 6379)
+	pm := newTestRedisPresenceStateManager(b, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 	b.SetParallelism(getBenchParallelism())
 	_ = pm.AddPresence("channel", "uid", &ClientInfo{})
 	b.ResetTimer()
@@ -516,7 +516,7 @@ func BenchmarkRedisPresenceStateAdd(b *testing.B) {
 func BenchmarkRedisPresenceStateRemove(b *testing.B) {
 	collector := &testChannelStateCollector{}
 	node := benchNode(b)
-	pm := newTestRedisPresenceStateManager(b, node, getUniquePrefix(), testChannelStateConfig(collector), 0, false, 6379)
+	pm := newTestRedisPresenceStateManager(b, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 	b.SetParallelism(getBenchParallelism())
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
