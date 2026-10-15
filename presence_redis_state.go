@@ -69,6 +69,10 @@ type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) e
 
 // RedisChannelStateConfig enables channel state events (occupied, vacated) in
 // RedisPresenceManager. Zero values select the defaults.
+//
+// When a node crashes, the partitions it consumed move to the surviving nodes only after
+// the node registry drops the crashed node, about 7 to 16 seconds after its last
+// publication. Events of those partitions are delayed by that much.
 type RedisChannelStateConfig struct {
 	// Enabled reports whether channel state events are kept for the channel. Required. The answer
 	// must not change for a channel while it has subscribers: keys are chosen per call, so toggling

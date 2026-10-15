@@ -173,6 +173,11 @@ func (w *channelStateWorker) releaseAll() {
 
 // share is the number of partitions this node takes: an even split by the nodes known
 // in the registry. The registry is a heuristic for fairness only, the lease is the guard.
+// A node that crashed stays in the registry until it is dropped, about 7 to 16 seconds
+// after its last publication, so its share is still counted. The survivors take over its
+// partitions only then, and events of those partitions are delayed by that much. This is
+// a documented delay: the share is not reduced early, because a node that is slow to
+// publish would then take more partitions than its share.
 func (w *channelStateWorker) share() int {
 	nodes := w.node.nodes.size()
 	if nodes < 1 {

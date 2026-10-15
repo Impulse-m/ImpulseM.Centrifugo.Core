@@ -1,7 +1,7 @@
 Unreleased fork changes
 =======================
 
-* Channel state events `occupied` and `vacated` in `RedisPresenceManager`, enabled per channel with `RedisPresenceManagerConfig.ChannelState` and delivered to a `ChannelStateHandler` in batches and partition order. Partitions are leased between nodes, a vacated event waits for `VacatedEventDelay`, and delivery is at least once. Metrics are in the `channel_state` subsystem.
+* Channel state events `occupied` and `vacated` in `RedisPresenceManager`, enabled per channel with `RedisPresenceManagerConfig.ChannelState` and delivered to a `ChannelStateHandler` in batches and partition order. Partitions are leased between nodes, a vacated event waits for `VacatedEventDelay`, and delivery is at least once. Partitions of a crashed node move to the other nodes only after the node registry drops it, about 7 to 16 seconds later, so their events are delayed by that much. Metrics are in the `channel_state` subsystem.
 
 v0.29.4 and higher
 ==================
