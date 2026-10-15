@@ -5137,7 +5137,6 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 	info := &ClientInfo{
 		ClientID: c.uid,
 		UserID:   c.UserID(),
-		ConnInfo: c.connInfo(),
 		ChanInfo: reply.Options.ChannelInfo,
 	}
 
@@ -5151,6 +5150,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 	// concurrent subscribe. Paths without a reservation (initial server-side
 	// subscribe on connect) get a fresh generation here.
 	c.mu.Lock()
+	info.ConnInfo = c.info
 	subGen := c.channels[channel].subGen
 	if subGen == 0 {
 		// No generation on the reservation (or no reservation at all, for the

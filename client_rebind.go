@@ -150,20 +150,14 @@ func (c *Client) storeUser(user string) {
 // calls go to the PresenceManager and the map broker.
 //
 // Unsubscribe deletes the channel under c.mu before it removes presence, and it
-// reads the user lock-free, so it removes either the old or the new user. If the
-// channel is no longer subscribed after the add, movePresence removes the entry
-// it just added.
+// reads the user lock-free, so it removes either the old or the new user. The
+// recheck after the add covers the case where it ran before the add: if the
+// channel is no longer subscribed, the entry just added is removed again.
 func (c *Client) rewritePresence(p rebindPresence, oldUser string) {
+	newUser := c.UserID()
 	if f := testHookRebindBeforePresence.Load(); f != nil {
 		(*f)(p.channel)
 	}
-	c.movePresence(p, oldUser)
-}
-
-// movePresence moves the presence of one channel from oldUser to the current
-// user of the connection, with the current info. c.mu must not be held.
-func (c *Client) movePresence(p rebindPresence, oldUser string) {
-	newUser := c.UserID()
 	c.removeChannelPresence(p, oldUser)
 	if _, err := c.updateChannelPresence(p.channel, p.ctx); err != nil {
 		c.node.logger.log(newErrorLogEntry(err, "error updating presence for channel on rebind", map[string]any{
