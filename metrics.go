@@ -164,12 +164,9 @@ type metrics struct {
 	mapBrokerCleanupRemoved         *prometheus.CounterVec
 	mapBrokerCleanupErrors          *prometheus.CounterVec
 
-	channelStateEventsEmitted   *prometheus.CounterVec
-	channelStateEventsDropped   *prometheus.CounterVec
-	channelStateEventsDelivered prometheus.Counter
-	channelStateDeliveryErrors  prometheus.Counter
-	channelStateSweepErrors     prometheus.Counter
-	channelStatePartitionsOwned prometheus.Gauge
+	channelState *channelStateMetrics
+	registerer   prometheus.Registerer
+	namespace    string
 
 	redisBrokerPubSubErrors           *prometheus.CounterVec
 	redisBrokerPubSubDroppedMessages  *prometheus.CounterVec
@@ -552,6 +549,8 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		config:      config,
 		nsCache:     nsCache,
 		codeStrings: codeStrings,
+		registerer:  registerer,
+		namespace:   metricsNamespace,
 	}
 
 	m.actionCount = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -909,48 +908,6 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		Help:      "Total number of cleanup errors.",
 	}, []string{"broker_name"})
 
-	m.channelStateEventsEmitted = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricsNamespace,
-		Subsystem: "channel_state",
-		Name:      "events_emitted_count",
-		Help:      "Number of channel state events written to a stream by this node.",
-	}, []string{"type"})
-
-	m.channelStateEventsDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: metricsNamespace,
-		Subsystem: "channel_state",
-		Name:      "events_dropped_count",
-		Help:      "Number of channel state events dropped because the stream of the partition was full.",
-	}, []string{"type"})
-
-	m.channelStateEventsDelivered = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricsNamespace,
-		Subsystem: "channel_state",
-		Name:      "events_delivered_count",
-		Help:      "Number of channel state events acknowledged by the handler.",
-	})
-
-	m.channelStateDeliveryErrors = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricsNamespace,
-		Subsystem: "channel_state",
-		Name:      "delivery_errors_count",
-		Help:      "Number of channel state handler calls that returned an error.",
-	})
-
-	m.channelStateSweepErrors = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: metricsNamespace,
-		Subsystem: "channel_state",
-		Name:      "sweep_errors_count",
-		Help:      "Number of Redis errors of the channel state sweep and lease loops.",
-	})
-
-	m.channelStatePartitionsOwned = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: metricsNamespace,
-		Subsystem: "channel_state",
-		Name:      "partitions_owned",
-		Help:      "Number of channel state partitions this node consumes.",
-	})
-
 	sharedPollDurationBuckets := []float64{
 		0.010, 0.025, 0.050, 0.100, 0.250, 0.500, // Millisecond resolution.
 		1.0, 2.5, 5.0, 10.0, 30.0, 60.0, // Second resolution.
@@ -1193,12 +1150,6 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		m.mapBrokerCleanupLag,
 		m.mapBrokerCleanupRemoved,
 		m.mapBrokerCleanupErrors,
-		m.channelStateEventsEmitted,
-		m.channelStateEventsDropped,
-		m.channelStateEventsDelivered,
-		m.channelStateDeliveryErrors,
-		m.channelStateSweepErrors,
-		m.channelStatePartitionsOwned,
 		m.redisBrokerPubSubErrors,
 		m.redisBrokerPubSubDroppedMessages,
 		m.redisBrokerPubSubBufferedMessages,

@@ -464,6 +464,7 @@ func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, before, runtime.NumGoroutine())
 	require.Nil(t, pm.state)
+	require.Nil(t, node.metrics.channelState)
 	require.NoError(t, pm.Close(context.Background()))
 }
 

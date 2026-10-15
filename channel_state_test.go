@@ -44,7 +44,7 @@ func getUniqueStatePrefix() string {
 
 func testOwnedPartitions(tb testing.TB, node *Node) int {
 	tb.Helper()
-	return int(testGaugeValue(tb, node.metrics.channelStatePartitionsOwned))
+	return int(testGaugeValue(tb, node.metrics.channelState.partitionsOwned))
 }
 
 func testStreamLength(tb testing.TB, pm *RedisPresenceManager, p int) int64 {
@@ -72,7 +72,7 @@ func TestRedisChannelStateRetryDelivery(t *testing.T) {
 	require.Len(t, attempts, 3)
 	require.GreaterOrEqual(t, attempts[1].Sub(attempts[0]), 100*time.Millisecond)
 	require.GreaterOrEqual(t, attempts[2].Sub(attempts[1]), 200*time.Millisecond)
-	require.Equal(t, 2.0, testCounterValue(t, node.metrics.channelStateDeliveryErrors))
+	require.Equal(t, 2.0, testCounterValue(t, node.metrics.channelState.deliveryErrors))
 	require.Len(t, collector.snapshot(), 1)
 }
 
@@ -91,7 +91,7 @@ func TestRedisChannelStateStreamCap(t *testing.T) {
 	for _, ch := range channels {
 		require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
 	}
-	require.Equal(t, 2.0, testCounterVecValue(t, node.metrics.channelStateEventsDropped, "occupied"))
+	require.Equal(t, 2.0, testCounterVecValue(t, node.metrics.channelState.eventsDropped, "occupied"))
 	require.Equal(t, int64(3), testStreamLength(t, pm, 0))
 
 	collector.setFailAll(false)

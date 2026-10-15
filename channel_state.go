@@ -93,7 +93,7 @@ func (w *channelStateWorker) leaseCycle() {
 	} else if len(w.owned) < share {
 		w.acquire(ctx, share)
 	}
-	w.state.metrics.setChannelStatePartitionsOwned(len(w.owned))
+	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
 // renewOwned renews the leases of the owned partitions, one pipeline per shard, so that the
@@ -120,7 +120,7 @@ func (w *channelStateWorker) renewOwned(ctx context.Context) {
 		for i, res := range results {
 			renewed, err := res.AsInt64()
 			if err != nil {
-				w.state.metrics.incChannelStateSweepErrors()
+				w.state.metrics.incSweepErrors()
 				w.logError(err, "channel state lease renew failed", partitions[i])
 			}
 			if err != nil || renewed != 1 {
@@ -141,7 +141,7 @@ func (w *channelStateWorker) releaseAll() {
 	for p, part := range w.owned {
 		w.releasePartition(ctx, p, part)
 	}
-	w.state.metrics.setChannelStatePartitionsOwned(len(w.owned))
+	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
 // share is the number of partitions this node takes: an even split by the nodes known
@@ -182,7 +182,7 @@ func (w *channelStateWorker) acquire(ctx context.Context, share int) {
 				continue
 			}
 			if err != nil {
-				w.state.metrics.incChannelStateSweepErrors()
+				w.state.metrics.incSweepErrors()
 				if firstErr == nil {
 					firstErr = err
 					errPartition = partitions[i]
@@ -208,7 +208,7 @@ func (w *channelStateWorker) acquire(ctx context.Context, share int) {
 // releaseTaken gives back a lease the node took but does not need.
 func (w *channelStateWorker) releaseTaken(ctx context.Context, p int) {
 	if err := w.releaseLease(ctx, p); err != nil {
-		w.state.metrics.incChannelStateSweepErrors()
+		w.state.metrics.incSweepErrors()
 		w.logError(err, "channel state lease release failed", p)
 	}
 }
@@ -236,7 +236,7 @@ func (w *channelStateWorker) stopPartition(p int, part *channelStatePartition) {
 func (w *channelStateWorker) releasePartition(ctx context.Context, p int, part *channelStatePartition) {
 	w.stopPartition(p, part)
 	if err := w.releaseLease(ctx, p); err != nil {
-		w.state.metrics.incChannelStateSweepErrors()
+		w.state.metrics.incSweepErrors()
 		w.logError(err, "channel state lease release failed", p)
 	}
 }
@@ -266,14 +266,14 @@ func (w *channelStateWorker) consume(ctx context.Context, p int, done chan struc
 // It returns false when ctx is done.
 func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p int, backoff *channelStateBackoff) bool {
 	if err := w.sweep(ctx, sh, p); err != nil {
-		w.state.metrics.incChannelStateSweepErrors()
+		w.state.metrics.incSweepErrors()
 		w.logError(err, "channel state sweep failed", p)
 		return w.wait(ctx, backoff)
 	}
 	for {
 		events, ids, err := w.readBatch(ctx, sh, p)
 		if err != nil {
-			w.state.metrics.incChannelStateSweepErrors()
+			w.state.metrics.incSweepErrors()
 			w.logError(err, "channel state read failed", p)
 			return w.wait(ctx, backoff)
 		}
@@ -282,18 +282,18 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 		}
 		if err := w.state.handler(ctx, events); err != nil {
 			// The events stay in the stream, so the same batch is delivered again.
-			w.state.metrics.incChannelStateDeliveryErrors()
+			w.state.metrics.incDeliveryErrors()
 			w.logError(err, "channel state delivery failed", p)
 			if !w.wait(ctx, backoff) {
 				return false
 			}
 			continue
 		}
-		w.state.metrics.addChannelStateDelivered(len(events))
+		w.state.metrics.addDelivered(len(events))
 		backoff.reset()
 		if err := w.ack(ctx, sh, p, ids); err != nil {
 			// The batch is still in the stream: a repeated delivery is possible, by design.
-			w.state.metrics.incChannelStateSweepErrors()
+			w.state.metrics.incSweepErrors()
 			w.logError(err, "channel state ack failed", p)
 			if !w.wait(ctx, backoff) {
 				return false
@@ -429,48 +429,4 @@ func (b *channelStateBackoff) next() time.Duration {
 
 func (b *channelStateBackoff) reset() {
 	b.delay = 0
-}
-
-// The metric helpers are nil safe: a node without metrics keeps working.
-
-func (m *metrics) incChannelStateEmitted(eventType ChannelStateEventType) {
-	if m == nil {
-		return
-	}
-	m.channelStateEventsEmitted.WithLabelValues(string(eventType)).Inc()
-}
-
-func (m *metrics) incChannelStateDropped(eventType ChannelStateEventType) {
-	if m == nil {
-		return
-	}
-	m.channelStateEventsDropped.WithLabelValues(string(eventType)).Inc()
-}
-
-func (m *metrics) addChannelStateDelivered(count int) {
-	if m == nil {
-		return
-	}
-	m.channelStateEventsDelivered.Add(float64(count))
-}
-
-func (m *metrics) incChannelStateDeliveryErrors() {
-	if m == nil {
-		return
-	}
-	m.channelStateDeliveryErrors.Inc()
-}
-
-func (m *metrics) incChannelStateSweepErrors() {
-	if m == nil {
-		return
-	}
-	m.channelStateSweepErrors.Inc()
-}
-
-func (m *metrics) setChannelStatePartitionsOwned(count int) {
-	if m == nil {
-		return
-	}
-	m.channelStatePartitionsOwned.Set(float64(count))
 }

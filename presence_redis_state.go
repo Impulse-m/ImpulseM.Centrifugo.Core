@@ -104,7 +104,7 @@ type presenceState struct {
 	sweepInterval     time.Duration
 	leaseTTL          time.Duration
 	batchSize         int
-	metrics           *metrics
+	metrics           *channelStateMetrics
 
 	addScript     *rueidis.Lua
 	remScript     *rueidis.Lua
@@ -160,6 +160,11 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 		batchSize = channelStateDefaultBatchSize
 	}
 
+	cm, err := m.node.metrics.enableChannelStateMetrics()
+	if err != nil {
+		return nil, err
+	}
+
 	partitionShards := make([]int, numPartitions)
 	for p := range partitionShards {
 		partitionShards[p] = consistentIndex("cs"+strconv.Itoa(p), len(m.shards))
@@ -176,7 +181,7 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 		sweepInterval:     sweepInterval,
 		leaseTTL:          leaseTTL,
 		batchSize:         batchSize,
-		metrics:           m.node.metrics,
+		metrics:           cm,
 
 		addScript:     rueidis.NewLuaScript(presenceStateAddScriptSource, rueidis.WithLoadSHA1(m.config.LoadSHA1)),
 		remScript:     rueidis.NewLuaScript(presenceStateRemScriptSource, rueidis.WithLoadSHA1(m.config.LoadSHA1)),
@@ -314,9 +319,9 @@ func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int
 func (s *presenceState) countResult(eventType ChannelStateEventType, result int64) {
 	switch result {
 	case 1:
-		s.metrics.incChannelStateEmitted(eventType)
+		s.metrics.incEmitted(eventType)
 	case 2:
-		s.metrics.incChannelStateDropped(eventType)
+		s.metrics.incDropped(eventType)
 	}
 }
 
