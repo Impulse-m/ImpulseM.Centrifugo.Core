@@ -57,6 +57,10 @@ type rebindPresence struct {
 // rebind, because its entry is removed and added again. A channel unsubscribed
 // while its presence moves is not left with a stale entry.
 //
+// A subscribe whose presence add runs during Rebind may leave the entry of the
+// identity it read before the rebind. Rebind does not correct it: the next
+// presence update of the connection rewrites the entry with the current identity.
+//
 // Rebind holds connectMu while it rewrites presence, so a concurrent close of the
 // same connection waits for that I/O, which is bounded by the presence backend
 // timeouts. Rebind is rare (a login or a logout), so this is accepted.
@@ -146,9 +150,9 @@ func (c *Client) storeUser(user string) {
 // calls go to the PresenceManager and the map broker.
 //
 // Unsubscribe deletes the channel under c.mu before it removes presence, and it
-// reads the user lock-free, so it removes either the old or the new user. The
-// recheck after the add covers the case where it ran before the add: if the
-// channel is no longer subscribed, the entry just added is removed again.
+// reads the user lock-free, so it removes either the old or the new user. If the
+// channel is no longer subscribed after the add, movePresence removes the entry
+// it just added.
 func (c *Client) rewritePresence(p rebindPresence, oldUser string) {
 	if f := testHookRebindBeforePresence.Load(); f != nil {
 		(*f)(p.channel)
