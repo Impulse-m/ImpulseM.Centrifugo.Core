@@ -351,6 +351,58 @@ func TestRedisChannelStateStaleEntriesDoNotKeepOccupied(t *testing.T) {
 	require.Len(t, eventsOfType(collector.snapshot(), ChannelStateOccupied), 1)
 }
 
+// TestRedisChannelStateAddAfterPresenceKeyExpired adds a client after the hash of the channel
+// expired on Redis, before the sweep sent the vacated event: the channel is still occupied for
+// the backend, so the add must not send occupied again.
+func TestRedisChannelStateAddAfterPresenceKeyExpired(t *testing.T) {
+	t.Parallel()
+	collector := &testChannelStateCollector{}
+	node := testNode(t)
+	const presenceTTL = time.Second
+	state := testChannelStateConfig(collector)
+	// The sweep runs once in the window of the test, after the second add.
+	state.SweepInterval = 2 * time.Second
+	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), state, presenceTTL, false, 6379)
+
+	const ch = "late-add"
+	require.NoError(t, pm.AddPresence(ch, "client-a", &ClientInfo{}))
+	time.Sleep(presenceTTL + presenceTTL/3)
+	require.NoError(t, pm.AddPresence(ch, "client-b", &ClientInfo{}))
+
+	require.Eventually(t, func() bool {
+		return len(collector.snapshot()) >= 1
+	}, 10*time.Second, 10*time.Millisecond)
+	time.Sleep(state.SweepInterval)
+
+	events := collector.snapshot()
+	require.Len(t, eventsOfType(events, ChannelStateOccupied), 1)
+	require.Empty(t, eventsOfType(events, ChannelStateVacated))
+}
+
+// TestRedisChannelStateRepeatedRemoveSendsOneVacated removes the same client twice: only the first
+// remove, the one that found the client, arms the vacated event.
+func TestRedisChannelStateRepeatedRemoveSendsOneVacated(t *testing.T) {
+	t.Parallel()
+	collector := &testChannelStateCollector{}
+	node := testNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniquePrefix(), testChannelStateConfig(collector), 0, false, 6379)
+
+	const ch = "repeated-remove"
+	require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, pm.RemovePresence(ch, "client-1", ""))
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateVacated)) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, pm.RemovePresence(ch, "client-1", ""))
+	time.Sleep(3 * testChannelStateVacatedDelay)
+	require.Len(t, eventsOfType(collector.snapshot(), ChannelStateVacated), 1)
+}
+
 func TestRedisChannelStateHashFieldTTL(t *testing.T) {
 	t.Parallel()
 	if !supportsHashFieldTTL(t, 6379) {
