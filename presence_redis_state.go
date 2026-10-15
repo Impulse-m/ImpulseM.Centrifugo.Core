@@ -62,13 +62,17 @@ type ChannelStateEvent struct {
 
 // ChannelStateHandler delivers one batch of a partition, in order. A non-nil error
 // makes the batch be delivered again after a backoff. The context is cancelled when
-// the presence manager is closed or the partition moves to another node.
+// the presence manager is closed or the partition moves to another node. The handler
+// must return once ctx is done: the lease loop waits for a running handler before it
+// releases the partition.
 type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) error
 
 // RedisChannelStateConfig enables channel state events (occupied, vacated) in
 // RedisPresenceManager. Zero values select the defaults.
 type RedisChannelStateConfig struct {
-	// Enabled reports whether channel state events are kept for the channel. Required.
+	// Enabled reports whether channel state events are kept for the channel. Required. The answer
+	// must not change for a channel while it has subscribers: keys are chosen per call, so toggling
+	// it on live channels is not supported.
 	Enabled func(channel string) bool
 	// Handler receives the events. Required.
 	Handler ChannelStateHandler
@@ -76,8 +80,9 @@ type RedisChannelStateConfig struct {
 	// It must not change while channels are occupied. Default 128.
 	NumPartitions int
 	// VacatedEventDelay is how long a channel stays occupied after its last subscriber
-	// left; a subscribe within the delay cancels the vacated event. Negative means no delay.
-	// Default 5s.
+	// left; a subscribe within the delay cancels the vacated event. Zero selects the default
+	// 5s, so a configured zero delay must be passed as a negative value: that means no delay,
+	// and the vacated event is sent by the next sweep. Default 5s.
 	VacatedEventDelay time.Duration
 	// MaxStreamLength caps the events waiting for delivery in one partition; new events
 	// are dropped when the cap is reached. Negative removes the cap. Default 8192.

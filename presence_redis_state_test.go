@@ -256,6 +256,37 @@ func TestRedisChannelStateResubscribeCancelsVacated(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 }
 
+func TestRedisChannelStateNegativeDelayHasNoGrace(t *testing.T) {
+	t.Parallel()
+	collector := &testChannelStateCollector{}
+	state := testChannelStateConfig(collector)
+	state.VacatedEventDelay = -1
+	node := testNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
+	require.Equal(t, time.Duration(0), pm.state.vacatedEventDelay)
+
+	const ch = "no-grace"
+	require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, pm.RemovePresence(ch, "client-1", ""))
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateVacated)) == 1
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestRedisChannelStateZeroDelayIsDefault(t *testing.T) {
+	t.Parallel()
+	collector := &testChannelStateCollector{}
+	state := testChannelStateConfig(collector)
+	state.VacatedEventDelay = 0
+	node := testNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
+	require.Equal(t, channelStateDefaultVacatedEventDelay, pm.state.vacatedEventDelay)
+}
+
 func TestRedisChannelStateOrderPerChannel(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
