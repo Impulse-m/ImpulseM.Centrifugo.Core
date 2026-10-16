@@ -111,6 +111,8 @@ func TestClientHistoryRefusedWhenFilteredSubscriptionComesAndGoesDuringCall(t *t
 		client.OnHistory(func(e HistoryEvent, cb HistoryCallback) {
 			subRW := testReplyWriterWrapper()
 			require.NoError(t, client.handleSubscribe(&protocol.SubscribeRequest{Channel: e.Channel}, &protocol.Command{Id: 3}, time.Now(), subRW.rw))
+			require.Len(t, subRW.replies, 1)
+			require.Nil(t, subRW.replies[0].Error)
 			client.Unsubscribe(e.Channel)
 			cb(HistoryReply{}, nil)
 		})
@@ -189,6 +191,8 @@ func TestClientHistoryRefusedWhenOtherSubscriptionCommitsDuringCall(t *testing.T
 		client.OnHistory(func(e HistoryEvent, cb HistoryCallback) {
 			subRW := testReplyWriterWrapper()
 			require.NoError(t, client.handleSubscribe(&protocol.SubscribeRequest{Channel: "other"}, &protocol.Command{Id: 3}, time.Now(), subRW.rw))
+			require.Len(t, subRW.replies, 1)
+			require.Nil(t, subRW.replies[0].Error)
 			cb(HistoryReply{}, nil)
 		})
 	})
@@ -339,6 +343,36 @@ func TestClientHistoryRefusedWhenMapSubscribeEndsDuringCall(t *testing.T) {
 	client := newTestConnectedClientV2(t, node, "user1")
 	publishHistoryForTest(t, node, "g")
 	seedMapSubscribing(client, "g")
+
+	histRW := testReplyWriterWrapper()
+	require.NoError(t, client.handleHistory(&protocol.HistoryRequest{Channel: "g", Limit: 100}, &protocol.Command{Id: 2}, time.Now(), histRW.rw))
+	requireHistoryRefusedReply(t, histRW)
+}
+
+// The application may set the history result itself. The refusal applies to
+// that result too: the publications it carries are not handed out when a
+// filtered subscription is committed during the call.
+func TestClientHistoryRefusedWhenApplicationResultDuringCall(t *testing.T) {
+	t.Parallel()
+	node := defaultNodeNoHandlers()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	node.OnConnect(func(client *Client) {
+		client.OnSubscribe(func(e SubscribeEvent, cb SubscribeCallback) {
+			cb(SubscribeReply{Options: filteredSubscribeOptions()}, nil)
+		})
+		client.OnHistory(func(e HistoryEvent, cb HistoryCallback) {
+			subRW := testReplyWriterWrapper()
+			require.NoError(t, client.handleSubscribe(&protocol.SubscribeRequest{Channel: e.Channel}, &protocol.Command{Id: 3}, time.Now(), subRW.rw))
+			require.Len(t, subRW.replies, 1)
+			require.Nil(t, subRW.replies[0].Error)
+			cb(HistoryReply{Result: &HistoryResult{
+				Publications: []*Publication{{Data: []byte(`{}`)}},
+			}}, nil)
+		})
+	})
+	client := newTestConnectedClientV2(t, node, "user1")
+	publishHistoryForTest(t, node, "g")
 
 	histRW := testReplyWriterWrapper()
 	require.NoError(t, client.handleHistory(&protocol.HistoryRequest{Channel: "g", Limit: 100}, &protocol.Command{Id: 2}, time.Now(), histRW.rw))
