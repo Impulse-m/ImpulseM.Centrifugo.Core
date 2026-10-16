@@ -3631,8 +3631,13 @@ func (c *Client) handleHistory(req *protocol.HistoryRequest, cmd *protocol.Comma
 	// history is not filtered by it: answering would hand out exactly what the
 	// filter hides. Recovery on subscribe applies the filter, so it stays the
 	// way for such a subscriber to get missed publications.
+	// The callback checks again, see historyRefusedAtCallback: the application
+	// decides in between, and the subscription may change meanwhile.
 	c.mu.RLock()
 	channelContext, subscribed := c.channels[channel]
+	_, loading := c.mapSubscribing[channel]
+	presentAtCheck := subscribed || loading
+	genAtCheck := c.subGenCounter.Load()
 	c.mu.RUnlock()
 	if subscribed && channelHasFlag(channelContext.flags, flagServerTagsFilter) {
 		return ErrorPermissionDenied
@@ -3662,6 +3667,10 @@ func (c *Client) handleHistory(req *protocol.HistoryRequest, cmd *protocol.Comma
 	cb := func(reply HistoryReply, err error) {
 		if err != nil {
 			c.writeDisconnectOrErrorFlush(channel, protocol.FrameTypeHistory, cmd, err, started, rw)
+			return
+		}
+		if c.historyRefusedAtCallback(channel, presentAtCheck, genAtCheck) {
+			c.writeDisconnectOrErrorFlush(channel, protocol.FrameTypeHistory, cmd, ErrorPermissionDenied, started, rw)
 			return
 		}
 
