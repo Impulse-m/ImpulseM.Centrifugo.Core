@@ -25,6 +25,7 @@ func newChannelStateMetrics(m *metrics) (*channelStateMetrics, error) {
 	if m == nil {
 		return nil, nil
 	}
+	// The registerer and the namespace are chosen as newMetricsRegistry chooses them, which does not return them.
 	registerer := prometheus.DefaultRegisterer
 	if m.config.RegistererGatherer != nil {
 		registerer = m.config.RegistererGatherer

@@ -64,8 +64,10 @@ type ChannelStateEvent struct {
 // ChannelStateHandler delivers one batch of a partition, in order. A non-nil error
 // makes the batch be delivered again after a backoff. The context is cancelled when
 // the presence manager is closed or the partition moves to another node. The handler
-// must return once ctx is done: the lease of the partition is released only after a
-// running handler has returned.
+// must return once ctx is done. When a partition moves to another node, its lease is
+// released only after a running handler has returned. Close releases the leases first
+// and then waits for the running handlers, up to the context of Close: a handler that
+// is still running after that may deliver its batch while another node takes the partition.
 type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) error
 
 // RedisChannelStateConfig enables channel state events (occupied, vacated) in
@@ -239,6 +241,17 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 	return s, nil
 }
 
+// startChannelState builds the channel state of the manager and starts its partition worker.
+func (m *RedisPresenceManager) startChannelState(config RedisChannelStateConfig) error {
+	state, err := newPresenceState(m, config)
+	if err != nil {
+		return err
+	}
+	m.state = state
+	go state.worker.run()
+	return nil
+}
+
 // stateEnabled reports whether the channel keeps channel state. A nil state, a manager without
 // channel state, keeps no channel state, so the guards of the presence manager need no nil check.
 func (s *presenceState) stateEnabled(channel string) bool {
@@ -406,8 +419,11 @@ func (s *presenceState) logDropped(eventType ChannelStateEventType) {
 }
 
 // close stops the partition workers and releases their leases. It returns early with
-// the context error when the context is done first.
+// the context error when the context is done first. A nil state has no workers.
 func (s *presenceState) close(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
 	s.worker.stop()
 	select {
 	case <-s.worker.stopped:

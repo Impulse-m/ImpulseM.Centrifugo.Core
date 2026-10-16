@@ -131,21 +131,15 @@ func NewRedisPresenceManager(n *Node, config RedisPresenceManagerConfig) (*Redis
 		presenceStatsScript: rueidis.NewLuaScript(presenceStatsScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
 	}
 	if config.ChannelState != nil {
-		state, err := newPresenceState(m, *config.ChannelState)
-		if err != nil {
+		if err := m.startChannelState(*config.ChannelState); err != nil {
 			return nil, err
 		}
-		m.state = state
-		go state.worker.run()
 	}
 	return m, nil
 }
 
 func (m *RedisPresenceManager) Close(ctx context.Context) error {
-	if m.state != nil {
-		return m.state.close(ctx)
-	}
-	return nil
+	return m.state.close(ctx)
 }
 
 func (m *RedisPresenceManager) getShard(channel string) *RedisShard {
