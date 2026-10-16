@@ -4,6 +4,7 @@ package centrifuge
 
 import (
 	"context"
+	"net"
 	"runtime"
 	"strconv"
 	"strings"
@@ -38,14 +39,25 @@ func newTestChannelStateNode(tb testing.TB, prefix string, state RedisChannelSta
 }
 
 // newTestChannelStateNodeWithShards creates a node with numShards Redis shards on the test server and a
-// channel state presence manager on them. The node has a Redis broker because Node.Run registers its
-// broker event handler. The shards are returned, so that a test can close them to simulate an outage.
+// channel state presence manager on them. The shards are returned, so that a test can close them to simulate
+// an outage.
 func newTestChannelStateNodeWithShards(tb testing.TB, prefix string, state RedisChannelStateConfig, numShards int) (*Node, *RedisPresenceManager, []*RedisShard) {
 	tb.Helper()
-	node := testStateNode(tb)
-	shards := make([]*RedisShard, 0, numShards)
+	confs := make([]RedisShardConfig, 0, numShards)
 	for range numShards {
-		s, err := NewRedisShard(node, testSingleRedisConf(6379))
+		confs = append(confs, testSingleRedisConf(6379))
+	}
+	return newTestChannelStateNodeWithConfs(tb, prefix, state, confs)
+}
+
+// newTestChannelStateNodeWithConfs creates a node with one Redis shard per config and a channel state presence
+// manager on them. The node has a Redis broker because Node.Run registers its broker event handler.
+func newTestChannelStateNodeWithConfs(tb testing.TB, prefix string, state RedisChannelStateConfig, confs []RedisShardConfig) (*Node, *RedisPresenceManager, []*RedisShard) {
+	tb.Helper()
+	node := testStateNode(tb)
+	shards := make([]*RedisShard, 0, len(confs))
+	for _, conf := range confs {
+		s, err := NewRedisShard(node, conf)
 		require.NoError(tb, err)
 		shards = append(shards, s)
 	}
@@ -268,6 +280,132 @@ func TestRedisChannelStateShardZeroOutage(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == len(channels)
 	}, 10*time.Second, 10*time.Millisecond)
+}
+
+// TestRedisChannelStateHungShard pauses the first shard behind a gate that accepts connections and holds their
+// traffic, so that its calls wait until they time out. The partitions of the second shard keep their leases and
+// keep delivering while the first shard hangs. The partitions of the first shard are given up.
+func TestRedisChannelStateHungShard(t *testing.T) {
+	t.Parallel()
+	prefix := getUniqueStatePrefix()
+	collector := &testChannelStateCollector{}
+	state := testChannelStateConfig(collector)
+	state.NumPartitions = 8
+
+	gate := startTestTCPGate(t, "127.0.0.1:6379")
+	gatedConf := testSingleRedisConf(6379)
+	gatedConf.Address = gate.addr()
+	_, pm, _ := newTestChannelStateNodeWithConfs(t, prefix, state, []RedisShardConfig{gatedConf, testSingleRedisConf(6379)})
+	// Registered after the node, so it runs first: the node shuts down on a shard that answers.
+	t.Cleanup(gate.resume)
+	require.Eventually(t, func() bool {
+		return testOwnedPartitions(t, pm) == state.NumPartitions
+	}, 3*testChannelStateLeaseTTL, 10*time.Millisecond)
+
+	var shard1Partitions []int
+	for p := range state.NumPartitions {
+		if pm.state.partitionShards[p] == 1 {
+			shard1Partitions = append(shard1Partitions, p)
+		}
+	}
+	require.NotEmpty(t, shard1Partitions)
+	require.Less(t, len(shard1Partitions), state.NumPartitions)
+
+	gate.pause()
+	require.Eventually(t, func() bool {
+		return testOwnedPartitions(t, pm) == len(shard1Partitions)
+	}, 2*testChannelStateLeaseTTL+time.Second, 10*time.Millisecond)
+	// The healthy shard keeps the leases of its partitions while the first shard hangs.
+	require.Never(t, func() bool {
+		return testOwnedPartitions(t, pm) != len(shard1Partitions)
+	}, 3*testChannelStateLeaseTTL, 10*time.Millisecond)
+
+	// One channel of every partition of the second shard: each of the partitions must deliver its event.
+	covered := make(map[int]bool, len(shard1Partitions))
+	var channels []string
+	for i := 0; len(covered) < len(shard1Partitions); i++ {
+		ch := "hung-shard-" + strconv.Itoa(i)
+		p := pm.state.partition(ch)
+		if covered[p] || pm.state.partitionShards[p] != 1 {
+			continue
+		}
+		covered[p] = true
+		channels = append(channels, ch)
+		require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
+	}
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == len(channels)
+	}, 10*time.Second, 10*time.Millisecond)
+}
+
+// testTCPGatePollInterval is how often a paused gate checks whether it is resumed.
+const testTCPGatePollInterval = 5 * time.Millisecond
+
+// testTCPGate forwards TCP connections to upstream until it is paused. A paused gate keeps the connections open
+// and holds their traffic, so that a client waits for replies that do not come: a shard that hangs. Unlike
+// startTestTCPProxy, which breaks the connections when it stops, the gate leaves the client waiting.
+type testTCPGate struct {
+	ln     net.Listener
+	paused atomic.Bool
+	closed atomic.Bool
+}
+
+// startTestTCPGate listens on a free local port and forwards the connections to upstream.
+func startTestTCPGate(tb testing.TB, upstream string) *testTCPGate {
+	tb.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(tb, err)
+	g := &testTCPGate{ln: ln}
+	tb.Cleanup(g.close)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", upstream)
+			if err != nil {
+				_ = c.Close()
+				continue
+			}
+			go g.copyChunks(up, c)
+			go g.copyChunks(c, up)
+		}
+	}()
+	return g
+}
+
+// copyChunks copies the traffic from src to dst. A chunk read while the gate is paused waits until the gate is
+// resumed or closed.
+func (g *testTCPGate) copyChunks(dst net.Conn, src net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			for g.paused.Load() && !g.closed.Load() {
+				time.Sleep(testTCPGatePollInterval)
+			}
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	_ = dst.Close()
+	_ = src.Close()
+}
+
+func (g *testTCPGate) addr() string { return g.ln.Addr().String() }
+
+func (g *testTCPGate) pause() { g.paused.Store(true) }
+
+func (g *testTCPGate) resume() { g.paused.Store(false) }
+
+func (g *testTCPGate) close() {
+	g.closed.Store(true)
+	_ = g.ln.Close()
 }
 
 // TestRedisChannelStateMixedNodes runs a node with channel state and a node without it on one prefix.
