@@ -64,8 +64,8 @@ type ChannelStateEvent struct {
 // ChannelStateHandler delivers one batch of a partition, in order. A non-nil error
 // makes the batch be delivered again after a backoff. The context is cancelled when
 // the presence manager is closed or the partition moves to another node. The handler
-// must return once ctx is done: the lease loop waits for a running handler before it
-// releases the partition.
+// must return once ctx is done: the lease of the partition is released only after a
+// running handler has returned.
 type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) error
 
 // RedisChannelStateConfig enables channel state events (occupied, vacated) in
@@ -85,12 +85,18 @@ type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) e
 // of that channel are split between the two layouts, and a vacated event can go out while a client on
 // another node is still subscribed.
 //
-// Membership uses the wall clock of each node. Clock skew between the workers larger than LeaseTTL
-// only shifts the division of the partitions; the leases still keep one consumer per partition.
+// Membership uses the wall clock of each node. Clock skew larger than LeaseTTL delays the takeover of a
+// crashed worker's partitions by about the skew, because a worker that is ahead of the others stays in
+// their count after it crashed. A worker whose clock lags is left out of the count while it runs, so it
+// takes no partitions. The leases still keep one consumer per partition.
 //
 // The lease check uses the wall clock. A backward step of the clock (NTP) can keep a lease
 // believed held after Redis expired it, so two nodes may deliver one partition for about the
 // size of the step. Delivery is at least once, so those events may repeat.
+//
+// The partition workers start with NewRedisPresenceManager and run until Close is called on the presence
+// manager. Node.Shutdown closes the presence manager it was given. A manager that is built and never
+// closed keeps its leases and calls Handler until the process exits.
 type RedisChannelStateConfig struct {
 	// Enabled reports whether channel state events are kept for the channel. Required. The answer
 	// must not change for a channel while it has subscribers: keys are chosen per call, so toggling
@@ -112,7 +118,8 @@ type RedisChannelStateConfig struct {
 	// SweepInterval is how often a partition is swept and its events are read. Default 1s.
 	SweepInterval time.Duration
 	// LeaseTTL is how long a partition lease lasts without renewal; a lease is renewed
-	// every LeaseTTL/5. A node that holds more than its share gives up one partition per
+	// every LeaseTTL/5, and a Redis call of the lease loop gives up after LeaseTTL/3. A
+	// node that holds more than its share gives up one partition per
 	// renewal, so a node that joins a worker holding every partition waits about half of
 	// NumPartitions renewals for its share: 64 s with 128 partitions and the default 5s.
 	// Must be at least 5ms. Default 5s.
