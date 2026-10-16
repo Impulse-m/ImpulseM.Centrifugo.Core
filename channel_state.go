@@ -103,11 +103,11 @@ func (w *channelStateWorker) leaseCycle() {
 	share := w.share()
 	if len(w.owned) > share {
 		for p, part := range w.owned {
-			w.releasePartition(ctx, p, part)
+			w.releasePartition(p, part)
 			break
 		}
 	} else if len(w.owned) < share {
-		w.acquire(ctx, share)
+		w.acquire(ctx, share-len(w.owned))
 	}
 	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
@@ -162,12 +162,12 @@ func (w *channelStateWorker) renewOwned(ctx context.Context) {
 
 // releaseAll stops every owned partition and releases its lease. It runs once, on stop.
 func (w *channelStateWorker) releaseAll() {
-	ctx, cancel := context.WithTimeout(context.Background(), w.state.leaseTTL)
-	defer cancel()
-
+	partitions := make([]int, 0, len(w.owned))
 	for p, part := range w.owned {
-		w.releasePartition(ctx, p, part)
+		w.stopPartition(p, part)
+		partitions = append(partitions, p)
 	}
+	w.releasePartitions(partitions)
 	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
@@ -186,25 +186,30 @@ func (w *channelStateWorker) share() int {
 	return (w.state.numPartitions + nodes - 1) / nodes
 }
 
-// acquire takes free partitions until the node owns its share. The lease attempts of a shard
-// go out in one pipeline, in random order, so a node takes its partitions in one round trip per
-// shard. A lease taken beyond the share is released at once. A lease attempt whose reply failed
-// may have taken the lease, so those leases are released too.
-func (w *channelStateWorker) acquire(ctx context.Context, share int) {
-	free := make(map[*RedisShard][]int)
+// acquire takes up to need free partitions, in random order, and starts a consumer for each. Only as many
+// partitions are attempted as the node needs, so it takes no lease beyond its share. The lease attempts of
+// a shard go out in one pipeline. A lease attempt whose reply failed may have taken the lease, so those
+// leases are released too.
+func (w *channelStateWorker) acquire(ctx context.Context, need int) {
+	free := make([]int, 0, w.state.numPartitions-len(w.owned))
 	for _, p := range rand.Perm(w.state.numPartitions) { //nolint:gosec // Partition order is only a fairness hint; not security-sensitive.
-		if _, ok := w.owned[p]; ok {
-			continue
+		if _, ok := w.owned[p]; !ok {
+			free = append(free, p)
 		}
+	}
+	if len(free) > need {
+		free = free[:need]
+	}
+	byShard := make(map[*RedisShard][]int)
+	for _, p := range free {
 		sh := w.state.shardOf(p)
-		free[sh] = append(free[sh], p)
+		byShard[sh] = append(byShard[sh], p)
 	}
 
 	start := time.Now()
-	var taken []int
 	var firstErr error
 	var errPartition int
-	for sh, partitions := range free {
+	for sh, partitions := range byShard {
 		cmds := make([]rueidis.Completed, 0, len(partitions))
 		for _, p := range partitions {
 			cmds = append(cmds, sh.client.B().Set().Key(w.leaseKey(p)).Value(w.node.uid).Nx().PxMilliseconds(w.state.leaseTTL.Milliseconds()).Build())
@@ -212,41 +217,24 @@ func (w *channelStateWorker) acquire(ctx context.Context, share int) {
 		var failed []int
 		for i, res := range sh.client.DoMulti(ctx, cmds...) {
 			err := res.Error()
-			if rueidis.IsRedisNil(err) {
+			switch {
+			case rueidis.IsRedisNil(err):
 				// Another node holds the lease.
-				continue
-			}
-			if err != nil {
+			case err != nil:
 				w.state.metrics.incSweepErrors()
 				if firstErr == nil {
 					firstErr = err
 					errPartition = partitions[i]
 				}
 				failed = append(failed, partitions[i])
-				continue
+			default:
+				w.startPartition(partitions[i], start)
 			}
-			taken = append(taken, partitions[i])
 		}
 		w.releaseLeases(sh, failed)
 	}
 	if firstErr != nil {
 		w.logError(firstErr, "channel state lease acquire failed", errPartition)
-	}
-
-	for _, p := range taken {
-		if len(w.owned) >= share {
-			w.releaseTaken(ctx, p)
-			continue
-		}
-		w.startPartition(p, start)
-	}
-}
-
-// releaseTaken gives back a lease the node took but does not need.
-func (w *channelStateWorker) releaseTaken(ctx context.Context, p int) {
-	if err := w.releaseLease(ctx, p); err != nil {
-		w.state.metrics.incSweepErrors()
-		w.logError(err, "channel state lease release failed", p)
 	}
 }
 
@@ -273,12 +261,9 @@ func (w *channelStateWorker) stopPartition(p int, part *channelStatePartition) {
 // releasePartition stops the consumer of the partition and then releases its lease. Delivery is
 // at least once: a stalled owner may overlap with the node that takes the lease after it, until
 // its own lease check stops its consumer.
-func (w *channelStateWorker) releasePartition(ctx context.Context, p int, part *channelStatePartition) {
+func (w *channelStateWorker) releasePartition(p int, part *channelStatePartition) {
 	w.stopPartition(p, part)
-	if err := w.releaseLease(ctx, p); err != nil {
-		w.state.metrics.incSweepErrors()
-		w.logError(err, "channel state lease release failed", p)
-	}
+	w.releaseLeases(w.state.shardOf(p), []int{p})
 }
 
 // consume sweeps the partition and delivers its events on every tick until ctx is done. A tick
@@ -437,15 +422,16 @@ func (w *channelStateWorker) leaseKey(p int) string {
 	return string(w.state.partitionKey(p, "lease"))
 }
 
-func (w *channelStateWorker) releaseLease(ctx context.Context, p int) error {
-	sh := w.state.shardOf(p)
-	_, err := w.state.releaseScript.Exec(
-		ctx,
-		sh.client,
-		[]string{w.leaseKey(p)},
-		[]string{w.node.uid},
-	).AsInt64()
-	return err
+// releasePartitions releases the leases of the partitions, one pipeline per shard.
+func (w *channelStateWorker) releasePartitions(partitions []int) {
+	byShard := make(map[*RedisShard][]int)
+	for _, p := range partitions {
+		sh := w.state.shardOf(p)
+		byShard[sh] = append(byShard[sh], p)
+	}
+	for sh, shardPartitions := range byShard {
+		w.releaseLeases(sh, shardPartitions)
+	}
 }
 
 // releaseLeases releases the leases of the partitions of one shard in one pipeline. The release
