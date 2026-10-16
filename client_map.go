@@ -1239,7 +1239,6 @@ func (c *Client) handleMapStreamPhase(
 			startedAt:         time.Now().UnixNano(),
 			isPresence:        reply.Options.Type.IsMapPresence(),
 			subscribingCh:     make(chan struct{}),
-			subGen:            c.subGenCounter.Add(1),
 			epoch:             req.Epoch,
 		}
 		tf, err := c.validateAndCreateTagsFilter(req, reply.Options.AllowTagsFilter, channel)
@@ -1280,6 +1279,10 @@ func (c *Client) handleMapStreamPhase(
 			c.mu.Unlock()
 			return ErrorAlreadySubscribed
 		}
+		// The generation is minted under the lock, in the same critical section
+		// as the insert: a history check which saw no entry and an unchanged
+		// counter relies on that (see historyRefusedAtCallback).
+		state.subGen = c.subGenCounter.Add(1)
 		c.mapSubscribing[channel] = state
 		attempt.reserve()
 		c.mu.Unlock()
