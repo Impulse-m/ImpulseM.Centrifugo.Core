@@ -460,6 +460,51 @@ func TestRedisChannelStateDueInBothSetsSendsOneVacated(t *testing.T) {
 	require.Len(t, eventsOfType(collector.snapshot(), ChannelStateVacated), 1)
 }
 
+// TestRedisChannelStateOverlappingSweepKeepsOccupied runs two sweeps of one partition that overlap, as when a
+// consumer still sweeps after its lease was released. The first sweep lists the due channel, the second one
+// sends its vacated event, and the first one checks its stale list afterwards. A client that subscribes next
+// must still send occupied, so the stale check must not arm a vacated event again.
+func TestRedisChannelStateOverlappingSweepKeepsOccupied(t *testing.T) {
+	t.Parallel()
+	collector := &testChannelStateCollector{}
+	node := testStateNode(t)
+	state := testChannelStateConfig(collector)
+	// A negative delay makes the channel due at once after its last client left.
+	state.VacatedEventDelay = -1
+	// The consumers start on the first lease cycle, one LeaseTTL/5 after the start. The writes of the test
+	// finish well before that, so the first read of a consumer delivers all of them, in order.
+	state.LeaseTTL = 5 * time.Second
+	state.SweepInterval = time.Hour
+	s, err := NewRedisShard(node, testSingleRedisConf(6379))
+	require.NoError(t, err)
+	pm := newTestRedisPresenceStateManagerWithShards(t, node, getUniqueStatePrefix(), state, 0, false, []*RedisShard{s})
+
+	const ch = "overlapping-sweep"
+	require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
+	require.NoError(t, pm.RemovePresence(ch, "client-1", ""))
+
+	p := pm.state.partition(ch)
+	sh := pm.state.shardOf(p)
+	ctx := context.Background()
+	nowMs := time.Now().UnixMilli()
+	stale, _, err := pm.state.worker.duePage(ctx, sh, p, nowMs)
+	require.NoError(t, err)
+	require.Equal(t, []string{ch}, stale)
+
+	require.NoError(t, pm.state.worker.sweep(ctx, sh, p))
+	require.NoError(t, pm.state.checkChannels(ctx, sh, p, stale, nowMs))
+	require.NoError(t, pm.AddPresence(ch, "client-2", &ClientInfo{}))
+
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == 2
+	}, 10*time.Second, 10*time.Millisecond)
+	requireSettled(t, func() int { return len(collector.snapshot()) }, testChannelStateQuietWindow)
+
+	events := collector.snapshot()
+	require.Len(t, eventsOfType(events, ChannelStateOccupied), 2)
+	require.Len(t, eventsOfType(events, ChannelStateVacated), 1)
+}
+
 func TestRedisChannelStateHashFieldTTL(t *testing.T) {
 	t.Parallel()
 	if !supportsHashFieldTTL(t, 6379) {

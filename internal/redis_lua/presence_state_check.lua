@@ -31,11 +31,17 @@ if redis.call("hlen", KEYS[2]) > 0 then
     return 0
 end
 
-redis.call("zrem", KEYS[5], ARGV[1])
+-- The expire entry is removed by the sweep when it resolves the channel, so a missing entry
+-- means another sweep resolved the channel already: a stale check must not arm a new delay.
+-- The expire entry is removed by the sweep when it resolves the channel, so a missing entry
+-- means another sweep resolved the channel already: a stale check must not arm a new delay.
+local hadExpire = redis.call("zrem", KEYS[5], ARGV[1]) == 1
 local fire = redis.call("zscore", KEYS[4], ARGV[1])
 if not fire then
-    -- The presence of the channel expired: arm the delay.
-    redis.call("zadd", KEYS[4], ARGV[4], ARGV[1])
+    if hadExpire then
+        -- The presence of the channel expired: arm the delay.
+        redis.call("zadd", KEYS[4], ARGV[4], ARGV[1])
+    end
     return 0
 end
 if tonumber(fire) > tonumber(ARGV[2]) then
