@@ -108,9 +108,12 @@ func (w *channelStateWorker) leaseCycle() {
 
 	workers, err := w.heartbeat(ctx)
 	if err != nil {
-		// Without the count the share is unknown, so the partitions are kept until the next cycle.
+		// Without the count the share is unknown. The worker keeps the partitions it owns and takes the free
+		// ones, so the partitions of a crashed worker are still consumed on the healthy shards. The leases keep
+		// one consumer per partition. The share is restored when the count is known again.
 		w.state.metrics.incSweepErrors()
 		w.node.logger.log(newErrorLogEntry(err, "channel state worker heartbeat failed", nil))
+		w.rebalance(ctx, w.state.numPartitions)
 	} else {
 		w.rebalance(ctx, w.share(workers))
 	}

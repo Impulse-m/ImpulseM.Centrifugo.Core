@@ -30,22 +30,34 @@ func testStateNode(tb testing.TB) *Node {
 	return node
 }
 
-// newTestChannelStateNode creates a node with a Redis broker, so that the nodes of one
-// prefix see each other in the node registry, and a channel state presence manager.
+// newTestChannelStateNode creates a node with one Redis shard and a channel state presence manager.
 func newTestChannelStateNode(tb testing.TB, prefix string, state RedisChannelStateConfig) (*Node, *RedisPresenceManager) {
 	tb.Helper()
+	node, pm, _ := newTestChannelStateNodeWithShards(tb, prefix, state, 1)
+	return node, pm
+}
+
+// newTestChannelStateNodeWithShards creates a node with numShards Redis shards on the test server and a
+// channel state presence manager on them. The node has a Redis broker because Node.Run registers its
+// broker event handler. The shards are returned, so that a test can close them to simulate an outage.
+func newTestChannelStateNodeWithShards(tb testing.TB, prefix string, state RedisChannelStateConfig, numShards int) (*Node, *RedisPresenceManager, []*RedisShard) {
+	tb.Helper()
 	node := testStateNode(tb)
-	s, err := NewRedisShard(node, testSingleRedisConf(6379))
-	require.NoError(tb, err)
+	shards := make([]*RedisShard, 0, numShards)
+	for range numShards {
+		s, err := NewRedisShard(node, testSingleRedisConf(6379))
+		require.NoError(tb, err)
+		shards = append(shards, s)
+	}
 	broker, err := NewRedisBroker(node, RedisBrokerConfig{
 		Prefix:   prefix,
 		UseLists: true,
-		Shards:   []*RedisShard{s},
+		Shards:   shards,
 	})
 	require.NoError(tb, err)
 	node.SetBroker(broker)
-	pm := newTestRedisPresenceStateManagerWithShards(tb, node, prefix, state, 0, false, []*RedisShard{s})
-	return node, pm
+	pm := newTestRedisPresenceStateManagerWithShards(tb, node, prefix, state, 0, false, shards)
+	return node, pm, shards
 }
 
 // testStatePrefixes numbers the prefixes of the channel state tests.
@@ -174,6 +186,87 @@ func TestRedisChannelStateTwoNodes(t *testing.T) {
 			}
 		}
 		return false
+	}, 10*time.Second, 10*time.Millisecond)
+}
+
+// TestRedisChannelStateCrashedWorkerPartitionsMove closes the shard of a worker without a clean shutdown:
+// it neither renews its leases nor refreshes its heartbeat entry, so they expire. The survivor takes
+// every partition, and every partition delivers the events of its channels.
+func TestRedisChannelStateCrashedWorkerPartitionsMove(t *testing.T) {
+	t.Parallel()
+	prefix := getUniqueStatePrefix()
+	collector := &testChannelStateCollector{}
+	state := testChannelStateConfig(collector)
+	state.NumPartitions = 8
+
+	_, pm1, _ := newTestChannelStateNodeWithShards(t, prefix, state, 1)
+	_, pm2, shards2 := newTestChannelStateNodeWithShards(t, prefix, state, 1)
+	require.Eventually(t, func() bool {
+		return testOwnedPartitions(t, pm1) == 4 && testOwnedPartitions(t, pm2) == 4
+	}, 3*testChannelStateLeaseTTL, 10*time.Millisecond)
+
+	shards2[0].Close()
+	require.Eventually(t, func() bool {
+		return testOwnedPartitions(t, pm1) == 8
+	}, 2*testChannelStateLeaseTTL+time.Second, 10*time.Millisecond)
+
+	const numChannels = 16
+	for i := 0; i < numChannels; i++ {
+		require.NoError(t, pm1.AddPresence("crashed-"+strconv.Itoa(i), "client-1", &ClientInfo{}))
+	}
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == numChannels
+	}, 10*time.Second, 10*time.Millisecond)
+}
+
+// TestRedisChannelStateShardZeroOutage runs two nodes with two shards each, on one Redis server. Node 1
+// loses shard 0, which keeps the worker set, and node 2 crashes. Node 1 cannot count the workers, so it
+// keeps its partitions and takes the free ones: the partitions of shard 1 that node 2 held must not wait
+// for shard 0 to recover.
+func TestRedisChannelStateShardZeroOutage(t *testing.T) {
+	t.Parallel()
+	prefix := getUniqueStatePrefix()
+	collector := &testChannelStateCollector{}
+	state := testChannelStateConfig(collector)
+	state.NumPartitions = 8
+
+	_, pm1, shards1 := newTestChannelStateNodeWithShards(t, prefix, state, 2)
+	_, pm2, shards2 := newTestChannelStateNodeWithShards(t, prefix, state, 2)
+	require.Eventually(t, func() bool {
+		return testOwnedPartitions(t, pm1) == 4 && testOwnedPartitions(t, pm2) == 4
+	}, 3*testChannelStateLeaseTTL, 10*time.Millisecond)
+
+	var shard1Partitions int
+	for p := range state.NumPartitions {
+		if pm1.state.partitionShards[p] == 1 {
+			shard1Partitions++
+		}
+	}
+	require.Positive(t, shard1Partitions)
+	require.Less(t, shard1Partitions, state.NumPartitions)
+
+	shards1[0].Close()
+	shards2[0].Close()
+	shards2[1].Close()
+	require.Eventually(t, func() bool {
+		return testOwnedPartitions(t, pm1) == shard1Partitions
+	}, 2*testChannelStateLeaseTTL+time.Second, 10*time.Millisecond)
+
+	// One channel of every partition of shard 1: each of the partitions must deliver its event.
+	covered := make(map[int]bool, shard1Partitions)
+	var channels []string
+	for i := 0; len(covered) < shard1Partitions; i++ {
+		ch := "shard-zero-" + strconv.Itoa(i)
+		p := pm1.state.partition(ch)
+		if covered[p] || pm1.state.partitionShards[p] != 1 {
+			continue
+		}
+		covered[p] = true
+		channels = append(channels, ch)
+		require.NoError(t, pm1.AddPresence(ch, "client-1", &ClientInfo{}))
+	}
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == len(channels)
 	}, 10*time.Second, 10*time.Millisecond)
 }
 
