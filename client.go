@@ -3633,14 +3633,8 @@ func (c *Client) handleHistory(req *protocol.HistoryRequest, cmd *protocol.Comma
 	// way for such a subscriber to get missed publications.
 	// The callback checks again, see historyRefusedAtCallback: the application
 	// decides in between, and the subscription may change meanwhile.
-	c.mu.RLock()
-	// subscribed is entry presence here: a reservation or a committed subscription.
-	channelContext, subscribed := c.channels[channel]
-	_, loading := c.mapSubscribing[channel]
-	presentAtCheck := subscribed || loading
-	genAtCheck := c.subGenCounter.Load()
-	c.mu.RUnlock()
-	if subscribed && channelHasFlag(channelContext.flags, flagServerTagsFilter) {
+	refusedAtEntry, presentAtCheck, genAtCheck := c.historyCheckAtEntry(channel)
+	if refusedAtEntry {
 		return ErrorPermissionDenied
 	}
 
