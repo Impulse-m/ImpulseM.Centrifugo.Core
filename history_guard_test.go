@@ -34,7 +34,7 @@ func TestClientHistoryRefusedWhenSubscribeCommitsDuringCall(t *testing.T) {
 		})
 		client.OnHistory(func(e HistoryEvent, cb HistoryCallback) {
 			close(releaseSub)
-			<-subDone
+			waitHistoryGuard(t, subDone, "subscribe callback")
 			cb(HistoryReply{}, nil)
 		})
 	})
@@ -75,7 +75,7 @@ func TestClientHistoryRefusedWhenUnsubscribedDuringCall(t *testing.T) {
 		})
 		client.OnHistory(func(e HistoryEvent, cb HistoryCallback) {
 			close(releaseSub)
-			<-subDone
+			waitHistoryGuard(t, subDone, "subscribe callback")
 			client.Unsubscribe(e.Channel)
 			cb(HistoryReply{}, nil)
 		})
@@ -399,6 +399,19 @@ func requireHistoryRefusedReply(t *testing.T, rw *sliceReplyWriter) {
 	require.NotNil(t, rw.replies[0].Error)
 	require.Equal(t, ErrorPermissionDenied.Code, rw.replies[0].Error.Code)
 	require.Nil(t, rw.replies[0].History)
+}
+
+// historyGuardWaitLimit bounds the waits of the history guard tests, so a test
+// which misses its ordering fails instead of hanging the package.
+const historyGuardWaitLimit = 10 * time.Second
+
+func waitHistoryGuard(t *testing.T, done <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(historyGuardWaitLimit):
+		t.Fatalf("%s did not run within %s", what, historyGuardWaitLimit)
+	}
 }
 
 func seedMapSubscribing(client *Client, channel string) {
