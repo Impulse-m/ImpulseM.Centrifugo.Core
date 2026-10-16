@@ -164,10 +164,6 @@ type metrics struct {
 	mapBrokerCleanupRemoved         *prometheus.CounterVec
 	mapBrokerCleanupErrors          *prometheus.CounterVec
 
-	channelState *channelStateMetrics
-	registerer   prometheus.Registerer
-	namespace    string
-
 	redisBrokerPubSubErrors           *prometheus.CounterVec
 	redisBrokerPubSubDroppedMessages  *prometheus.CounterVec
 	redisBrokerPubSubBufferedMessages *prometheus.GaugeVec
@@ -549,8 +545,6 @@ func newMetricsRegistry(config MetricsConfig) (*metrics, error) {
 		config:      config,
 		nsCache:     nsCache,
 		codeStrings: codeStrings,
-		registerer:  registerer,
-		namespace:   metricsNamespace,
 	}
 
 	m.actionCount = prometheus.NewCounterVec(prometheus.CounterOpts{

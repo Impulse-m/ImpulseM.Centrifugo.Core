@@ -109,19 +109,19 @@ func newTestRedisPresenceStateManager(
 	s, err := NewRedisShard(n, testSingleRedisConf(port))
 	require.NoError(tb, err)
 	pm := newTestRedisPresenceStateManagerWithShards(tb, n, prefix, state, presenceTTL, hashFieldTTL, []*RedisShard{s})
-	waitForChannelStatePartitions(tb, n, state.NumPartitions)
+	waitForChannelStatePartitions(tb, pm, state.NumPartitions)
 	return pm
 }
 
 // waitForChannelStatePartitions waits until the node consumes every partition, so that the
 // timing of the tests starts after the first lease cycle, where the partitions are taken.
-func waitForChannelStatePartitions(tb testing.TB, node *Node, numPartitions int) {
+func waitForChannelStatePartitions(tb testing.TB, pm *RedisPresenceManager, numPartitions int) {
 	tb.Helper()
 	if numPartitions <= 0 {
 		numPartitions = channelStateDefaultNumPartitions
 	}
 	require.Eventually(tb, func() bool {
-		return testOwnedPartitions(tb, node) == numPartitions
+		return testOwnedPartitions(tb, pm) == numPartitions
 	}, 5*time.Second, 5*time.Millisecond)
 }
 
@@ -179,7 +179,7 @@ func testGaugeValue(tb testing.TB, gauge prometheus.Gauge) float64 {
 // vacated event after the delay. It runs on Redis with the given hash field TTL mode.
 func testOccupiedVacated(t *testing.T, port int, hashFieldTTL bool) {
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, hashFieldTTL, port)
 
 	const ch = "occupied-vacated"
@@ -204,7 +204,7 @@ func testOccupiedVacated(t *testing.T, port int, hashFieldTTL bool) {
 func TestRedisChannelStateOccupiedOnce(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	const ch = "occupied-once"
@@ -233,7 +233,7 @@ func TestRedisChannelStateVacatedAfterDelay(t *testing.T) {
 func TestRedisChannelStateResubscribeCancelsVacated(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	const ch = "resubscribe"
@@ -261,7 +261,7 @@ func TestRedisChannelStateNegativeDelayHasNoGrace(t *testing.T) {
 	collector := &testChannelStateCollector{}
 	state := testChannelStateConfig(collector)
 	state.VacatedEventDelay = -1
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
 	require.Equal(t, time.Duration(0), pm.state.vacatedEventDelay)
 
@@ -282,7 +282,7 @@ func TestRedisChannelStateZeroDelayIsDefault(t *testing.T) {
 	collector := &testChannelStateCollector{}
 	state := testChannelStateConfig(collector)
 	state.VacatedEventDelay = 0
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
 	require.Equal(t, channelStateDefaultVacatedEventDelay, pm.state.vacatedEventDelay)
 }
@@ -290,7 +290,7 @@ func TestRedisChannelStateZeroDelayIsDefault(t *testing.T) {
 func TestRedisChannelStateOrderPerChannel(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	const ch = "order"
@@ -323,7 +323,7 @@ func TestRedisChannelStateOrderPerChannel(t *testing.T) {
 func TestRedisChannelStateExpiredPresence(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	const presenceTTL = time.Second
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), presenceTTL, false, 6379)
 
@@ -352,7 +352,7 @@ func TestRedisChannelStateExpiredPresence(t *testing.T) {
 func TestRedisChannelStateStaleEntriesDoNotKeepOccupied(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	const presenceTTL = time.Second
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), presenceTTL, false, 6379)
 
@@ -388,7 +388,7 @@ func TestRedisChannelStateStaleEntriesDoNotKeepOccupied(t *testing.T) {
 func TestRedisChannelStateAddAfterPresenceKeyExpired(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	const presenceTTL = time.Second
 	state := testChannelStateConfig(collector)
 	// The sweep runs once in the window of the test, after the second add.
@@ -415,7 +415,7 @@ func TestRedisChannelStateAddAfterPresenceKeyExpired(t *testing.T) {
 func TestRedisChannelStateRepeatedRemoveSendsOneVacated(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	const ch = "repeated-remove"
@@ -449,7 +449,7 @@ func TestRedisChannelStateDisabledChannelKeysUnchanged(t *testing.T) {
 	state.Enabled = func(channel string) bool {
 		return strings.HasPrefix(channel, "state:")
 	}
-	node := testNode(t)
+	node := testStateNode(t)
 	prefix := getUniqueStatePrefix()
 	pm := newTestRedisPresenceStateManager(t, node, prefix, state, 0, false, 6379)
 
@@ -492,7 +492,7 @@ func TestRedisChannelStateTaggedChannelDoesNotShareKeys(t *testing.T) {
 	state.Enabled = func(channel string) bool {
 		return channel == ch
 	}
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
 
 	plain := "{cs" + strconv.Itoa(pm.state.partition(ch)) + "}." + ch
@@ -519,8 +519,49 @@ func TestRedisChannelStateTaggedChannelDoesNotShareKeys(t *testing.T) {
 	require.Equal(t, ch, eventsOfType(events, ChannelStateVacated)[0].Channel)
 }
 
+// TestRedisChannelStateSharedRegistry runs two nodes with channel state on one registry. The second
+// presence manager reuses the collectors of the first, so both count into the same series.
+func TestRedisChannelStateSharedRegistry(t *testing.T) {
+	t.Parallel()
+	registry := prometheus.NewRegistry()
+	newNode := func() *Node {
+		node, err := New(Config{
+			LogLevel:   LogLevelDebug,
+			LogHandler: func(entry LogEntry) {},
+			Metrics: MetricsConfig{
+				RegistererGatherer: registry,
+			},
+		})
+		require.NoError(t, err)
+		return node
+	}
+	collector := &testChannelStateCollector{}
+	state := testChannelStateConfig(collector)
+	prefix := getUniqueStatePrefix()
+
+	node1 := newNode()
+	s1, err := NewRedisShard(node1, testSingleRedisConf(6379))
+	require.NoError(t, err)
+	pm1 := newTestRedisPresenceStateManagerWithShards(t, node1, prefix, state, 0, false, []*RedisShard{s1})
+
+	node2 := newNode()
+	s2, err := NewRedisShard(node2, testSingleRedisConf(6379))
+	require.NoError(t, err)
+	pm2 := newTestRedisPresenceStateManagerWithShards(t, node2, prefix, state, 0, false, []*RedisShard{s2})
+
+	require.Same(t, pm1.state.metrics.eventsEmitted, pm2.state.metrics.eventsEmitted)
+	require.Same(t, pm1.state.metrics.partitionsOwned, pm2.state.metrics.partitionsOwned)
+
+	const ch = "shared-registry"
+	require.NoError(t, pm2.AddPresence(ch, "client-1", &ClientInfo{}))
+	require.Equal(t, 1.0, testCounterVecValue(t, pm1.state.metrics.eventsEmitted, "occupied"))
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
 func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
-	node := testNode(t)
+	node := testStateNode(t)
 	s, err := NewRedisShard(node, testSingleRedisConf(6379))
 	require.NoError(t, err)
 	defer s.Close()
@@ -533,21 +574,20 @@ func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, before, runtime.NumGoroutine())
 	require.Nil(t, pm.state)
-	require.Nil(t, node.metrics.channelState)
 	require.NoError(t, pm.Close(context.Background()))
 }
 
 func TestRedisChannelStateCluster(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	s, err := NewRedisShard(node, RedisShardConfig{
 		ClusterAddresses: []string{"localhost:7001", "localhost:7002", "localhost:7003"},
 		IOTimeout:        10 * time.Second,
 	})
 	require.NoError(t, err)
 	pm := newTestRedisPresenceStateManagerWithShards(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, []*RedisShard{s})
-	waitForChannelStatePartitions(t, node, 0)
+	waitForChannelStatePartitions(t, pm, 0)
 
 	channels := []string{"cluster-a", "cluster-b", "cluster-c", "cluster-d", "cluster-e"}
 	for _, ch := range channels {

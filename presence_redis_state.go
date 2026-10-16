@@ -170,7 +170,7 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 		batchSize = channelStateDefaultBatchSize
 	}
 
-	cm, err := m.node.metrics.enableChannelStateMetrics()
+	cm, err := newChannelStateMetrics(m.node.metrics)
 	if err != nil {
 		return nil, err
 	}

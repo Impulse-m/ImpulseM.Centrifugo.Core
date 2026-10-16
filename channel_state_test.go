@@ -11,14 +11,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
+
+// testStateNode creates a node with a registry of its own for its metrics, so that the channel state
+// metrics of the tests, which run in parallel, do not share the default registry.
+func testStateNode(tb testing.TB) *Node {
+	tb.Helper()
+	node, err := New(Config{
+		LogLevel:   LogLevelDebug,
+		LogHandler: func(entry LogEntry) {},
+		Metrics: MetricsConfig{
+			RegistererGatherer: prometheus.NewRegistry(),
+		},
+	})
+	require.NoError(tb, err)
+	return node
+}
 
 // newTestChannelStateNode creates a node with a Redis broker, so that the nodes of one
 // prefix see each other in the node registry, and a channel state presence manager.
 func newTestChannelStateNode(tb testing.TB, prefix string, state RedisChannelStateConfig) (*Node, *RedisPresenceManager) {
 	tb.Helper()
-	node := testNode(tb)
+	node := testStateNode(tb)
 	s, err := NewRedisShard(node, testSingleRedisConf(6379))
 	require.NoError(tb, err)
 	broker, err := NewRedisBroker(node, RedisBrokerConfig{
@@ -42,9 +58,9 @@ func getUniqueStatePrefix() string {
 	return getUniquePrefix() + "-" + strconv.FormatUint(testStatePrefixes.Add(1), 10)
 }
 
-func testOwnedPartitions(tb testing.TB, node *Node) int {
+func testOwnedPartitions(tb testing.TB, pm *RedisPresenceManager) int {
 	tb.Helper()
-	return int(testGaugeValue(tb, node.metrics.channelState.partitionsOwned))
+	return int(testGaugeValue(tb, pm.state.metrics.partitionsOwned))
 }
 
 func testStreamLength(tb testing.TB, pm *RedisPresenceManager, p int) int64 {
@@ -59,7 +75,7 @@ func TestRedisChannelStateRetryDelivery(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
 	collector.setFailures(2)
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
 
 	require.NoError(t, pm.AddPresence("retry", "client-1", &ClientInfo{}))
@@ -72,7 +88,7 @@ func TestRedisChannelStateRetryDelivery(t *testing.T) {
 	require.Len(t, attempts, 3)
 	require.GreaterOrEqual(t, attempts[1].Sub(attempts[0]), 100*time.Millisecond)
 	require.GreaterOrEqual(t, attempts[2].Sub(attempts[1]), 200*time.Millisecond)
-	require.Equal(t, 2.0, testCounterValue(t, node.metrics.channelState.deliveryErrors))
+	require.Equal(t, 2.0, testCounterValue(t, pm.state.metrics.deliveryErrors))
 	require.Len(t, collector.snapshot(), 1)
 }
 
@@ -84,14 +100,14 @@ func TestRedisChannelStateStreamCap(t *testing.T) {
 	// One partition, so the five channels share the stream cap of three events.
 	state.NumPartitions = 1
 	state.MaxStreamLength = 3
-	node := testNode(t)
+	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
 
 	channels := []string{"cap-1", "cap-2", "cap-3", "cap-4", "cap-5"}
 	for _, ch := range channels {
 		require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
 	}
-	require.Equal(t, 2.0, testCounterVecValue(t, node.metrics.channelState.eventsDropped, "occupied"))
+	require.Equal(t, 2.0, testCounterVecValue(t, pm.state.metrics.eventsDropped, "occupied"))
 	require.Equal(t, int64(3), testStreamLength(t, pm, 0))
 
 	collector.setFailAll(false)
@@ -114,15 +130,15 @@ func TestRedisChannelStateTwoNodes(t *testing.T) {
 	state := testChannelStateConfig(collector)
 	state.NumPartitions = 8
 
-	node1, pm1 := newTestChannelStateNode(t, prefix, state)
+	_, pm1 := newTestChannelStateNode(t, prefix, state)
 	require.Eventually(t, func() bool {
-		return testOwnedPartitions(t, node1) == 8
+		return testOwnedPartitions(t, pm1) == 8
 	}, 3*time.Second, 10*time.Millisecond)
 
-	node2, _ := newTestChannelStateNode(t, prefix, state)
+	node2, pm2 := newTestChannelStateNode(t, prefix, state)
 	// Each node owns 4 partitions within 3 lease intervals.
 	require.Eventually(t, func() bool {
-		return testOwnedPartitions(t, node1) == 4 && testOwnedPartitions(t, node2) == 4
+		return testOwnedPartitions(t, pm1) == 4 && testOwnedPartitions(t, pm2) == 4
 	}, 3*testChannelStateLeaseTTL, 10*time.Millisecond)
 
 	const numChannels = 50
@@ -147,7 +163,7 @@ func TestRedisChannelStateTwoNodes(t *testing.T) {
 	// Closing node 2 moves its partitions to node 1.
 	require.NoError(t, node2.Shutdown(context.Background()))
 	require.Eventually(t, func() bool {
-		return testOwnedPartitions(t, node1) == 8
+		return testOwnedPartitions(t, pm1) == 8
 	}, 2*testChannelStateLeaseTTL+time.Second, 10*time.Millisecond)
 
 	require.NoError(t, pm1.AddPresence("after-close", "client-1", &ClientInfo{}))
@@ -163,7 +179,7 @@ func TestRedisChannelStateTwoNodes(t *testing.T) {
 
 func TestRedisChannelStateClose(t *testing.T) {
 	collector := &testChannelStateCollector{}
-	node := testNode(t)
+	node := testStateNode(t)
 	s, err := NewRedisShard(node, testSingleRedisConf(6379))
 	require.NoError(t, err)
 	t.Cleanup(s.Close)
