@@ -72,7 +72,7 @@ func getUniqueStatePrefix() string {
 
 func testOwnedPartitions(tb testing.TB, pm *RedisPresenceManager) int {
 	tb.Helper()
-	return int(testGaugeValue(tb, pm.state.metrics.partitionsOwned))
+	return int(metricValue(tb, pm.state.metrics.partitionsOwned))
 }
 
 func testStreamLength(tb testing.TB, pm *RedisPresenceManager, p int) int64 {
@@ -100,7 +100,7 @@ func TestRedisChannelStateRetryDelivery(t *testing.T) {
 	require.Len(t, attempts, 3)
 	require.GreaterOrEqual(t, attempts[1].Sub(attempts[0]), 100*time.Millisecond)
 	require.GreaterOrEqual(t, attempts[2].Sub(attempts[1]), 200*time.Millisecond)
-	require.Equal(t, 2.0, testCounterValue(t, pm.state.metrics.deliveryErrors))
+	require.Equal(t, 2.0, counterValue(t, pm.state.metrics.deliveryErrors))
 	require.Len(t, collector.snapshot(), 1)
 }
 
@@ -119,7 +119,7 @@ func TestRedisChannelStateStreamCap(t *testing.T) {
 	for _, ch := range channels {
 		require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
 	}
-	require.Equal(t, 2.0, testCounterVecValue(t, pm.state.metrics.eventsDropped, "occupied"))
+	require.Equal(t, 2.0, metricValue(t, pm.state.metrics.eventsDropped.WithLabelValues("occupied")))
 	require.Equal(t, int64(3), testStreamLength(t, pm, 0))
 
 	collector.setFailAll(false)
@@ -364,7 +364,7 @@ func TestRedisChannelStateClose(t *testing.T) {
 	require.NoError(t, pm.Close(context.Background()))
 	require.Equal(t, 0, leaseKeys())
 	// Consumers stopped by Close are not Redis errors.
-	require.Equal(t, 0.0, testCounterValue(t, pm.state.metrics.sweepErrors))
+	require.Equal(t, 0.0, counterValue(t, pm.state.metrics.sweepErrors))
 	// The pool of the Redis client keeps its own goroutines, so only the worker goroutines are counted.
 	require.Eventually(t, func() bool {
 		return countChannelStateGoroutines() == 0

@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/redis/rueidis"
 	"github.com/stretchr/testify/require"
 )
@@ -154,27 +153,6 @@ func newTestRedisPresenceStateManagerWithShards(
 		}
 	})
 	return pm
-}
-
-func testCounterVecValue(tb testing.TB, vec *prometheus.CounterVec, label string) float64 {
-	tb.Helper()
-	var metric dto.Metric
-	require.NoError(tb, vec.WithLabelValues(label).Write(&metric))
-	return metric.GetCounter().GetValue()
-}
-
-func testCounterValue(tb testing.TB, counter prometheus.Counter) float64 {
-	tb.Helper()
-	var metric dto.Metric
-	require.NoError(tb, counter.Write(&metric))
-	return metric.GetCounter().GetValue()
-}
-
-func testGaugeValue(tb testing.TB, gauge prometheus.Gauge) float64 {
-	tb.Helper()
-	var metric dto.Metric
-	require.NoError(tb, gauge.Write(&metric))
-	return metric.GetGauge().GetValue()
 }
 
 // testOccupiedVacated adds a client, removes it and checks the occupied event and the
@@ -517,9 +495,9 @@ func TestRedisChannelStateDisabledChannelKeysUnchanged(t *testing.T) {
 	require.NoError(t, pm2.AddPresence("plain", "client-1", &ClientInfo{}))
 }
 
-// TestRedisChannelStateTaggedChannelDoesNotShareKeys names a channel without channel state with the
-// partition tag of a channel with channel state. Its presence must not change the occupied and
-// vacated events or the presence list of the state channel.
+// TestRedisChannelStateTaggedChannelDoesNotShareKeys names channels without channel state with the
+// partition tag of a channel with channel state, and with the key infix of channel state. Their presence
+// must not change the occupied and vacated events or the presence list of the state channel.
 func TestRedisChannelStateTaggedChannelDoesNotShareKeys(t *testing.T) {
 	t.Parallel()
 	collector := &testChannelStateCollector{}
@@ -531,8 +509,10 @@ func TestRedisChannelStateTaggedChannelDoesNotShareKeys(t *testing.T) {
 	node := testStateNode(t)
 	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
 
-	plain := "{cs" + strconv.Itoa(pm.state.partition(ch)) + "}." + ch
-	require.NoError(t, pm.AddPresence(plain, "attacker", &ClientInfo{}))
+	p := strconv.Itoa(pm.state.partition(ch))
+	for _, plain := range []string{"{cs" + p + "}." + ch, "channel_state.{cs" + p + "}.presence.data." + ch} {
+		require.NoError(t, pm.AddPresence(plain, "attacker", &ClientInfo{}))
+	}
 	require.NoError(t, pm.AddPresence(ch, "victim", &ClientInfo{}))
 
 	require.Eventually(t, func() bool {
@@ -590,7 +570,7 @@ func TestRedisChannelStateSharedRegistry(t *testing.T) {
 
 	const ch = "shared-registry"
 	require.NoError(t, pm2.AddPresence(ch, "client-1", &ClientInfo{}))
-	require.Equal(t, 1.0, testCounterVecValue(t, pm1.state.metrics.eventsEmitted, "occupied"))
+	require.Equal(t, 1.0, metricValue(t, pm1.state.metrics.eventsEmitted.WithLabelValues("occupied")))
 	require.Eventually(t, func() bool {
 		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == 1
 	}, 5*time.Second, 10*time.Millisecond)
