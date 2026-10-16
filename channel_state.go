@@ -471,7 +471,7 @@ func (w *channelStateWorker) releaseLeases(sh *RedisShard, partitions []int) {
 	for i, res := range w.state.releaseScript.ExecMulti(ctx, sh.client, execs...) {
 		if err := res.Error(); err != nil {
 			w.state.metrics.incSweepErrors()
-			w.logError(err, "channel state lease release failed", partitions[i])
+			w.logError(err, "channel state lease release failed", partitions[i]) //nolint:gosec // ExecMulti returns one result per exec, one exec per partition.
 		}
 	}
 }

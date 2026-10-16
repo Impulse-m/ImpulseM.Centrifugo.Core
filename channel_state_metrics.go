@@ -25,7 +25,7 @@ func newChannelStateMetrics(m *metrics) (*channelStateMetrics, error) {
 	if m == nil {
 		return nil, nil
 	}
-	var registerer prometheus.Registerer = prometheus.DefaultRegisterer
+	registerer := prometheus.DefaultRegisterer
 	if m.config.RegistererGatherer != nil {
 		registerer = m.config.RegistererGatherer
 	}
