@@ -37,7 +37,11 @@ type channelStatePartition struct {
 	// validUntil is the wall clock time in Unix nanoseconds until which the lease is known
 	// to be held: the start of the last renewal (or of the acquisition) plus LeaseTTL. The
 	// wall clock keeps running while the process is suspended, so a resumed consumer sees
-	// an expired lease before it delivers anything.
+	// an expired lease before it delivers anything. A backward step of the wall clock (NTP)
+	// works the other way: Redis expires the lease on its own clock, but this node still
+	// believes it is held until the step has passed. The node may then deliver the partition
+	// for about the size of the step while another node holds it. Delivery is at least once,
+	// so those events may be delivered twice.
 	validUntil atomic.Int64
 }
 

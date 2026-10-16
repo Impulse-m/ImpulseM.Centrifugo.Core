@@ -74,6 +74,15 @@ type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) e
 // When a node crashes, the partitions it consumed move to the surviving nodes only after
 // the node registry drops the crashed node, about 7 to 16 seconds after its last
 // publication. Events of those partitions are delayed by that much.
+//
+// Every node that shares the prefix must run channel state: the registry counts all its
+// nodes when it divides the partitions, so a node without channel state takes a share that
+// no consumer serves, and those partitions are not delivered until a node with channel
+// state joins or the node without it leaves.
+//
+// The lease check uses the wall clock. A backward step of the clock (NTP) can keep a lease
+// believed held after Redis expired it, so two nodes may deliver one partition for about the
+// size of the step. Delivery is at least once, so those events may repeat.
 type RedisChannelStateConfig struct {
 	// Enabled reports whether channel state events are kept for the channel. Required. The answer
 	// must not change for a channel while it has subscribers: keys are chosen per call, so toggling
