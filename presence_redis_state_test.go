@@ -15,6 +15,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/redis/rueidis"
 	"github.com/stretchr/testify/require"
 )
 
@@ -431,6 +432,40 @@ func TestRedisChannelStateRepeatedRemoveSendsOneVacated(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 
 	require.NoError(t, pm.RemovePresence(ch, "client-1", ""))
+	time.Sleep(3 * testChannelStateVacatedDelay)
+	require.Len(t, eventsOfType(collector.snapshot(), ChannelStateVacated), 1)
+}
+
+// TestRedisChannelStateDueInBothSetsSendsOneVacated makes a channel due in the pending and the expire
+// sets at once, as after a sweep gap longer than the presence TTL. The sweep lists the channel twice,
+// and the vacated event must still be sent once.
+func TestRedisChannelStateDueInBothSetsSendsOneVacated(t *testing.T) {
+	t.Parallel()
+	collector := &testChannelStateCollector{}
+	node := testStateNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, 6379)
+
+	const ch = "due-in-both-sets"
+	require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+	require.NoError(t, pm.RemovePresence(ch, "client-1", ""))
+
+	// Both sets hold the channel with a score in the past, so the next sweep lists it in both.
+	p := pm.state.partition(ch)
+	client := pm.state.shardOf(p).client
+	script := rueidis.NewLuaScript(`redis.call("zadd", KEYS[1], 1, ARGV[1]); redis.call("zadd", KEYS[2], 1, ARGV[1]); return 1`)
+	require.NoError(t, script.Exec(
+		context.Background(),
+		client,
+		[]string{string(pm.state.partitionKey(p, "pending")), string(pm.state.partitionKey(p, "expire"))},
+		[]string{ch},
+	).Error())
+
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateVacated)) == 1
+	}, 5*time.Second, 10*time.Millisecond)
 	time.Sleep(3 * testChannelStateVacatedDelay)
 	require.Len(t, eventsOfType(collector.snapshot(), ChannelStateVacated), 1)
 }

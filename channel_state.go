@@ -3,6 +3,7 @@ package centrifuge
 import (
 	"context"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -424,7 +425,7 @@ func (w *channelStateWorker) sweep(ctx context.Context, sh *RedisShard, p int) e
 }
 
 // duePage returns one page of the channels due in the pending and expire sets of the
-// partition, and whether any of the pages was full.
+// partition, each channel once, and whether any of the pages was full.
 func (w *channelStateWorker) duePage(ctx context.Context, sh *RedisShard, p int, nowMs int64) ([]string, bool, error) {
 	nowStr := strconv.FormatInt(nowMs, 10)
 	pendingKey := string(w.state.partitionKey(p, "pending"))
@@ -446,7 +447,10 @@ func (w *channelStateWorker) duePage(ctx context.Context, sh *RedisShard, p int,
 	channels := make([]string, 0, len(pending)+len(expired))
 	channels = append(channels, pending...)
 	channels = append(channels, expired...)
-	return channels, full, nil
+	// A channel can be due in both sets. Its second check would arm a new vacated event after the
+	// first one has sent it, so each channel is checked once.
+	slices.Sort(channels)
+	return slices.Compact(channels), full, nil
 }
 
 // readBatch reads up to BatchSize entries of the stream of the partition, oldest first. An entry
