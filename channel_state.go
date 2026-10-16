@@ -89,6 +89,7 @@ func (w *channelStateWorker) run() {
 		select {
 		case <-w.closeCh:
 			w.releaseAll()
+			w.leave()
 			return
 		case <-ticker.C:
 			w.leaseCycle()
@@ -96,15 +97,28 @@ func (w *channelStateWorker) run() {
 	}
 }
 
-// leaseCycle renews the owned leases, gives up one partition when the node owns more
-// than its share, and takes free partitions while it owns less.
+// leaseCycle renews the owned leases, publishes this worker, and rebalances the partitions by the
+// number of workers the heartbeat counts.
 func (w *channelStateWorker) leaseCycle() {
 	ctx, cancel := context.WithTimeout(context.Background(), w.state.leaseTTL)
 	defer cancel()
 
 	w.renewOwned(ctx)
 
-	share := w.share()
+	workers, err := w.heartbeat(ctx)
+	if err != nil {
+		// Without the count the share is unknown, so the partitions are kept until the next cycle.
+		w.state.metrics.incSweepErrors()
+		w.node.logger.log(newErrorLogEntry(err, "channel state worker heartbeat failed", nil))
+	} else {
+		w.rebalance(ctx, w.share(workers))
+	}
+	w.state.metrics.setPartitionsOwned(len(w.owned))
+}
+
+// rebalance gives up one partition when the node owns more than its share, and takes free partitions
+// while it owns less.
+func (w *channelStateWorker) rebalance(ctx context.Context, share int) {
 	if len(w.owned) > share {
 		for p, part := range w.owned {
 			w.releasePartition(p, part)
@@ -113,7 +127,6 @@ func (w *channelStateWorker) leaseCycle() {
 	} else if len(w.owned) < share {
 		w.acquire(ctx, share-len(w.owned))
 	}
-	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
 // renewOwned renews the leases of the owned partitions, one pipeline per shard, so that the
@@ -175,19 +188,55 @@ func (w *channelStateWorker) releaseAll() {
 	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
-// share is the number of partitions this node takes: an even split by the nodes known
-// in the registry. The registry is a heuristic for fairness only, the lease is the guard.
-// A node that crashed stays in the registry until it is dropped, about 7 to 16 seconds
-// after its last publication, so its share is still counted. The survivors take over its
-// partitions only then, and events of those partitions are delayed by that much. This is
-// a documented delay: the share is not reduced early, because a node that is slow to
-// publish would then take more partitions than its share.
-func (w *channelStateWorker) share() int {
-	nodes := w.node.nodes.size()
-	if nodes < 1 {
-		nodes = 1
+// share is the number of partitions this node takes: an even split by the live workers of the
+// prefix, as counted by the heartbeat. The count is a heuristic for fairness only, the lease is
+// the guard. A worker that crashed drops out of the count LeaseTTL after its last heartbeat.
+func (w *channelStateWorker) share(workers int) int {
+	if workers < 1 {
+		workers = 1
 	}
-	return (w.state.numPartitions + nodes - 1) / nodes
+	return (w.state.numPartitions + workers - 1) / workers
+}
+
+// heartbeat publishes this worker in the set of workers of the prefix, removes the entries that
+// have expired, and returns how many workers the set holds, this one included. An entry expires
+// LeaseTTL after its heartbeat unless the next heartbeat renews it. The set lives on the first
+// shard, so all nodes count the same set. The set has no TTL of its own: every heartbeat trims it.
+func (w *channelStateWorker) heartbeat(ctx context.Context) (int, error) {
+	sh := w.state.workersShard
+	key := w.state.workersKey
+	nowMs := time.Now().UnixMilli()
+	nowStr := strconv.FormatInt(nowMs, 10)
+	expireAt := float64(nowMs + w.state.leaseTTL.Milliseconds())
+	results := sh.client.DoMulti(
+		ctx,
+		sh.client.B().Zadd().Key(key).ScoreMember().ScoreMember(expireAt, w.node.uid).Build(),
+		sh.client.B().Zremrangebyscore().Key(key).Min("-inf").Max(nowStr).Build(),
+		sh.client.B().Zcount().Key(key).Min(nowStr).Max("+inf").Build(),
+	)
+	for _, res := range results {
+		if err := res.Error(); err != nil {
+			return 0, err
+		}
+	}
+	count, err := results[2].AsInt64()
+	if err != nil {
+		return 0, err
+	}
+	return int(count), nil
+}
+
+// leave removes this worker from the set of workers, so the other workers take its partitions
+// without waiting for its entry to expire. It runs when the worker stops.
+func (w *channelStateWorker) leave() {
+	ctx, cancel := context.WithTimeout(context.Background(), w.state.leaseTTL)
+	defer cancel()
+
+	sh := w.state.workersShard
+	if err := sh.client.Do(ctx, sh.client.B().Zrem().Key(w.state.workersKey).Member(w.node.uid).Build()).Error(); err != nil {
+		w.state.metrics.incSweepErrors()
+		w.node.logger.log(newErrorLogEntry(err, "channel state worker leave failed", nil))
+	}
 }
 
 // acquire takes up to need free partitions, in random order, and starts a consumer for each. Only as many

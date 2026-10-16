@@ -71,14 +71,15 @@ type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) e
 // RedisChannelStateConfig enables channel state events (occupied, vacated) in
 // RedisPresenceManager. Zero values select the defaults.
 //
-// When a node crashes, the partitions it consumed move to the surviving nodes only after
-// the node registry drops the crashed node, about 7 to 16 seconds after its last
-// publication. Events of those partitions are delayed by that much.
+// The partitions are divided among the nodes that run channel state, the workers of the prefix.
+// A worker publishes itself in a set on the first Redis shard on every lease cycle, and an entry
+// expires after LeaseTTL unless it is renewed. Nodes without channel state are not counted, so
+// a rolling enable on some nodes is safe: every partition has a consumer while one worker runs.
+// When a worker crashes, its partitions move to the survivors after about LeaseTTL, and a worker
+// that shuts down hands its partitions over at once.
 //
-// Every node that shares the prefix must run channel state: the registry counts all its
-// nodes when it divides the partitions, so a node without channel state takes a share that
-// no consumer serves, and those partitions are not delivered until a node with channel
-// state joins or the node without it leaves.
+// Membership uses the wall clock of each node. Clock skew between the workers larger than LeaseTTL
+// only shifts the division of the partitions; the leases still keep one consumer per partition.
 //
 // The lease check uses the wall clock. A backward step of the clock (NTP) can keep a lease
 // believed held after Redis expired it, so two nodes may deliver one partition for about the
@@ -119,6 +120,8 @@ type presenceState struct {
 	numPartitions     int
 	partitionShards   []int
 	partitionTags     []string
+	workersKey        string
+	workersShard      *RedisShard
 	vacatedEventDelay time.Duration
 	maxStreamLength   int
 	sweepInterval     time.Duration
@@ -200,6 +203,8 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 		numPartitions:     numPartitions,
 		partitionShards:   partitionShards,
 		partitionTags:     partitionTags,
+		workersKey:        m.config.Prefix + ".channel_state.workers",
+		workersShard:      m.shards[0],
 		vacatedEventDelay: vacatedEventDelay,
 		maxStreamLength:   maxStreamLength,
 		sweepInterval:     sweepInterval,
