@@ -105,7 +105,10 @@ type RedisChannelStateConfig struct {
 	// SweepInterval is how often a partition is swept and its events are read. Default 1s.
 	SweepInterval time.Duration
 	// LeaseTTL is how long a partition lease lasts without renewal; a lease is renewed
-	// every LeaseTTL/5. Must be at least 5ms. Default 5s.
+	// every LeaseTTL/5. A node that holds more than its share gives up one partition per
+	// renewal, so a node that joins a worker holding every partition waits about half of
+	// NumPartitions renewals for its share: 64 s with 128 partitions and the default 5s.
+	// Must be at least 5ms. Default 5s.
 	LeaseTTL time.Duration
 	// BatchSize is the maximum number of events in one Handler call. Default 100.
 	BatchSize int
@@ -230,6 +233,16 @@ func (s *presenceState) partition(channel string) int {
 // shardOf returns the Redis shard that keeps the state of the partition.
 func (s *presenceState) shardOf(p int) *RedisShard {
 	return s.manager.shards[s.partitionShards[p]]
+}
+
+// partitionsByShard groups the partitions by the Redis shard that keeps their state.
+func (s *presenceState) partitionsByShard(partitions []int) map[*RedisShard][]int {
+	byShard := make(map[*RedisShard][]int)
+	for _, p := range partitions {
+		sh := s.shardOf(p)
+		byShard[sh] = append(byShard[sh], p)
+	}
+	return byShard
 }
 
 // partitionKey returns a key of the partition: all of them share the tag of the partition,

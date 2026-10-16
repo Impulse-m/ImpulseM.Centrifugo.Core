@@ -15,6 +15,8 @@ import (
 const (
 	channelStateMinBackoff = 100 * time.Millisecond
 	channelStateMaxBackoff = 20 * time.Second
+	// channelStateLeaseRenewals is how many times a lease is renewed within its TTL.
+	channelStateLeaseRenewals = 5
 )
 
 // channelStateWorker holds the leases of the channel state partitions of a node and
@@ -65,7 +67,7 @@ func newChannelStateWorker(state *presenceState, node *Node) *channelStateWorker
 	return &channelStateWorker{
 		state:     state,
 		node:      node,
-		leaseTick: state.leaseTTL / 5,
+		leaseTick: state.leaseTTL / channelStateLeaseRenewals,
 		closeCh:   make(chan struct{}),
 		stopped:   make(chan struct{}),
 		owned:     make(map[int]*channelStatePartition),
@@ -138,15 +140,14 @@ func (w *channelStateWorker) rebalance(ctx context.Context, share int) {
 // lease is not renewed is stopped: another node may own it now. A partition whose renewal
 // failed is stopped and its lease released, because the renewal may have reached Redis.
 func (w *channelStateWorker) renewOwned(ctx context.Context) {
-	byShard := make(map[*RedisShard][]int)
+	owned := make([]int, 0, len(w.owned))
 	for p := range w.owned {
-		sh := w.state.shardOf(p)
-		byShard[sh] = append(byShard[sh], p)
+		owned = append(owned, p)
 	}
 
 	ttl := strconv.FormatInt(w.state.leaseTTL.Milliseconds(), 10)
 	var lost []int
-	for sh, partitions := range byShard {
+	for sh, partitions := range w.state.partitionsByShard(owned) {
 		execs := make([]rueidis.LuaExec, 0, len(partitions))
 		for _, p := range partitions {
 			execs = append(execs, rueidis.LuaExec{
@@ -257,16 +258,10 @@ func (w *channelStateWorker) acquire(ctx context.Context, need int) {
 	if len(free) > need {
 		free = free[:need]
 	}
-	byShard := make(map[*RedisShard][]int)
-	for _, p := range free {
-		sh := w.state.shardOf(p)
-		byShard[sh] = append(byShard[sh], p)
-	}
-
 	start := time.Now()
 	var firstErr error
 	var errPartition int
-	for sh, partitions := range byShard {
+	for sh, partitions := range w.state.partitionsByShard(free) {
 		cmds := make([]rueidis.Completed, 0, len(partitions))
 		for _, p := range partitions {
 			cmds = append(cmds, sh.client.B().Set().Key(w.leaseKey(p)).Value(w.node.uid).Nx().PxMilliseconds(w.state.leaseTTL.Milliseconds()).Build())
@@ -320,7 +315,7 @@ func (w *channelStateWorker) stopPartition(p int, part *channelStatePartition) {
 // its own lease check stops its consumer.
 func (w *channelStateWorker) releasePartition(p int, part *channelStatePartition) {
 	w.stopPartition(p, part)
-	w.releaseLeases(w.state.shardOf(p), []int{p})
+	w.releasePartitions([]int{p})
 }
 
 // consume sweeps the partition and delivers its events on every tick until ctx is done. A tick
@@ -497,12 +492,7 @@ func (w *channelStateWorker) leaseKey(p int) string {
 
 // releasePartitions releases the leases of the partitions, one pipeline per shard.
 func (w *channelStateWorker) releasePartitions(partitions []int) {
-	byShard := make(map[*RedisShard][]int)
-	for _, p := range partitions {
-		sh := w.state.shardOf(p)
-		byShard[sh] = append(byShard[sh], p)
-	}
-	for sh, shardPartitions := range byShard {
+	for sh, shardPartitions := range w.state.partitionsByShard(partitions) {
 		w.releaseLeases(sh, shardPartitions)
 	}
 }
