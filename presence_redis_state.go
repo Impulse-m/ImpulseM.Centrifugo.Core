@@ -218,9 +218,12 @@ func (s *presenceState) partitionKey(p int, suffix string) channelID {
 	return channelID(s.manager.config.Prefix + ".channel_state.{cs" + strconv.Itoa(p) + "}." + suffix)
 }
 
-// presenceKey returns a presence key of the channel, tagged with the partition of the channel.
+// presenceKey returns a presence key of the channel, tagged with the partition of the channel. The key
+// lives under the channel state prefix, not under the presence prefix: presence keys of channels without
+// channel state always start with prefix.presence., so no channel name can make them collide with the
+// keys of a channel with channel state.
 func (s *presenceState) presenceKey(channel string, kind string) channelID {
-	return channelID(s.manager.config.Prefix + ".presence." + kind + ".{cs" + strconv.Itoa(s.partition(channel)) + "}." + channel)
+	return channelID(s.manager.config.Prefix + ".channel_state.{cs" + strconv.Itoa(s.partition(channel)) + "}.presence." + kind + "." + channel)
 }
 
 func (s *presenceState) stateHashKey(channel string) channelID {

@@ -481,6 +481,44 @@ func TestRedisChannelStateDisabledChannelKeysUnchanged(t *testing.T) {
 	require.NoError(t, pm2.AddPresence("plain", "client-1", &ClientInfo{}))
 }
 
+// TestRedisChannelStateTaggedChannelDoesNotShareKeys names a channel without channel state with the
+// partition tag of a channel with channel state. Its presence must not change the occupied and
+// vacated events or the presence list of the state channel.
+func TestRedisChannelStateTaggedChannelDoesNotShareKeys(t *testing.T) {
+	t.Parallel()
+	collector := &testChannelStateCollector{}
+	const ch = "state:shared"
+	state := testChannelStateConfig(collector)
+	state.Enabled = func(channel string) bool {
+		return channel == ch
+	}
+	node := testNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
+
+	plain := "{cs" + strconv.Itoa(pm.state.partition(ch)) + "}." + ch
+	require.NoError(t, pm.AddPresence(plain, "attacker", &ClientInfo{}))
+	require.NoError(t, pm.AddPresence(ch, "victim", &ClientInfo{}))
+
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	presence, err := pm.Presence(ch)
+	require.NoError(t, err)
+	require.Len(t, presence, 1)
+	require.Contains(t, presence, "victim")
+
+	require.NoError(t, pm.RemovePresence(ch, "victim", ""))
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateVacated)) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	events := collector.snapshot()
+	require.Len(t, eventsOfType(events, ChannelStateOccupied), 1)
+	require.Equal(t, ch, eventsOfType(events, ChannelStateOccupied)[0].Channel)
+	require.Equal(t, ch, eventsOfType(events, ChannelStateVacated)[0].Channel)
+}
+
 func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
 	node := testNode(t)
 	s, err := NewRedisShard(node, testSingleRedisConf(6379))
