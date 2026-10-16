@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -558,6 +559,50 @@ func TestRedisChannelStateSharedRegistry(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == 1
 	}, 5*time.Second, 10*time.Millisecond)
+}
+
+// luaNonEmptyLines returns the trimmed non-empty lines of a script.
+func luaNonEmptyLines(script string) []string {
+	var lines []string
+	for _, line := range strings.Split(script, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+	return lines
+}
+
+// luaScriptBody returns the non-empty lines of a script after its header, which ends with the last
+// "-- ARGV[" line.
+func luaScriptBody(source string) []string {
+	lines := strings.Split(source, "\n")
+	start := 0
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "-- ARGV[") {
+			start = i + 1
+		}
+	}
+	return luaNonEmptyLines(strings.Join(lines[start:], "\n"))
+}
+
+// containsLuaLines reports whether the needle lines are a run of consecutive non-empty lines of the script.
+func containsLuaLines(script string, needle []string) bool {
+	lines := luaNonEmptyLines(script)
+	for i := 0; i+len(needle) <= len(lines); i++ {
+		if slices.Equal(lines[i:i+len(needle)], needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRedisChannelStateScriptsKeepPresenceBodies fails when the upstream presence scripts change and the
+// channel state scripts keep the old body: the state scripts embed the bodies of the upstream scripts.
+func TestRedisChannelStateScriptsKeepPresenceBodies(t *testing.T) {
+	require.True(t, containsLuaLines(presenceStateAddScriptSource, luaScriptBody(addPresenceScriptSource)),
+		"presence_state_add.lua does not contain the body of presence_add.lua")
+	require.True(t, containsLuaLines(presenceStateRemScriptSource, luaScriptBody(remPresenceScriptSource)),
+		"presence_state_rem.lua does not contain the body of presence_rem.lua")
 }
 
 func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
