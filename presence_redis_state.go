@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	_ "embed"
@@ -115,6 +116,7 @@ type presenceState struct {
 	leaseTTL          time.Duration
 	batchSize         int
 	metrics           *channelStateMetrics
+	dropLoggedAt      atomic.Int64
 
 	addScript     *rueidis.Lua
 	remScript     *rueidis.Lua
@@ -338,7 +340,22 @@ func (s *presenceState) countResult(eventType ChannelStateEventType, result int6
 		s.metrics.incEmitted(eventType)
 	case 2:
 		s.metrics.incDropped(eventType)
+		s.logDropped(eventType)
 	}
+}
+
+// logDropped logs a dropped event at most once per minute. A full stream means the backend does not
+// answer, so the log shows it without a line per dropped event.
+func (s *presenceState) logDropped(eventType ChannelStateEventType) {
+	now := time.Now().UnixNano()
+	last := s.dropLoggedAt.Load()
+	if now-last < int64(time.Minute) || !s.dropLoggedAt.CompareAndSwap(last, now) {
+		return
+	}
+	s.manager.node.logger.log(newLogEntry(LogLevelWarn, "channel state event dropped: the stream of the partition is full", map[string]any{
+		"type":              string(eventType),
+		"max_stream_length": s.maxStreamLength,
+	}))
 }
 
 // close stops the partition workers and releases their leases. It returns early with
