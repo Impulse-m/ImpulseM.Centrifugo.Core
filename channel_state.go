@@ -2,6 +2,7 @@ package centrifuge
 
 import (
 	"context"
+	"errors"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -17,6 +18,8 @@ const (
 	channelStateMaxBackoff = 20 * time.Second
 	// channelStateLeaseRenewals is how many times a lease is renewed within its TTL.
 	channelStateLeaseRenewals = 5
+	// channelStateCallDivisor sets the timeout of a Redis call of the lease loop: a third of LeaseTTL.
+	channelStateCallDivisor = 3
 )
 
 // channelStateWorker holds the leases of the channel state partitions of a node and
@@ -56,6 +59,12 @@ func (p *channelStatePartition) leaseHeld() bool {
 // extendLease records that the lease was taken or renewed at since.
 func (p *channelStatePartition) extendLease(since time.Time, leaseTTL time.Duration) {
 	p.validUntil.Store(since.Add(leaseTTL).UnixNano())
+}
+
+// stop cancels the consumer of the partition and waits until it has stopped. It does not change the owned set.
+func (p *channelStatePartition) stop() {
+	p.cancel()
+	<-p.done
 }
 
 // channelStateBackoff doubles the delay between attempts of a failing step, from 100ms up to 20s.
@@ -100,87 +109,204 @@ func (w *channelStateWorker) run() {
 	}
 }
 
-// leaseCycle renews the owned leases, publishes this worker, and rebalances the partitions by the
-// number of workers the heartbeat counts.
+// leaseCycle renews the owned leases, publishes this worker, and rebalances the partitions by the number of
+// workers the heartbeat counts. The renewals and the heartbeat run together, and the cycle waits for their
+// replies for at most callTimeout. A shard that does not answer in time is given up, so it cannot delay the
+// renewals of the others. The acquisitions wait for at most callTimeout too: a cycle lasts at most two call
+// timeouts, two thirds of LeaseTTL at the most, however long a shard takes to answer.
 func (w *channelStateWorker) leaseCycle() {
-	ctx, cancel := context.WithTimeout(context.Background(), w.state.leaseTTL)
-	defer cancel()
+	expired := closeAfter(w.callTimeout())
+	heartbeat := startCall(w.heartbeat)
 
-	w.renewOwned(ctx)
+	w.renewOwned(expired)
+	hb, _ := awaitCall(heartbeat, expired)
 
-	workers, err := w.heartbeat(ctx)
-	if err != nil {
+	if hb.err != nil {
 		// Without the count the share is unknown. The worker keeps the partitions it owns and takes the free
 		// ones, so the partitions of a crashed worker are still consumed on the healthy shards. The leases keep
-		// one consumer per partition. The share is restored when the count is known again.
+		// one consumer per partition. The worker may hold more than its share until the count is known again.
 		w.state.metrics.incSweepErrors()
-		w.node.logger.log(newErrorLogEntry(err, "channel state worker heartbeat failed", nil))
-		w.rebalance(ctx, w.state.numPartitions)
+		w.node.logger.log(newErrorLogEntry(hb.err, "channel state worker heartbeat failed", nil))
+		w.rebalance(w.state.numPartitions)
 	} else {
-		w.rebalance(ctx, w.share(workers))
+		w.rebalance(w.share(hb.value))
 	}
 	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
+// callTimeout is how long one Redis call of the lease loop may take: a third of LeaseTTL. A shard that does not
+// answer within it is given up for the cycle, so the other shards keep their leases.
+func (w *channelStateWorker) callTimeout() time.Duration {
+	return w.state.leaseTTL / channelStateCallDivisor
+}
+
+// callContext returns the context of one Redis call of the lease loop, which gives up after callTimeout.
+func (w *channelStateWorker) callContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), w.callTimeout())
+}
+
+// errCallTimeout is the outcome of a call of the lease loop that did not return in time.
+var errCallTimeout = errors.New("channel state call did not return in time")
+
+// callResult is the outcome of a call of the lease loop that runs on its own goroutine.
+type callResult[T any] struct {
+	value T
+	err   error
+}
+
+// startCall runs fn on its own goroutine and returns the channel of its outcome. The channel is buffered, so
+// a call that returns after the lease loop stopped waiting for it does not block.
+func startCall[T any](fn func() (T, error)) <-chan callResult[T] {
+	ch := make(chan callResult[T], 1)
+	go func() {
+		value, err := fn()
+		ch <- callResult[T]{value: value, err: err}
+	}()
+	return ch
+}
+
+// awaitCall waits for the outcome of a call until expired is closed. A result that is already there wins over
+// the expiry. ok is false when the call did not return in time: rueidis queues a call behind a connection that
+// is being dialed, and that wait does not end with the context of the call, so the lease loop does not wait for
+// a call without a bound of its own.
+func awaitCall[T any](ch <-chan callResult[T], expired <-chan struct{}) (res callResult[T], ok bool) {
+	select {
+	case res = <-ch:
+		return res, true
+	default:
+	}
+	select {
+	case res = <-ch:
+		return res, true
+	case <-expired:
+		return callResult[T]{err: errCallTimeout}, false
+	}
+}
+
+// closeAfter returns a channel that is closed after d. Unlike a timer channel, it can be waited for by any
+// number of calls.
+func closeAfter(d time.Duration) <-chan struct{} {
+	expired := make(chan struct{})
+	time.AfterFunc(d, func() {
+		close(expired)
+	})
+	return expired
+}
+
 // rebalance gives up one partition when the node owns more than its share, and takes free partitions
 // while it owns less.
-func (w *channelStateWorker) rebalance(ctx context.Context, share int) {
+func (w *channelStateWorker) rebalance(share int) {
 	if len(w.owned) > share {
 		for p, part := range w.owned {
 			w.releasePartition(p, part)
 			break
 		}
 	} else if len(w.owned) < share {
-		w.acquire(ctx, share-len(w.owned))
+		w.acquire(share - len(w.owned))
 	}
 }
 
-// renewOwned renews the leases of the owned partitions, one pipeline per shard, so that the
-// renewals of a node take one round trip however many partitions it owns. A partition whose
-// lease is not renewed is stopped: another node may own it now. A partition whose renewal
-// failed is stopped and its lease released, because the renewal may have reached Redis.
-func (w *channelStateWorker) renewOwned(ctx context.Context) {
+// renewOwned renews the leases of the owned partitions, one pipeline per shard. The shards run in parallel, and
+// the loop waits for each of them until expired: a shard that does not answer in time is given up, so it does
+// not delay the renewals of the others. A partition whose lease is not renewed is stopped: another node may own
+// it now. A partition whose renewal failed, or whose shard was given up, is stopped and its lease released,
+// because the renewal may have reached Redis.
+func (w *channelStateWorker) renewOwned(expired <-chan struct{}) {
 	owned := make([]int, 0, len(w.owned))
 	for p := range w.owned {
 		owned = append(owned, p)
 	}
-
 	ttl := strconv.FormatInt(w.state.leaseTTL.Milliseconds(), 10)
-	var lost []int
-	for sh, partitions := range w.state.partitionsByShard(owned) {
-		execs := make([]rueidis.LuaExec, 0, len(partitions))
+
+	type renewal struct {
+		sh         *RedisShard
+		partitions []int
+		parts      []*channelStatePartition
+		ch         <-chan callResult[[]int]
+	}
+	byShard := w.state.partitionsByShard(owned)
+	renewals := make([]renewal, 0, len(byShard))
+	for sh, partitions := range byShard {
+		parts := make([]*channelStatePartition, 0, len(partitions))
 		for _, p := range partitions {
-			execs = append(execs, rueidis.LuaExec{
-				Keys: []string{w.leaseKey(p)},
-				Args: []string{w.node.uid, ttl},
-			})
+			parts = append(parts, w.owned[p])
 		}
-		start := time.Now()
-		results := w.state.renewScript.ExecMulti(ctx, sh.client, execs...)
-		var failed []int
-		var errs callErrors
-		for i, res := range results {
-			p := partitions[i]
-			renewed, err := res.AsInt64()
-			switch {
-			case err != nil:
-				errs.add(err, p)
-				failed = append(failed, p)
-			case renewed != 1:
-				lost = append(lost, p)
-			default:
-				w.owned[p].extendLease(start, w.state.leaseTTL)
-			}
-		}
-		for _, p := range failed {
-			w.stopPartition(p, w.owned[p])
-		}
-		w.releaseLeases(sh, failed)
-		w.reportCallErrors("channel state lease renew failed", errs)
+		renewals = append(renewals, renewal{
+			sh:         sh,
+			partitions: partitions,
+			parts:      parts,
+			ch: startCall(func() ([]int, error) {
+				return w.renewShard(sh, partitions, parts, ttl), nil
+			}),
+		})
 	}
-	for _, p := range lost {
-		w.stopPartition(p, w.owned[p])
+	for _, r := range renewals {
+		res, ok := awaitCall(r.ch, expired)
+		if !ok {
+			// The renewals of the shard may still reach Redis, so its partitions are released as well.
+			w.retire(r.parts, r.sh, r.partitions)
+			res.value = r.partitions
+		}
+		for _, p := range res.value {
+			delete(w.owned, p)
+		}
 	}
+}
+
+// renewShard renews the leases of the partitions of one shard in one pipeline. It stops the partitions
+// whose lease is lost or whose renewal failed, releases the leases of the failed ones, and returns the
+// partitions it stopped. It does not touch the owned set, so it may run beside the renewals of other shards.
+func (w *channelStateWorker) renewShard(sh *RedisShard, partitions []int, parts []*channelStatePartition, ttl string) []int {
+	ctx, cancel := w.callContext()
+	defer cancel()
+
+	execs := make([]rueidis.LuaExec, 0, len(partitions))
+	for _, p := range partitions {
+		execs = append(execs, rueidis.LuaExec{
+			Keys: []string{w.leaseKey(p)},
+			Args: []string{w.node.uid, ttl},
+		})
+	}
+	start := time.Now()
+	var stopped []int
+	var stopping []*channelStatePartition
+	var failed []int
+	var errs callErrors
+	for i, res := range w.state.renewScript.ExecMulti(ctx, sh.client, execs...) {
+		p := partitions[i]
+		renewed, err := res.AsInt64()
+		switch {
+		case err != nil:
+			errs.add(err, p)
+			failed = append(failed, p)
+			stopping = append(stopping, parts[i])
+			stopped = append(stopped, p)
+		case renewed != 1:
+			stopping = append(stopping, parts[i])
+			stopped = append(stopped, p)
+		default:
+			parts[i].extendLease(start, w.state.leaseTTL)
+		}
+	}
+	w.retire(stopping, sh, failed)
+	w.reportCallErrors("channel state lease renew failed", errs)
+	return stopped
+}
+
+// retire stops the consumers of the partitions and then releases the leases of the release partitions on the
+// shard. It runs in the background: a consumer may be stuck in a Redis call that ignores its context, such as
+// the connection setup of rueidis to a shard that does not answer, and the lease loop must not wait for it. A
+// lease is still released only after its consumer has stopped.
+func (w *channelStateWorker) retire(stopping []*channelStatePartition, sh *RedisShard, release []int) {
+	if len(stopping) == 0 {
+		return
+	}
+	go func() {
+		for _, part := range stopping {
+			part.stop()
+		}
+		w.releaseLeases(sh, release)
+	}()
 }
 
 // releaseAll stops every owned partition and releases its lease. It runs once, on stop.
@@ -208,7 +334,10 @@ func (w *channelStateWorker) share(workers int) int {
 // have expired, and returns how many workers the set holds, this one included. An entry expires
 // LeaseTTL after its heartbeat unless the next heartbeat renews it. The set lives on the first
 // shard, so all nodes count the same set. The set has no TTL of its own: every heartbeat trims it.
-func (w *channelStateWorker) heartbeat(ctx context.Context) (int, error) {
+func (w *channelStateWorker) heartbeat() (int, error) {
+	ctx, cancel := w.callContext()
+	defer cancel()
+
 	sh := w.state.workersShard
 	key := w.state.workersKey
 	nowMs := time.Now().UnixMilli()
@@ -235,7 +364,7 @@ func (w *channelStateWorker) heartbeat(ctx context.Context) (int, error) {
 // leave removes this worker from the set of workers, so the other workers take its partitions
 // without waiting for its entry to expire. It runs when the worker stops.
 func (w *channelStateWorker) leave() {
-	ctx, cancel := context.WithTimeout(context.Background(), w.state.leaseTTL)
+	ctx, cancel := w.callContext()
 	defer cancel()
 
 	sh := w.state.workersShard
@@ -246,10 +375,12 @@ func (w *channelStateWorker) leave() {
 }
 
 // acquire takes up to need free partitions, in random order, and starts a consumer for each. Only as many
-// partitions are attempted as the node needs, so it takes no lease beyond its share. The lease attempts of
-// a shard go out in one pipeline. A lease attempt whose reply failed may have taken the lease, so those
-// leases are released too.
-func (w *channelStateWorker) acquire(ctx context.Context, need int) {
+// partitions are attempted as the node needs. The lease attempts of a shard go out in one pipeline, and the
+// shards run in parallel. The loop waits for each attempt for at most callTimeout: an attempt that is given up
+// releases the leases it takes when it returns. A lease attempt whose reply failed may have taken the lease,
+// so those leases are released too. A node whose worker count is unknown takes every free partition it can
+// (see leaseCycle), so it may exceed its share until the count is back.
+func (w *channelStateWorker) acquire(need int) {
 	free := make([]int, 0, w.state.numPartitions-len(w.owned))
 	for _, p := range rand.Perm(w.state.numPartitions) { //nolint:gosec // Partition order is only a fairness hint; not security-sensitive.
 		if _, ok := w.owned[p]; !ok {
@@ -259,29 +390,79 @@ func (w *channelStateWorker) acquire(ctx context.Context, need int) {
 	if len(free) > need {
 		free = free[:need]
 	}
-	start := time.Now()
-	for sh, partitions := range w.state.partitionsByShard(free) {
-		cmds := make([]rueidis.Completed, 0, len(partitions))
-		for _, p := range partitions {
-			cmds = append(cmds, sh.client.B().Set().Key(w.leaseKey(p)).Value(w.node.uid).Nx().PxMilliseconds(w.state.leaseTTL.Milliseconds()).Build())
-		}
-		var failed []int
-		var errs callErrors
-		for i, res := range sh.client.DoMulti(ctx, cmds...) {
-			err := res.Error()
-			switch {
-			case rueidis.IsRedisNil(err):
-				// Another node holds the lease.
-			case err != nil:
-				errs.add(err, partitions[i])
-				failed = append(failed, partitions[i])
-			default:
-				w.startPartition(partitions[i], start)
-			}
-		}
-		w.releaseLeases(sh, failed)
-		w.reportCallErrors("channel state lease acquire failed", errs)
+	expired := closeAfter(w.callTimeout())
+	type attempt struct {
+		sh *RedisShard
+		ch <-chan callResult[shardAcquisition]
 	}
+	byShard := w.state.partitionsByShard(free)
+	attempts := make([]attempt, 0, len(byShard))
+	for sh, partitions := range byShard {
+		attempts = append(attempts, attempt{
+			sh: sh,
+			ch: startCall(func() (shardAcquisition, error) {
+				return w.acquireShard(sh, partitions), nil
+			}),
+		})
+	}
+	for _, a := range attempts {
+		res, ok := awaitCall(a.ch, expired)
+		if !ok {
+			w.releaseWhenReturned(a.sh, a.ch)
+			continue
+		}
+		for _, p := range res.value.partitions {
+			w.startPartition(p, res.value.since)
+		}
+	}
+}
+
+// releaseWhenReturned releases the leases that a lease attempt takes when it returns, for an attempt that the
+// lease loop has given up. The release runs on the goroutine that waits for the attempt.
+func (w *channelStateWorker) releaseWhenReturned(sh *RedisShard, ch <-chan callResult[shardAcquisition]) {
+	go func() {
+		res := <-ch
+		w.releaseLeases(sh, res.value.partitions)
+	}()
+}
+
+// shardAcquisition is the outcome of the lease attempts of one shard: the partitions whose leases the node
+// took, and the time the attempts were sent, which is the time the taken leases start from.
+type shardAcquisition struct {
+	partitions []int
+	since      time.Time
+}
+
+// acquireShard attempts the leases of the partitions of one shard in one pipeline, on its own timeout. It
+// releases the leases of the attempts whose reply failed, and returns the partitions whose leases it took.
+// It starts no consumer: the caller does, on the lease loop goroutine.
+func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int) shardAcquisition {
+	ctx, cancel := w.callContext()
+	defer cancel()
+
+	cmds := make([]rueidis.Completed, 0, len(partitions))
+	for _, p := range partitions {
+		cmds = append(cmds, sh.client.B().Set().Key(w.leaseKey(p)).Value(w.node.uid).Nx().PxMilliseconds(w.state.leaseTTL.Milliseconds()).Build())
+	}
+	since := time.Now()
+	var taken []int
+	var failed []int
+	var errs callErrors
+	for i, res := range sh.client.DoMulti(ctx, cmds...) {
+		err := res.Error()
+		switch {
+		case rueidis.IsRedisNil(err):
+			// Another node holds the lease.
+		case err != nil:
+			errs.add(err, partitions[i])
+			failed = append(failed, partitions[i])
+		default:
+			taken = append(taken, partitions[i])
+		}
+	}
+	w.releaseLeases(sh, failed)
+	w.reportCallErrors("channel state lease acquire failed", errs)
+	return shardAcquisition{partitions: taken, since: since}
 }
 
 // startPartition starts the consumer of a partition whose lease was taken at since.
@@ -299,17 +480,15 @@ func (w *channelStateWorker) startPartition(p int, since time.Time) {
 // stopPartition cancels the consumer of the partition and waits until it has stopped.
 // The lease is not released: it is lost or it is released by the caller.
 func (w *channelStateWorker) stopPartition(p int, part *channelStatePartition) {
-	part.cancel()
-	<-part.done
+	part.stop()
 	delete(w.owned, p)
 }
 
-// releasePartition stops the consumer of the partition and then releases its lease. Delivery is
-// at least once: a stalled owner may overlap with the node that takes the lease after it, until
-// its own lease check stops its consumer.
+// releasePartition gives up the partition: it leaves the owned set at once, and its consumer is stopped
+// and its lease released in the background, after the consumer has stopped.
 func (w *channelStateWorker) releasePartition(p int, part *channelStatePartition) {
-	w.stopPartition(p, part)
-	w.releasePartitions([]int{p})
+	delete(w.owned, p)
+	w.retire([]*channelStatePartition{part}, w.state.shardOf(p), []int{p})
 }
 
 // consume sweeps the partition and delivers its events on every tick until ctx is done. A tick
@@ -491,14 +670,14 @@ func (w *channelStateWorker) releasePartitions(partitions []int) {
 	}
 }
 
-// releaseLeases releases the leases of the partitions of one shard in one pipeline. The release
-// runs on its own context, because the lease cycle context may be the reason of the failure.
-// A lease that is not held by this node is left alone by the release script.
+// releaseLeases releases the leases of the partitions of one shard in one pipeline. The release runs on
+// its own timeout, because the failure it follows may be a shard that does not answer. A lease that is
+// not held by this node is left alone by the release script.
 func (w *channelStateWorker) releaseLeases(sh *RedisShard, partitions []int) {
 	if len(partitions) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), w.state.leaseTTL)
+	ctx, cancel := w.callContext()
 	defer cancel()
 
 	execs := make([]rueidis.LuaExec, 0, len(partitions))
