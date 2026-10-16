@@ -139,7 +139,15 @@ func (w *channelStateWorker) leaseCycle() {
 	w.heartbeats.Add(1)
 	heartbeat := startCall(func() (int, error) {
 		defer w.heartbeats.Done()
-		return w.heartbeat()
+		count, err := w.heartbeat()
+		select {
+		case <-w.closeCh:
+			// The worker closed while the heartbeat was in flight, so its entry may have been written after leave
+			// removed it. Leaving again removes the entry, since this call ran after its write.
+			w.leave()
+		default:
+		}
+		return count, err
 	})
 
 	w.renewOwned(ctx.Done())
