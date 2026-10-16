@@ -34,8 +34,9 @@ type channelStateWorker struct {
 	// heartbeats tracks the heartbeat calls that may still reach Redis, so that the membership
 	// is removed after the last of them.
 	heartbeats sync.WaitGroup
-	// background tracks the work beside the lease loop: the retirement of partitions and the release
-	// of the leases of an acquisition that the lease loop gave up.
+	// background tracks the work beside the lease loop: the consumers, the retirement of partitions and
+	// the release of the leases of an acquisition that the lease loop gave up. Shutdown waits for it, and
+	// Close bounds that wait with its context.
 	background sync.WaitGroup
 	// owned is only accessed by the lease loop goroutine.
 	owned map[int]*channelStatePartition
@@ -55,6 +56,9 @@ type channelStatePartition struct {
 	token  string
 	cancel context.CancelFunc
 	done   chan struct{}
+	// release says whether the lease is released once the consumer has stopped. It is set when the
+	// partition is given up, and the lease loop goroutine reads it.
+	release bool
 	// validUntil is the wall clock time in Unix nanoseconds until which the lease is known
 	// to be held: the start of the last renewal (or of the acquisition) plus LeaseTTL. The
 	// wall clock keeps running while the process is suspended, so a resumed consumer sees
@@ -130,15 +134,16 @@ func (w *channelStateWorker) run() {
 // renewals of the others. The acquisitions wait for at most callTimeout too: a cycle lasts at most two call
 // timeouts, two thirds of LeaseTTL at the most, however long a shard takes to answer.
 func (w *channelStateWorker) leaseCycle() {
-	expired := closeAfter(w.callTimeout())
+	ctx, cancel := w.callContext()
+	defer cancel()
 	w.heartbeats.Add(1)
 	heartbeat := startCall(func() (int, error) {
 		defer w.heartbeats.Done()
 		return w.heartbeat()
 	})
 
-	w.renewOwned(expired)
-	hb, _ := awaitCall(heartbeat, expired)
+	w.renewOwned(ctx.Done())
+	hb, _ := awaitCall(heartbeat, ctx.Done())
 
 	if hb.err != nil {
 		// Without the count the share is unknown. The worker keeps the partitions it owns and takes the free
@@ -202,16 +207,6 @@ func awaitCall[T any](ch <-chan callResult[T], expired <-chan struct{}) (res cal
 	}
 }
 
-// closeAfter returns a channel that is closed after d. Unlike a timer channel, it can be waited for by any
-// number of calls.
-func closeAfter(d time.Duration) <-chan struct{} {
-	expired := make(chan struct{})
-	time.AfterFunc(d, func() {
-		close(expired)
-	})
-	return expired
-}
-
 // waitWithin waits until the goroutines of wg are done or d has passed. A call whose connection is being dialed
 // does not end with its context, so the waits of the shutdown are bounded here. A wait that gives up leaves its
 // goroutine behind until the work of wg is done.
@@ -266,7 +261,7 @@ func (w *channelStateWorker) renewOwned(expired <-chan struct{}) {
 		parts []*channelStatePartition
 		ch    <-chan callResult[renewResult]
 	}
-	byShard := groupByShard(owned)
+	byShard := groupByShard(owned, partitionShard)
 	renewals := make([]renewal, 0, len(byShard))
 	for sh, parts := range byShard {
 		renewals = append(renewals, renewal{
@@ -341,6 +336,7 @@ func (w *channelStateWorker) giveUp(parts []*channelStatePartition, release bool
 // can outlive its consumer by up to LeaseTTL.
 func (w *channelStateWorker) retire(parts []*channelStatePartition, release bool) {
 	for _, part := range parts {
+		part.release = release
 		w.retiring[part.p] = part
 	}
 	w.background.Add(1)
@@ -355,26 +351,27 @@ func (w *channelStateWorker) retire(parts []*channelStatePartition, release bool
 	}()
 }
 
-// shutdown stops the worker when Close is called. It cancels the consumers and releases their leases before it
-// waits for any consumer, so a consumer stuck in a call that ignores its context does not hold the leases of the
-// others. The releases and the membership removal are bounded by the call timeout. The wait for the consumers and
-// the background work comes last: Close bounds it with its context. A consumer that runs past the release of its
-// lease may deliver one more batch, which at-least-once delivery allows.
+// shutdown stops the worker when Close is called. It cancels the consumers and releases the leases of the owned
+// partitions, and of the retiring ones whose release is pending, before it waits for any consumer, so a consumer
+// stuck in a call that ignores its context does not hold the leases of the others. The releases and the membership
+// removal are bounded by the call timeout. The wait for the consumers and the background work comes last and has
+// no bound of its own: Close bounds it with its context. A consumer that runs past the release of its lease may
+// deliver one more batch, which at-least-once delivery allows.
 func (w *channelStateWorker) shutdown() {
-	owned := make([]*channelStatePartition, 0, len(w.owned))
+	released := make([]*channelStatePartition, 0, len(w.owned)+len(w.retiring))
 	for _, part := range w.owned {
 		part.cancel()
-		owned = append(owned, part)
-	}
-	w.releaseAtShutdown(owned)
-	waitWithin(&w.heartbeats, w.callTimeout())
-	w.leave()
-	for _, part := range owned {
-		<-part.done
+		released = append(released, part)
 	}
 	for _, part := range w.retiring {
-		<-part.done
+		part.cancel()
+		if part.release {
+			released = append(released, part)
+		}
 	}
+	w.releaseAtShutdown(released)
+	waitWithin(&w.heartbeats, w.callTimeout())
+	w.leave()
 	w.background.Wait()
 	clear(w.owned)
 	w.state.metrics.setPartitionsOwned(0)
@@ -384,7 +381,7 @@ func (w *channelStateWorker) shutdown() {
 // The wait is bounded by the call timeout.
 func (w *channelStateWorker) releaseAtShutdown(parts []*channelStatePartition) {
 	var releases sync.WaitGroup
-	for sh, leases := range groupByShard(parts) {
+	for sh, leases := range groupByShard(parts, partitionShard) {
 		releases.Add(1)
 		go func(sh *RedisShard, leases []*channelStatePartition) {
 			defer releases.Done()
@@ -437,14 +434,20 @@ func (w *channelStateWorker) heartbeat() (int, error) {
 
 // leave removes this worker from the set of workers, so the other workers take its partitions
 // without waiting for its entry to expire. It runs when the worker stops, after its last heartbeat.
+// The call is bounded by the call timeout, because a call that waits for a connection being dialed
+// does not end with its context.
 func (w *channelStateWorker) leave() {
 	ctx, cancel := w.callContext()
 	defer cancel()
 
 	sh := w.state.workersShard
-	if err := sh.client.Do(ctx, sh.client.B().Zrem().Key(w.state.workersKey).Member(w.node.uid).Build()).Error(); err != nil {
+	leaving := startCall(func() (struct{}, error) {
+		return struct{}{}, sh.client.Do(ctx, sh.client.B().Zrem().Key(w.state.workersKey).Member(w.node.uid).Build()).Error()
+	})
+	res, _ := awaitCall(leaving, ctx.Done())
+	if res.err != nil {
 		w.state.metrics.incSweepErrors()
-		w.node.logger.log(newErrorLogEntry(err, "channel state worker leave failed", nil))
+		w.node.logger.log(newErrorLogEntry(res.err, "channel state worker leave failed", nil))
 	}
 }
 
@@ -467,8 +470,9 @@ func (w *channelStateWorker) acquire(need int) {
 	if len(free) > need {
 		free = free[:need]
 	}
-	expired := closeAfter(w.callTimeout())
-	byShard := w.state.partitionsByShard(free)
+	ctx, cancel := w.callContext()
+	defer cancel()
+	byShard := groupByShard(free, w.state.shardOf)
 	attempts := make([]<-chan callResult[[]*channelStatePartition], 0, len(byShard))
 	for sh, partitions := range byShard {
 		attempts = append(attempts, startCall(func() ([]*channelStatePartition, error) {
@@ -476,7 +480,7 @@ func (w *channelStateWorker) acquire(need int) {
 		}))
 	}
 	for _, ch := range attempts {
-		res, ok := awaitCall(ch, expired)
+		res, ok := awaitCall(ch, ctx.Done())
 		if !ok {
 			w.releaseWhenReturned(ch)
 			continue
@@ -558,7 +562,11 @@ func (w *channelStateWorker) startPartition(part *channelStatePartition) {
 	part.cancel = cancel
 	part.done = make(chan struct{})
 	w.owned[part.p] = part
-	go w.consume(ctx, part)
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		w.consume(ctx, part)
+	}()
 }
 
 // consume sweeps the partition and delivers its events on every tick until ctx is done. A tick
@@ -594,7 +602,6 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 		w.logError(err, "channel state sweep failed", p)
 		return w.wait(ctx, backoff)
 	}
-	backoff.reset()
 	for {
 		events, ids, err := w.readBatch(ctx, sh, p)
 		if err != nil {
@@ -629,7 +636,6 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 			}
 			w.state.metrics.addDelivered(len(events))
 		}
-		backoff.reset()
 		if err := w.ack(ctx, sh, p, ids); err != nil {
 			if ctx.Err() != nil {
 				return false
@@ -640,6 +646,10 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 			if !w.wait(ctx, backoff) {
 				return false
 			}
+		} else {
+			// The backoff resets only once the batch is delivered and acknowledged, so a failure of any step
+			// of the sweep, the read, the delivery or the ack keeps the delay growing.
+			backoff.reset()
 		}
 	}
 }
@@ -733,18 +743,24 @@ func (w *channelStateWorker) leaseKey(p int) string {
 	return string(w.state.partitionKey(p, "lease"))
 }
 
-// groupByShard groups the partitions by the Redis shard that keeps their leases.
-func groupByShard(parts []*channelStatePartition) map[*RedisShard][]*channelStatePartition {
-	byShard := make(map[*RedisShard][]*channelStatePartition)
-	for _, part := range parts {
-		byShard[part.shard] = append(byShard[part.shard], part)
+// groupByShard groups the items by the Redis shard that shardOf returns for each of them.
+func groupByShard[T any](items []T, shardOf func(T) *RedisShard) map[*RedisShard][]T {
+	byShard := make(map[*RedisShard][]T)
+	for _, item := range items {
+		sh := shardOf(item)
+		byShard[sh] = append(byShard[sh], item)
 	}
 	return byShard
 }
 
+// partitionShard returns the Redis shard that keeps the lease of the partition.
+func partitionShard(part *channelStatePartition) *RedisShard {
+	return part.shard
+}
+
 // releaseParts releases the leases of the partitions, one pipeline per shard.
 func (w *channelStateWorker) releaseParts(parts []*channelStatePartition) {
-	for sh, leases := range groupByShard(parts) {
+	for sh, leases := range groupByShard(parts, partitionShard) {
 		w.releaseLeases(sh, leases)
 	}
 }

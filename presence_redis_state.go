@@ -89,8 +89,8 @@ type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) e
 //
 // Membership uses the wall clock of each node. Clock skew larger than LeaseTTL delays the takeover of a
 // crashed worker's partitions by about the skew, because a worker that is ahead of the others stays in
-// their count after it crashed. A worker whose clock lags is left out of the count while it runs, so it
-// takes no partitions. The leases still keep one consumer per partition.
+// their count after it crashed. A worker whose clock lags is left out of the count of the other workers while
+// it runs. It takes a share of its own count, and the leases keep one consumer per partition.
 //
 // The lease check uses the wall clock. A backward step of the clock (NTP) can keep a lease
 // believed held after Redis expired it, so two nodes may deliver one partition for about the
@@ -266,16 +266,6 @@ func (s *presenceState) partition(channel string) int {
 // shardOf returns the Redis shard that keeps the state of the partition.
 func (s *presenceState) shardOf(p int) *RedisShard {
 	return s.manager.shards[s.partitionShards[p]]
-}
-
-// partitionsByShard groups the partitions by the Redis shard that keeps their state.
-func (s *presenceState) partitionsByShard(partitions []int) map[*RedisShard][]int {
-	byShard := make(map[*RedisShard][]int)
-	for _, p := range partitions {
-		sh := s.shardOf(p)
-		byShard[sh] = append(byShard[sh], p)
-	}
-	return byShard
 }
 
 // partitionKey returns a key of the partition: all of them share the tag of the partition,
