@@ -292,6 +292,9 @@ func (w *channelStateWorker) consume(ctx context.Context, p int, part *channelSt
 // lease is lost. It returns false when ctx is done.
 func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p int, part *channelStatePartition, backoff *channelStateBackoff) bool {
 	if err := w.sweep(ctx, sh, p); err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
 		w.state.metrics.incSweepErrors()
 		w.logError(err, "channel state sweep failed", p)
 		return w.wait(ctx, backoff)
@@ -300,6 +303,9 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 	for {
 		events, ids, err := w.readBatch(ctx, sh, p)
 		if err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
 			w.state.metrics.incSweepErrors()
 			w.logError(err, "channel state read failed", p)
 			return w.wait(ctx, backoff)
@@ -314,6 +320,10 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 				return true
 			}
 			if err := w.state.handler(ctx, events); err != nil {
+				if ctx.Err() != nil {
+					// Stopped while the handler ran: the events stay in the stream.
+					return false
+				}
 				// The events stay in the stream, so the same batch is delivered again.
 				w.state.metrics.incDeliveryErrors()
 				w.logError(err, "channel state delivery failed", p)
@@ -326,6 +336,9 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 		}
 		backoff.reset()
 		if err := w.ack(ctx, sh, p, ids); err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
 			// The batch is still in the stream: a repeated delivery is possible, by design.
 			w.state.metrics.incSweepErrors()
 			w.logError(err, "channel state ack failed", p)

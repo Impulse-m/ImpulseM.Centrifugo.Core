@@ -214,6 +214,8 @@ func TestRedisChannelStateClose(t *testing.T) {
 
 	require.NoError(t, pm.Close(context.Background()))
 	require.Equal(t, 0, leaseKeys())
+	// Consumers stopped by Close are not Redis errors.
+	require.Equal(t, 0.0, testCounterValue(t, pm.state.metrics.sweepErrors))
 	// The pool of the Redis client keeps its own goroutines, so only the worker goroutines are counted.
 	require.Eventually(t, func() bool {
 		return countChannelStateGoroutines() == 0
