@@ -106,7 +106,7 @@ func TestRedisChannelStateRetryDelivery(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(collector.snapshot()) == 1
 	}, 10*time.Second, 10*time.Millisecond)
-	time.Sleep(3 * testChannelStateVacatedDelay)
+	requireSettled(t, func() int { return len(collector.attemptTimes()) }, testChannelStateQuietWindow)
 
 	attempts := collector.attemptTimes()
 	require.Len(t, attempts, 3)
@@ -172,7 +172,7 @@ func TestRedisChannelStateTwoNodes(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == numChannels
 	}, 10*time.Second, 10*time.Millisecond)
-	time.Sleep(3 * testChannelStateVacatedDelay)
+	requireSettled(t, func() int { return len(collector.snapshot()) }, testChannelStateQuietWindow)
 
 	// Each channel is delivered exactly once in total, by either node.
 	seen := make(map[string]int, numChannels)

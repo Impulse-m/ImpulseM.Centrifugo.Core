@@ -5,7 +5,6 @@ package centrifuge
 import (
 	"context"
 	"errors"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -70,6 +69,19 @@ func (c *testChannelStateCollector) attemptTimes() []time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]time.Time(nil), c.attempts...)
+}
+
+// testChannelStateQuietWindow is how long a test watches that no extra channel state event arrives.
+const testChannelStateQuietWindow = 3 * testChannelStateVacatedDelay
+
+// requireSettled fails when count changes within the window, so that a test checks that no extra event
+// arrives after the expected ones. The check ends at the first change.
+func requireSettled(tb testing.TB, count func() int, window time.Duration) {
+	tb.Helper()
+	before := count()
+	require.Never(tb, func() bool {
+		return count() != before
+	}, window, 10*time.Millisecond)
 }
 
 // eventsOfType returns the events of the channel state event type, in order.
@@ -170,7 +182,7 @@ func testOccupiedVacated(t *testing.T, port int, hashFieldTTL bool) {
 
 	removeAt := time.Now()
 	require.NoError(t, pm.RemovePresence(ch, "client-1", ""))
-	time.Sleep(testChannelStateVacatedDelay / 2)
+	requireSettled(t, func() int { return len(collector.snapshot()) }, testChannelStateVacatedDelay/2)
 	require.Empty(t, eventsOfType(collector.snapshot(), ChannelStateVacated))
 
 	require.Eventually(t, func() bool {
@@ -196,7 +208,7 @@ func TestRedisChannelStateOccupiedOnce(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(collector.snapshot()) >= 1
 	}, 5*time.Second, 10*time.Millisecond)
-	time.Sleep(3 * testChannelStateVacatedDelay)
+	requireSettled(t, func() int { return len(collector.snapshot()) }, testChannelStateQuietWindow)
 
 	events := collector.snapshot()
 	require.Len(t, events, 1)
@@ -224,7 +236,7 @@ func TestRedisChannelStateResubscribeCancelsVacated(t *testing.T) {
 
 	require.NoError(t, pm.RemovePresence(ch, "client-1", ""))
 	require.NoError(t, pm.AddPresence(ch, "client-1", &ClientInfo{}))
-	time.Sleep(3 * testChannelStateVacatedDelay)
+	requireSettled(t, func() int { return len(collector.snapshot()) }, testChannelStateQuietWindow)
 
 	events := collector.snapshot()
 	require.Len(t, eventsOfType(events, ChannelStateOccupied), 1)
@@ -315,7 +327,7 @@ func TestRedisChannelStateExpiredPresence(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 
 	// No refresh: the presence expires and no vacated event is sent before its TTL.
-	time.Sleep(presenceTTL / 2)
+	requireSettled(t, func() int { return len(collector.snapshot()) }, presenceTTL/2)
 	require.Empty(t, eventsOfType(collector.snapshot(), ChannelStateVacated))
 
 	require.Eventually(t, func() bool {
@@ -383,7 +395,7 @@ func TestRedisChannelStateAddAfterPresenceKeyExpired(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(collector.snapshot()) >= 1
 	}, 10*time.Second, 10*time.Millisecond)
-	time.Sleep(state.SweepInterval)
+	requireSettled(t, func() int { return len(collector.snapshot()) }, state.SweepInterval)
 
 	events := collector.snapshot()
 	require.Len(t, eventsOfType(events, ChannelStateOccupied), 1)
@@ -410,7 +422,7 @@ func TestRedisChannelStateRepeatedRemoveSendsOneVacated(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 
 	require.NoError(t, pm.RemovePresence(ch, "client-1", ""))
-	time.Sleep(3 * testChannelStateVacatedDelay)
+	requireSettled(t, func() int { return len(collector.snapshot()) }, testChannelStateQuietWindow)
 	require.Len(t, eventsOfType(collector.snapshot(), ChannelStateVacated), 1)
 }
 
@@ -444,7 +456,7 @@ func TestRedisChannelStateDueInBothSetsSendsOneVacated(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(eventsOfType(collector.snapshot(), ChannelStateVacated)) == 1
 	}, 5*time.Second, 10*time.Millisecond)
-	time.Sleep(3 * testChannelStateVacatedDelay)
+	requireSettled(t, func() int { return len(collector.snapshot()) }, testChannelStateQuietWindow)
 	require.Len(t, eventsOfType(collector.snapshot(), ChannelStateVacated), 1)
 }
 
@@ -611,13 +623,49 @@ func containsLuaLines(script string, needle []string) bool {
 	return false
 }
 
+// luaExpiredCleanup returns the expired entries cleanup of a script: the lines from its local expired
+// statement to the end of the if that removes the entries. The expiry argument is written as ARGV[now], so
+// that the copies of the cleanup in other scripts compare equal.
+func luaExpiredCleanup(source string, expiryArg string) []string {
+	var block []string
+	depth := 0
+	inside := false
+	for _, line := range luaNonEmptyLines(source) {
+		if !inside {
+			if !strings.HasPrefix(line, `local expired = redis.call("zrangebyscore"`) {
+				continue
+			}
+			inside = true
+		}
+		block = append(block, strings.ReplaceAll(line, expiryArg, "ARGV[now]"))
+		switch {
+		case strings.HasSuffix(line, " then"), strings.HasSuffix(line, " do"):
+			depth++
+		case line == "end":
+			depth--
+		}
+		if depth == 0 && line == "end" {
+			break
+		}
+	}
+	return block
+}
+
 // TestRedisChannelStateScriptsKeepPresenceBodies fails when the upstream presence scripts change and the
-// channel state scripts keep the old body: the state scripts embed the bodies of the upstream scripts.
+// channel state scripts keep the old body: the state scripts embed the bodies of the upstream scripts, and
+// the cleanup of the expired entries of presence_get.lua.
 func TestRedisChannelStateScriptsKeepPresenceBodies(t *testing.T) {
 	require.True(t, containsLuaLines(presenceStateAddScriptSource, luaScriptBody(addPresenceScriptSource)),
 		"presence_state_add.lua does not contain the body of presence_add.lua")
 	require.True(t, containsLuaLines(presenceStateRemScriptSource, luaScriptBody(remPresenceScriptSource)),
 		"presence_state_rem.lua does not contain the body of presence_rem.lua")
+
+	cleanup := luaExpiredCleanup(presenceScriptSource, "ARGV[1]")
+	require.NotEmpty(t, cleanup, "presence_get.lua has no cleanup of the expired entries")
+	require.Equal(t, cleanup, luaExpiredCleanup(presenceStateCheckScriptSource, "ARGV[3]"),
+		"presence_state_check.lua does not keep the cleanup of presence_get.lua")
+	require.Equal(t, cleanup, luaExpiredCleanup(presenceStateRemScriptSource, "ARGV[6]"),
+		"presence_state_rem.lua does not keep the cleanup of presence_get.lua")
 }
 
 func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
@@ -626,13 +674,14 @@ func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	before := runtime.NumGoroutine()
+	// Other tests run their workers in parallel, so the worker goroutines are counted, not all goroutines.
+	before := countChannelStateGoroutines()
 	pm, err := NewRedisPresenceManager(node, RedisPresenceManagerConfig{
 		Prefix: getUniqueStatePrefix(),
 		Shards: []*RedisShard{s},
 	})
 	require.NoError(t, err)
-	require.Equal(t, before, runtime.NumGoroutine())
+	require.LessOrEqual(t, countChannelStateGoroutines(), before)
 	require.Nil(t, pm.state)
 	require.NoError(t, pm.Close(context.Background()))
 }
