@@ -3634,6 +3634,7 @@ func (c *Client) handleHistory(req *protocol.HistoryRequest, cmd *protocol.Comma
 	// The callback checks again, see historyRefusedAtCallback: the application
 	// decides in between, and the subscription may change meanwhile.
 	c.mu.RLock()
+	// subscribed is entry presence here: a reservation or a committed subscription.
 	channelContext, subscribed := c.channels[channel]
 	_, loading := c.mapSubscribing[channel]
 	presentAtCheck := subscribed || loading
