@@ -177,6 +177,62 @@ func TestRedisChannelStateTwoNodes(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond)
 }
 
+// TestRedisChannelStateMixedNodes runs a node with channel state and a node without it on one prefix.
+// Only the node with channel state is a worker, so it takes every partition, and every partition has
+// a consumer for the channels added to it.
+func TestRedisChannelStateMixedNodes(t *testing.T) {
+	t.Parallel()
+	prefix := getUniqueStatePrefix()
+	collector := &testChannelStateCollector{}
+	state := testChannelStateConfig(collector)
+	state.NumPartitions = 8
+
+	_, pm1 := newTestChannelStateNode(t, prefix, state)
+
+	plain := testStateNode(t)
+	s, err := NewRedisShard(plain, testSingleRedisConf(6379))
+	require.NoError(t, err)
+	t.Cleanup(s.Close)
+	broker, err := NewRedisBroker(plain, RedisBrokerConfig{
+		Prefix:   prefix,
+		UseLists: true,
+		Shards:   []*RedisShard{s},
+	})
+	require.NoError(t, err)
+	plain.SetBroker(broker)
+	plainPM, err := NewRedisPresenceManager(plain, RedisPresenceManagerConfig{
+		Prefix: prefix,
+		Shards: []*RedisShard{s},
+	})
+	require.NoError(t, err)
+	plain.SetPresenceManager(plainPM)
+	require.NoError(t, plain.Run())
+	t.Cleanup(func() {
+		_ = plain.Shutdown(context.Background())
+	})
+
+	require.Eventually(t, func() bool {
+		return testOwnedPartitions(t, pm1) == 8
+	}, 3*testChannelStateLeaseTTL, 10*time.Millisecond)
+
+	// One channel of every partition: each of the partitions must deliver its event.
+	covered := make(map[int]bool, 8)
+	var channels []string
+	for i := 0; len(covered) < 8; i++ {
+		ch := "mixed-" + strconv.Itoa(i)
+		p := pm1.state.partition(ch)
+		if covered[p] {
+			continue
+		}
+		covered[p] = true
+		channels = append(channels, ch)
+		require.NoError(t, pm1.AddPresence(ch, "client-1", &ClientInfo{}))
+	}
+	require.Eventually(t, func() bool {
+		return len(eventsOfType(collector.snapshot(), ChannelStateOccupied)) == len(channels)
+	}, 10*time.Second, 10*time.Millisecond)
+}
+
 func TestRedisChannelStateClose(t *testing.T) {
 	collector := &testChannelStateCollector{}
 	node := testStateNode(t)
