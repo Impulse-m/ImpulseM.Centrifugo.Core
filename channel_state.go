@@ -452,31 +452,31 @@ func (w *channelStateWorker) leave() {
 }
 
 // acquire takes up to need free partitions, in random order, and starts a consumer for each. A partition is free
-// when this node holds no lease on it and its consumer, if it was retiring, has stopped. Only as many partitions
-// are attempted as the node needs. The lease attempts of a shard go out in one pipeline, and the shards run in
-// parallel. The loop waits for each attempt for at most callTimeout: an attempt that is given up releases the
-// leases it takes when it returns. A node whose worker count is unknown takes every free partition it can (see
-// leaseCycle), so it may exceed its share until the count is back.
+// when this node holds no lease on it, its consumer, if it was retiring, has stopped, and its lease key is not held
+// in Redis. The candidates are probed before any lease is attempted, so the attempts go to the partitions that are
+// free and not to a random pick that another worker holds. The shards run in parallel, and each shard attempts at
+// most the slots left of need. The loop waits for each shard for at most callTimeout: a shard that is given up
+// releases the leases it takes when it returns. A node whose worker count is unknown takes every free partition it
+// can (see leaseCycle), so it may exceed its share until the count is back.
 func (w *channelStateWorker) acquire(need int) {
 	w.forgetStopped()
-	free := make([]int, 0, w.state.numPartitions-len(w.owned))
+	candidates := make([]int, 0, w.state.numPartitions-len(w.owned))
 	for _, p := range rand.Perm(w.state.numPartitions) { //nolint:gosec // Partition order is only a fairness hint; not security-sensitive.
 		_, owned := w.owned[p]
 		_, retiring := w.retiring[p]
 		if !owned && !retiring {
-			free = append(free, p)
+			candidates = append(candidates, p)
 		}
-	}
-	if len(free) > need {
-		free = free[:need]
 	}
 	ctx, cancel := w.callContext()
 	defer cancel()
-	byShard := groupByShard(free, w.state.shardOf)
+	var remaining atomic.Int64
+	remaining.Store(int64(need))
+	byShard := groupByShard(candidates, w.state.shardOf)
 	attempts := make([]<-chan callResult[[]*channelStatePartition], 0, len(byShard))
 	for sh, partitions := range byShard {
 		attempts = append(attempts, startCall(func() ([]*channelStatePartition, error) {
-			return w.acquireShard(sh, partitions), nil
+			return w.acquireShard(sh, partitions, &remaining), nil
 		}))
 	}
 	for _, ch := range attempts {
@@ -513,16 +513,22 @@ func (w *channelStateWorker) releaseWhenReturned(ch <-chan callResult[[]*channel
 	}()
 }
 
-// acquireShard attempts the leases of the partitions of one shard in one pipeline, on its own timeout. Every attempt
-// writes its own token. It releases the leases of the attempts whose reply failed, since they may have been taken,
-// and returns the leases it took. It starts no consumer: the caller does, on the lease loop goroutine.
-func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int) []*channelStatePartition {
+// acquireShard probes the lease keys of the partitions of one shard in one pipeline, then attempts the leases of
+// the free ones in one pipeline, on its own timeout. It attempts no more partitions than the slots it claims from
+// remaining, which holds the partitions the node still needs in total. Every attempt writes its own token. It
+// releases the leases of the attempts whose reply failed, since they may have been taken, and returns the leases it
+// took. It starts no consumer: the caller does, on the lease loop goroutine.
+func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int, remaining *atomic.Int64) []*channelStatePartition {
 	ctx, cancel := w.callContext()
 	defer cancel()
 
-	attempts := make([]*channelStatePartition, 0, len(partitions))
-	cmds := make([]rueidis.Completed, 0, len(partitions))
-	for _, p := range partitions {
+	var errs callErrors
+	free := w.freePartitions(ctx, sh, partitions, &errs)
+	free = free[:claimSlots(remaining, len(free))]
+
+	attempts := make([]*channelStatePartition, 0, len(free))
+	cmds := make([]rueidis.Completed, 0, len(free))
+	for _, p := range free {
 		attempt := &channelStatePartition{p: p, shard: sh, token: w.newLeaseToken()}
 		attempts = append(attempts, attempt)
 		cmds = append(cmds, sh.client.B().Set().Key(w.leaseKey(p)).Value(attempt.token).Nx().PxMilliseconds(w.state.leaseTTL.Milliseconds()).Build())
@@ -530,7 +536,6 @@ func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int) []*c
 	since := time.Now()
 	var taken []*channelStatePartition
 	var failed []*channelStatePartition
-	var errs callErrors
 	for i, res := range sh.client.DoMulti(ctx, cmds...) {
 		attempt := attempts[i]
 		err := res.Error()
@@ -548,6 +553,41 @@ func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int) []*c
 	w.releaseParts(failed)
 	w.reportCallErrors("channel state lease acquire failed", errs)
 	return taken
+}
+
+// freePartitions returns the partitions of one shard whose lease key is not held, in the order given. The keys are
+// read in one pipeline. A key whose read failed is not free, and its error is added to errs.
+func (w *channelStateWorker) freePartitions(ctx context.Context, sh *RedisShard, partitions []int, errs *callErrors) []int {
+	cmds := make([]rueidis.Completed, 0, len(partitions))
+	for _, p := range partitions {
+		cmds = append(cmds, sh.client.B().Get().Key(w.leaseKey(p)).Build())
+	}
+	free := make([]int, 0, len(partitions))
+	for i, res := range sh.client.DoMulti(ctx, cmds...) {
+		err := res.Error()
+		switch {
+		case rueidis.IsRedisNil(err):
+			free = append(free, partitions[i])
+		case err != nil:
+			errs.add(err, partitions[i])
+		}
+	}
+	return free
+}
+
+// claimSlots takes up to want of the slots left in remaining and returns how many it took. The shards claim their
+// slots in parallel, so the claim is atomic: the attempts of all shards together never exceed what the node needs.
+func claimSlots(remaining *atomic.Int64, want int) int {
+	for {
+		left := remaining.Load()
+		if left <= 0 {
+			return 0
+		}
+		take := min(left, int64(want))
+		if remaining.CompareAndSwap(left, left-take) {
+			return int(take)
+		}
+	}
 }
 
 // newLeaseToken returns the value an acquisition writes to the lease key: the node ID and a random part, so that
