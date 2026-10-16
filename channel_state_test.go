@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -507,6 +508,112 @@ func TestRedisChannelStateClose(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return countChannelStateGoroutines() == 0
 	}, time.Second, 10*time.Millisecond)
+}
+
+// testBlockingHandler is a channel state handler whose calls block until unblock is called. It ignores its
+// context, like a handler that does not honour it. It counts the calls and the most calls that ran at once.
+type testBlockingHandler struct {
+	calls    atomic.Int32
+	inFlight atomic.Int32
+	peak     atomic.Int32
+	release  chan struct{}
+	once     sync.Once
+}
+
+func newTestBlockingHandler() *testBlockingHandler {
+	return &testBlockingHandler{release: make(chan struct{})}
+}
+
+func (h *testBlockingHandler) handle(_ context.Context, _ []ChannelStateEvent) error {
+	h.calls.Add(1)
+	running := h.inFlight.Add(1)
+	defer h.inFlight.Add(-1)
+	for {
+		peak := h.peak.Load()
+		if running <= peak || h.peak.CompareAndSwap(peak, running) {
+			break
+		}
+	}
+	<-h.release
+	return nil
+}
+
+// unblock lets the blocked calls return. It may be called more than once.
+func (h *testBlockingHandler) unblock() {
+	h.once.Do(func() {
+		close(h.release)
+	})
+}
+
+// testBlockingChannelStateConfig returns the config of a single partition whose events go to handler.
+func testBlockingChannelStateConfig(handler *testBlockingHandler) RedisChannelStateConfig {
+	return RedisChannelStateConfig{
+		Enabled: func(_ string) bool {
+			return true
+		},
+		Handler:           handler.handle,
+		NumPartitions:     1,
+		SweepInterval:     testChannelStateSweepInterval,
+		VacatedEventDelay: testChannelStateVacatedDelay,
+		LeaseTTL:          testChannelStateLeaseTTL,
+	}
+}
+
+// TestRedisChannelStateLostLeaseKeepsOneConsumer deletes the lease of a partition while its handler call is
+// blocked. The node gives the partition up, and it must not start a second consumer for the partition while the
+// first one still runs, even though the lease is free in Redis.
+func TestRedisChannelStateLostLeaseKeepsOneConsumer(t *testing.T) {
+	t.Parallel()
+	handler := newTestBlockingHandler()
+	node := testStateNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testBlockingChannelStateConfig(handler), 0, false, 6379)
+	t.Cleanup(handler.unblock)
+	require.NoError(t, pm.AddPresence("lost-lease", "client-1", &ClientInfo{}))
+	require.Eventually(t, func() bool {
+		return handler.inFlight.Load() == 1
+	}, 3*testChannelStateLeaseTTL, 5*time.Millisecond)
+
+	// The lease is gone from Redis while the handler still runs, as when another owner takes it.
+	client := pm.shards[0].client
+	require.NoError(t, client.Do(context.Background(), client.B().Del().Key(string(pm.state.partitionKey(0, "lease"))).Build()).Error())
+
+	// The lease loop gives the partition up on its next renewal. No second call may start while the first one is
+	// blocked, for several lease intervals.
+	require.Never(t, func() bool {
+		return handler.calls.Load() > 1
+	}, 4*testChannelStateLeaseTTL, 5*time.Millisecond)
+	require.Equal(t, int32(1), handler.peak.Load())
+	require.Equal(t, 0, testOwnedPartitions(t, pm))
+}
+
+// TestRedisChannelStateCloseReleasesWhileConsumerHangs closes the presence manager while a handler call ignores
+// its context. Close releases the leases and removes the membership before it waits for the consumer, so the
+// leases are gone when Close returns with the context error.
+func TestRedisChannelStateCloseReleasesWhileConsumerHangs(t *testing.T) {
+	t.Parallel()
+	handler := newTestBlockingHandler()
+	node := testStateNode(t)
+	prefix := getUniqueStatePrefix()
+	pm := newTestRedisPresenceStateManager(t, node, prefix, testBlockingChannelStateConfig(handler), 0, false, 6379)
+	t.Cleanup(handler.unblock)
+	require.NoError(t, pm.AddPresence("hung-close", "client-1", &ClientInfo{}))
+	require.Eventually(t, func() bool {
+		return handler.inFlight.Load() == 1
+	}, 3*testChannelStateLeaseTTL, 5*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.ErrorIs(t, pm.Close(ctx), context.DeadlineExceeded)
+
+	client := pm.shards[0].client
+	keys, err := client.Do(context.Background(), client.B().Keys().Pattern(prefix+".channel_state.*").Build()).AsStrSlice()
+	require.NoError(t, err)
+	for _, key := range keys {
+		require.False(t, strings.HasSuffix(key, ".lease"), "lease held after Close: %s", key)
+	}
+	members, err := client.Do(context.Background(), client.B().Zcard().Key(pm.state.workersKey).Build()).AsInt64()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), members)
 }
 
 // countChannelStateGoroutines counts the goroutines that run the channel state worker.
