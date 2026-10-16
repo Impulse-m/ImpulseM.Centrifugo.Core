@@ -64,10 +64,15 @@ type ChannelStateEvent struct {
 // ChannelStateHandler delivers one batch of a partition, in order. A non-nil error
 // makes the batch be delivered again after a backoff. The context is cancelled when
 // the presence manager is closed or the partition moves to another node. The handler
-// must return once ctx is done. When a partition moves to another node, its lease is
-// released only after a running handler has returned. Close releases the leases first
-// and then waits for the running handlers, up to the context of Close: a handler that
-// is still running after that may deliver its batch while another node takes the partition.
+// must return once ctx is done. When a partition moves to another node, its owner releases
+// the lease only after a running handler has returned. A lease that expires instead, because
+// its owner stalled or failed to renew it, can be taken while the old handler still runs: a
+// handler that overruns ctx may deliver its batch beside the new owner, and a batch stalled
+// past the lease TTL can reach the handler after later events of its channels. The backend
+// must therefore reconcile by presence, not rely on the order of events across owners.
+// Close releases the leases first and then waits for the running handlers, up to the context
+// of Close: a handler that is still running after that may deliver its batch while another
+// node takes the partition.
 type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) error
 
 // RedisChannelStateConfig enables channel state events (occupied, vacated) in

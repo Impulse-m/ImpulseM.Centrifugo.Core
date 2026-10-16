@@ -366,8 +366,9 @@ func (w *channelStateWorker) retire(parts []*channelStatePartition, release bool
 
 // shutdown stops the worker when Close is called. It cancels the consumers and releases the leases of the owned
 // partitions, and of the retiring ones whose release is pending, before it waits for any consumer, so a consumer
-// stuck in a call that ignores its context does not hold the leases of the others. The releases and the membership
-// removal are bounded by the call timeout. The wait for the consumers and the background work comes last and has
+// stuck in a call that ignores its context does not hold the leases of the others. The releases, the wait for the
+// heartbeat and the membership removal are each bounded by the call timeout, so the membership can be removed up to
+// three call timeouts after Close starts. The wait for the consumers and the background work comes last and has
 // no bound of its own: Close bounds it with its context. A consumer that runs past the release of its lease may
 // deliver one more batch, which at-least-once delivery allows.
 func (w *channelStateWorker) shutdown() {
