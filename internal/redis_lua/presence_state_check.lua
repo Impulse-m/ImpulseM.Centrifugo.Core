@@ -33,8 +33,6 @@ end
 
 -- The expire entry is removed by the sweep when it resolves the channel, so a missing entry
 -- means another sweep resolved the channel already: a stale check must not arm a new delay.
--- The expire entry is removed by the sweep when it resolves the channel, so a missing entry
--- means another sweep resolved the channel already: a stale check must not arm a new delay.
 local hadExpire = redis.call("zrem", KEYS[5], ARGV[1]) == 1
 local fire = redis.call("zscore", KEYS[4], ARGV[1])
 if not fire then
