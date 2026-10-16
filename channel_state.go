@@ -158,13 +158,13 @@ func (w *channelStateWorker) renewOwned(ctx context.Context) {
 		start := time.Now()
 		results := w.state.renewScript.ExecMulti(ctx, sh.client, execs...)
 		var failed []int
+		var errs callErrors
 		for i, res := range results {
 			p := partitions[i]
 			renewed, err := res.AsInt64()
 			switch {
 			case err != nil:
-				w.state.metrics.incSweepErrors()
-				w.logError(err, "channel state lease renew failed", p)
+				errs.add(err, p)
 				failed = append(failed, p)
 			case renewed != 1:
 				lost = append(lost, p)
@@ -176,6 +176,7 @@ func (w *channelStateWorker) renewOwned(ctx context.Context) {
 			w.stopPartition(p, w.owned[p])
 		}
 		w.releaseLeases(sh, failed)
+		w.reportCallErrors("channel state lease renew failed", errs)
 	}
 	for _, p := range lost {
 		w.stopPartition(p, w.owned[p])
@@ -259,34 +260,27 @@ func (w *channelStateWorker) acquire(ctx context.Context, need int) {
 		free = free[:need]
 	}
 	start := time.Now()
-	var firstErr error
-	var errPartition int
 	for sh, partitions := range w.state.partitionsByShard(free) {
 		cmds := make([]rueidis.Completed, 0, len(partitions))
 		for _, p := range partitions {
 			cmds = append(cmds, sh.client.B().Set().Key(w.leaseKey(p)).Value(w.node.uid).Nx().PxMilliseconds(w.state.leaseTTL.Milliseconds()).Build())
 		}
 		var failed []int
+		var errs callErrors
 		for i, res := range sh.client.DoMulti(ctx, cmds...) {
 			err := res.Error()
 			switch {
 			case rueidis.IsRedisNil(err):
 				// Another node holds the lease.
 			case err != nil:
-				w.state.metrics.incSweepErrors()
-				if firstErr == nil {
-					firstErr = err
-					errPartition = partitions[i]
-				}
+				errs.add(err, partitions[i])
 				failed = append(failed, partitions[i])
 			default:
 				w.startPartition(partitions[i], start)
 			}
 		}
 		w.releaseLeases(sh, failed)
-	}
-	if firstErr != nil {
-		w.logError(firstErr, "channel state lease acquire failed", errPartition)
+		w.reportCallErrors("channel state lease acquire failed", errs)
 	}
 }
 
@@ -514,12 +508,11 @@ func (w *channelStateWorker) releaseLeases(sh *RedisShard, partitions []int) {
 			Args: []string{w.node.uid},
 		})
 	}
+	var errs callErrors
 	for i, res := range w.state.releaseScript.ExecMulti(ctx, sh.client, execs...) {
-		if err := res.Error(); err != nil {
-			w.state.metrics.incSweepErrors()
-			w.logError(err, "channel state lease release failed", partitions[i]) //nolint:gosec // ExecMulti returns one result per exec, one exec per partition.
-		}
+		errs.add(res.Error(), partitions[i]) //nolint:gosec // ExecMulti returns one result per exec, one exec per partition.
 	}
+	w.reportCallErrors("channel state lease release failed", errs)
 }
 
 // wait sleeps the next backoff delay. It returns false when ctx is done first.
@@ -537,6 +530,35 @@ func (w *channelStateWorker) wait(ctx context.Context, backoff *channelStateBack
 
 func (w *channelStateWorker) logError(err error, message string, p int) {
 	w.node.logger.log(newErrorLogEntry(err, message, map[string]any{"partition": p}))
+}
+
+// callErrors collects the errors of the commands of one call to a shard. The call counts as one sweep
+// error and logs its first error, with the partition of that error and how many commands failed.
+type callErrors struct {
+	first     error
+	partition int
+	failed    int
+}
+
+// add records the outcome of the command of the partition. A nil error is not a failure.
+func (e *callErrors) add(err error, p int) {
+	if err == nil {
+		return
+	}
+	if e.first == nil {
+		e.first = err
+		e.partition = p
+	}
+	e.failed++
+}
+
+// reportCallErrors counts one sweep error for the call and logs its first error, if it failed.
+func (w *channelStateWorker) reportCallErrors(message string, errs callErrors) {
+	if errs.first == nil {
+		return
+	}
+	w.state.metrics.incSweepErrors()
+	w.node.logger.log(newErrorLogEntry(errs.first, message, map[string]any{"partition": errs.partition, "failed": errs.failed}))
 }
 
 // next returns the delay before the next attempt and doubles the one after it.
