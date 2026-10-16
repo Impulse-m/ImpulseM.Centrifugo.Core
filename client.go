@@ -77,8 +77,13 @@ func (c *Client) OnRefresh(h RefreshHandler) {
 
 // OnDisconnect allows setting DisconnectHandler.
 // DisconnectHandler called when client disconnected.
+// Safe to call at any time, also from another goroutine while the client closes:
+// close reads the handler under c.mu, so a handler set concurrently is either
+// called by close or not at all. Must not be called while c.mu is held.
 func (c *Client) OnDisconnect(h DisconnectHandler) {
+	c.mu.Lock()
 	c.eventHub.disconnectHandler = h
+	c.mu.Unlock()
 }
 
 // OnMessage allows setting MessageHandler.
@@ -1801,6 +1806,9 @@ func (c *Client) close(disconnect Disconnect) error {
 		return nil
 	}
 	prevStatus := c.status
+	// Read under c.mu, with OnDisconnect writing it under c.mu: a handler set
+	// while the connection closes is either called below or not at all.
+	disconnectHandler := c.eventHub.disconnectHandler
 	// Capture c.user under c.mu: connectCmd writes it under c.mu, and close can
 	// race connectCmd (e.g. the stale-connection timer firing during a slow
 	// connect), so the disconnect logs below must not read it lock-free.
@@ -1897,8 +1905,8 @@ func (c *Client) close(disconnect Disconnect) error {
 	if disconnect.Code != DisconnectConnectionClosed.Code {
 		c.node.metrics.incServerDisconnect(disconnect.Code, c)
 	}
-	if c.eventHub.disconnectHandler != nil && prevStatus == statusConnected {
-		c.eventHub.disconnectHandler(DisconnectEvent{
+	if disconnectHandler != nil && prevStatus == statusConnected {
+		disconnectHandler(DisconnectEvent{
 			Disconnect: disconnect,
 		})
 	}
