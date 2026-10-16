@@ -1,7 +1,7 @@
 Unreleased fork changes
 =======================
 
-* Channel state events `occupied` and `vacated` in `RedisPresenceManager`, enabled per channel with `RedisPresenceManagerConfig.ChannelState` and delivered to a `ChannelStateHandler` in batches and partition order. Partitions are leased between nodes, a vacated event waits for `VacatedEventDelay`, and delivery is at least once. The partitions are divided among the nodes that run channel state: each one publishes itself as a worker in a set with a heartbeat of LeaseTTL, so nodes without channel state take no share and a rolling enable is safe. Partitions of a crashed worker move to the others about LeaseTTL after its last heartbeat. Metrics are in the `channel_state` subsystem.
+* Channel state events `occupied` and `vacated` in `RedisPresenceManager`, enabled per channel with `RedisPresenceManagerConfig.ChannelState` and delivered to a `ChannelStateHandler` in batches and partition order. Partitions are leased between nodes, a vacated event waits for `VacatedEventDelay`, and delivery is at least once. The partitions are divided among the nodes that run channel state: each one publishes itself as a worker in a set with a heartbeat of LeaseTTL, so nodes without channel state take no share and a rolling enable keeps every partition consumed. Partitions of a crashed worker move to the others about LeaseTTL after its last heartbeat, and while the first shard is unreachable a worker takes the free partitions. The presence of an enabled channel is split when only some nodes run the configuration, so deploy it to all nodes before clients subscribe to an enabled channel. Metrics are in the `channel_state` subsystem.
 
 v0.29.4 and higher
 ==================

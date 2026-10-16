@@ -74,9 +74,16 @@ type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) e
 // The partitions are divided among the nodes that run channel state, the workers of the prefix.
 // A worker publishes itself in a set on the first Redis shard on every lease cycle, and an entry
 // expires after LeaseTTL unless it is renewed. Nodes without channel state are not counted, so
-// a rolling enable on some nodes is safe: every partition has a consumer while one worker runs.
-// When a worker crashes, its partitions move to the survivors after about LeaseTTL, and a worker
-// that shuts down hands its partitions over at once.
+// a rolling enable on some nodes keeps every partition consumed while one worker runs. When a
+// worker crashes, its partitions move to the survivors after about LeaseTTL, and a worker that
+// shuts down hands its partitions over at once. While the first shard cannot be reached the count
+// is unknown: a worker keeps its partitions and takes the free ones until the count is back.
+//
+// Presence is not split across the partitions. The presence of an enabled channel is kept in its own
+// keys, which a node without channel state does not read. Deploy the configuration to every node of
+// the prefix before a client subscribes to an enabled channel. Otherwise the events and the presence
+// of that channel are split between the two layouts, and a vacated event can go out while a client on
+// another node is still subscribed.
 //
 // Membership uses the wall clock of each node. Clock skew between the workers larger than LeaseTTL
 // only shifts the division of the partitions; the leases still keep one consumer per partition.
