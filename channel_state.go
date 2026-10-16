@@ -211,7 +211,12 @@ func awaitCall[T any](ch <-chan callResult[T], expired <-chan struct{}) (res cal
 	case res = <-ch:
 		return res, true
 	case <-expired:
-		return callResult[T]{err: errCallTimeout}, false
+		select {
+		case res = <-ch:
+			return res, true
+		default:
+			return callResult[T]{err: errCallTimeout}, false
+		}
 	}
 }
 
