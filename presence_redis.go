@@ -149,7 +149,7 @@ func (m *RedisPresenceManager) Close(ctx context.Context) error {
 }
 
 func (m *RedisPresenceManager) getShard(channel string) *RedisShard {
-	if m.state != nil && m.state.enabled(channel) {
+	if m.state.stateEnabled(channel) {
 		return m.state.shardOf(m.state.partition(channel))
 	}
 	if !m.sharding {
@@ -206,7 +206,7 @@ func (m *RedisPresenceManager) useHashFieldTTLArg() string {
 }
 
 func (m *RedisPresenceManager) addPresence(s *RedisShard, ch string, uid string, info *ClientInfo) error {
-	if m.state != nil && m.state.enabled(ch) {
+	if m.state.stateEnabled(ch) {
 		return m.state.addPresence(s, ch, uid, info)
 	}
 	keys, args, err := m.addPresenceScriptKeysArgs(s, ch, uid, info)
@@ -242,7 +242,7 @@ func (m *RedisPresenceManager) removePresenceScriptKeysArgs(s *RedisShard, ch st
 }
 
 func (m *RedisPresenceManager) removePresence(s *RedisShard, ch string, clientID string, userID string) error {
-	if m.state != nil && m.state.enabled(ch) {
+	if m.state.stateEnabled(ch) {
 		return m.state.removePresence(s, ch, clientID, userID)
 	}
 	keys, args, err := m.removePresenceScriptKeysArgs(s, ch, clientID, userID)
@@ -395,7 +395,7 @@ func (m *RedisPresenceManager) PresenceStats(ch string) (PresenceStats, error) {
 // checkChannel refuses a channel whose keys could not share a slot. Presence
 // keys are tagged by channel in any cluster - see errRedisUnsupportedChannel.
 func (m *RedisPresenceManager) checkChannel(ch string) error {
-	if m.state != nil && m.state.enabled(ch) {
+	if m.state.stateEnabled(ch) {
 		// The keys of the channel are tagged by its partition, not by the channel.
 		return nil
 	}
@@ -406,7 +406,7 @@ func (m *RedisPresenceManager) checkChannel(ch string) error {
 }
 
 func (m *RedisPresenceManager) presenceHashKey(s *RedisShard, ch string) channelID {
-	if m.state != nil && m.state.enabled(ch) {
+	if m.state.stateEnabled(ch) {
 		return m.state.stateHashKey(ch)
 	}
 	if !s.isCluster {
@@ -425,7 +425,7 @@ func (m *RedisPresenceManager) presenceHashKey(s *RedisShard, ch string) channel
 }
 
 func (m *RedisPresenceManager) presenceSetKey(s *RedisShard, ch string) channelID {
-	if m.state != nil && m.state.enabled(ch) {
+	if m.state.stateEnabled(ch) {
 		return m.state.stateSetKey(ch)
 	}
 	if !s.isCluster {
@@ -444,7 +444,7 @@ func (m *RedisPresenceManager) presenceSetKey(s *RedisShard, ch string) channelI
 }
 
 func (m *RedisPresenceManager) userSetKey(s *RedisShard, ch string) channelID {
-	if m.state != nil && m.state.enabled(ch) {
+	if m.state.stateEnabled(ch) {
 		return m.state.stateUserSetKey(ch)
 	}
 	if !s.isCluster {
@@ -463,7 +463,7 @@ func (m *RedisPresenceManager) userSetKey(s *RedisShard, ch string) channelID {
 }
 
 func (m *RedisPresenceManager) userHashKey(s *RedisShard, ch string) channelID {
-	if m.state != nil && m.state.enabled(ch) {
+	if m.state.stateEnabled(ch) {
 		return m.state.stateUserHashKey(ch)
 	}
 	if !s.isCluster {

@@ -225,6 +225,12 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 	return s, nil
 }
 
+// stateEnabled reports whether the channel keeps channel state. A nil state, a manager without
+// channel state, keeps no channel state, so the guards of the presence manager need no nil check.
+func (s *presenceState) stateEnabled(channel string) bool {
+	return s != nil && s.enabled(channel)
+}
+
 // partition returns the channel state partition of the channel.
 func (s *presenceState) partition(channel string) int {
 	return index(channel, s.numPartitions)
