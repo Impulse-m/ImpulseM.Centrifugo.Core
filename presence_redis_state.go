@@ -108,6 +108,7 @@ type presenceState struct {
 	handler           ChannelStateHandler
 	numPartitions     int
 	partitionShards   []int
+	partitionTags     []string
 	vacatedEventDelay time.Duration
 	maxStreamLength   int
 	sweepInterval     time.Duration
@@ -175,8 +176,10 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 	}
 
 	partitionShards := make([]int, numPartitions)
+	partitionTags := make([]string, numPartitions)
 	for p := range partitionShards {
 		partitionShards[p] = consistentIndex("cs"+strconv.Itoa(p), len(m.shards))
+		partitionTags[p] = m.config.Prefix + ".channel_state.{cs" + strconv.Itoa(p) + "}."
 	}
 
 	s := &presenceState{
@@ -185,6 +188,7 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 		handler:           config.Handler,
 		numPartitions:     numPartitions,
 		partitionShards:   partitionShards,
+		partitionTags:     partitionTags,
 		vacatedEventDelay: vacatedEventDelay,
 		maxStreamLength:   maxStreamLength,
 		sweepInterval:     sweepInterval,
@@ -215,7 +219,7 @@ func (s *presenceState) shardOf(p int) *RedisShard {
 // partitionKey returns a key of the partition: all of them share the tag of the partition,
 // so one script may touch the channel keys and the partition keys in Redis Cluster.
 func (s *presenceState) partitionKey(p int, suffix string) channelID {
-	return channelID(s.manager.config.Prefix + ".channel_state.{cs" + strconv.Itoa(p) + "}." + suffix)
+	return channelID(s.partitionTags[p] + suffix)
 }
 
 // presenceKey returns a presence key of the channel, tagged with the partition of the channel. The key
@@ -223,7 +227,7 @@ func (s *presenceState) partitionKey(p int, suffix string) channelID {
 // channel state always start with prefix.presence., so no channel name can make them collide with the
 // keys of a channel with channel state.
 func (s *presenceState) presenceKey(channel string, kind string) channelID {
-	return channelID(s.manager.config.Prefix + ".channel_state.{cs" + strconv.Itoa(s.partition(channel)) + "}.presence." + kind + "." + channel)
+	return channelID(s.partitionTags[s.partition(channel)] + "presence." + kind + "." + channel)
 }
 
 func (s *presenceState) stateHashKey(channel string) channelID {
