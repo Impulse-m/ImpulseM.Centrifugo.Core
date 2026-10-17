@@ -4,6 +4,7 @@ package centrifuge
 // false for a client which is closed or not yet connected: close reads the handler in the critical section which marks
 // the client closed and runs it only for a connected client, so a handler set here always runs when the client closes,
 // and a caller which gets false knows that nothing it attaches to the connection will be released by a handler.
+// It replaces the DisconnectHandler which is set at the time, including one set by OnDisconnect.
 // Must not be called while c.mu is held.
 func (c *Client) OnDisconnectIfConnected(h DisconnectHandler) bool {
 	c.mu.Lock()
