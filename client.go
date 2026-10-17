@@ -5774,10 +5774,10 @@ func (c *Client) handleAsyncUnsubscribe(ch string, subGen uint64, unsub Unsubscr
 
 func (c *Client) writePublicationUpdatePosition(
 	ch string, pub *protocol.Publication, prep preparedData, sp StreamPosition, maxLagExceeded bool,
-	batchConfig ChannelBatchConfig,
+	batchConfig ChannelBatchConfig, nowUnix int64,
 ) error {
 	c.mu.Lock()
-	data, ok := c.publicationDataUpdatePositionLocked(ch, pub, prep, sp, maxLagExceeded)
+	data, ok := c.publicationDataUpdatePositionLocked(ch, pub, prep, sp, maxLagExceeded, nowUnix)
 	c.mu.Unlock()
 	if !ok {
 		return nil
@@ -5791,8 +5791,12 @@ func (c *Client) writePublicationUpdatePosition(
 // publicationDataUpdatePositionLocked checks a publication with offset against
 // the subscription to ch and advances its position. It returns the data to write
 // to the client, ok is false if nothing must be written. c.mu must be held.
+//
+// nowUnix is the time the position counts as checked at, read once per broadcast
+// rather than per subscriber. Zero means read it here.
 func (c *Client) publicationDataUpdatePositionLocked(
 	ch string, pub *protocol.Publication, prep preparedData, sp StreamPosition, maxLagExceeded bool,
+	nowUnix int64,
 ) ([]byte, bool) {
 	channelContext, ok := c.channels[ch]
 	if !ok || !channelHasFlag(channelContext.flags, flagSubscribed) {
@@ -5877,7 +5881,10 @@ func (c *Client) publicationDataUpdatePositionLocked(
 		// here. Safe to just skip for the subscriber.
 		return nil, false
 	}
-	channelContext.positionCheckTime = time.Now().Unix()
+	if nowUnix == 0 {
+		nowUnix = time.Now().Unix()
+	}
+	channelContext.positionCheckTime = nowUnix
 	channelContext.streamPosition.Offset = pub.Offset
 	if hasFlag(c.transport.DisabledPushFlags(), PushFlagPublication) {
 		c.channels[ch] = channelContext
@@ -5905,10 +5912,12 @@ func (c *Client) writePublicationNoDelta(ch string, pub *protocol.Publication, d
 		ch, pub, preparedData{
 			fullData: data, brokerDeltaData: nil, localDeltaData: nil, deltaSub: false, wasFiltered: false,
 		},
-		sp, false, batchConfig)
+		sp, false, batchConfig, 0)
 }
 
-func (c *Client) writePublication(ch string, pub *protocol.Publication, prep preparedData, sp StreamPosition, maxLagExceeded bool, batchConfig ChannelBatchConfig) error {
+// writePublication writes a publication broadcast to ch. nowUnix is the broadcast
+// time (see publicationDataUpdatePositionLocked), zero if the caller has none.
+func (c *Client) writePublication(ch string, pub *protocol.Publication, prep preparedData, sp StreamPosition, maxLagExceeded bool, batchConfig ChannelBatchConfig, nowUnix int64) error {
 	if c.pubSubSync.Buffering() {
 		// The client may be subscribing to ch: the publication goes to its recovery
 		// buffer, or is queued until the subscription's result is written (or, without
@@ -5918,7 +5927,7 @@ func (c *Client) writePublication(ch string, pub *protocol.Publication, prep pre
 			syncPub = prep.filteredPub
 		}
 		if c.pubSubSync.SyncPublication(ch, syncPub, sp.Epoch, len(prep.fullData), pendingPublication{
-			channel: ch, pub: pub, prep: prep, sp: sp, maxLagExceeded: maxLagExceeded, batchConfig: batchConfig,
+			channel: ch, pub: pub, prep: prep, sp: sp, maxLagExceeded: maxLagExceeded, batchConfig: batchConfig, nowUnix: nowUnix,
 		}, c.node.config.ClientQueueMaxSize) {
 			return nil
 		}
@@ -5926,7 +5935,7 @@ func (c *Client) writePublication(ch string, pub *protocol.Publication, prep pre
 	if pub.Offset == 0 {
 		return c.writeOffsetlessPublication(ch, pub, prep, batchConfig)
 	}
-	_ = c.writePublicationUpdatePosition(ch, pub, prep, sp, maxLagExceeded, batchConfig)
+	_ = c.writePublicationUpdatePosition(ch, pub, prep, sp, maxLagExceeded, batchConfig, nowUnix)
 	return nil
 }
 
@@ -5943,18 +5952,21 @@ func (c *Client) writeOffsetlessPublication(ch string, pub *protocol.Publication
 		return nil
 	}
 
+	// The client is in the hub from addSubscription on, but subscribed only once the
+	// subscription is committed. A subscribe attempt which fails after
+	// addSubscription cancels its buffer before it leaves the hub: without this
+	// check its publications would reach the client meanwhile.
+	c.mu.RLock()
+	channelContext, ok := c.channels[ch]
+	c.mu.RUnlock()
+	if !ok || !channelHasFlag(channelContext.flags, flagSubscribed) {
+		return nil
+	}
+
 	if prep.deltaSub {
 		// For this path (no Offset) delta may come from channel medium layer, so that we can use it
 		// here if allowed for the connection.
-		c.mu.RLock()
-		channelContext, ok := c.channels[ch]
-		if !ok {
-			c.mu.RUnlock()
-			return nil
-		}
 		deltaAllowed := channelHasFlag(channelContext.flags, flagDeltaAllowed)
-		c.mu.RUnlock()
-
 		if deltaAllowed {
 			if c.node.logEnabled(LogLevelTrace) {
 				c.traceOutPush(&protocol.Push{Channel: ch, Pub: pub})
@@ -5985,6 +5997,9 @@ type pendingPublication struct {
 	sp             StreamPosition
 	maxLagExceeded bool
 	batchConfig    ChannelBatchConfig
+	// nowUnix is the broadcast time: written later, the position counts as
+	// checked a bit earlier than it was, which only brings the next check closer.
+	nowUnix int64
 }
 
 // writePendingPublication checks and writes a queued publication under c.mu. The
@@ -5995,7 +6010,7 @@ type pendingPublication struct {
 // Broadcasts get the same order from the hub shard lock.
 func (c *Client) writePendingPublication(q pendingPublication) {
 	c.mu.Lock()
-	data, ok := c.publicationDataUpdatePositionLocked(q.channel, q.pub, q.prep, q.sp, q.maxLagExceeded)
+	data, ok := c.publicationDataUpdatePositionLocked(q.channel, q.pub, q.prep, q.sp, q.maxLagExceeded, q.nowUnix)
 	if ok {
 		_ = c.writeEncodedPushData(data, q.channel, q.pub.Key, protocol.FrameTypePushPublication, q.batchConfig)
 	}
@@ -6291,6 +6306,7 @@ func (c *Client) unsubscribeWaiting(channel string, unsubscribe Unsubscribe, dis
 	}
 	// Clean up map subscribing state. Identity-match against the snapshot so we
 	// don't close a fresh entry installed by a concurrent resubscribe.
+	removedMapLoad := false
 	if hasKeyedState {
 		if state, exists := c.mapSubscribing[channel]; exists && state == keyedState {
 			if state.subscribingCh != nil {
@@ -6299,8 +6315,15 @@ func (c *Client) unsubscribeWaiting(channel string, unsubscribe Unsubscribe, dis
 			delete(c.mapSubscribing, channel)
 			removedNow = true
 			endedAttempt = true
+			removedMapLoad = true
 		}
 	}
+	// The push goes only to a client which knows about the subscription: it got
+	// the subscribe result, or the replies of a map subscribe loading. A
+	// reservation is removed without its subscribe having written a result when
+	// a wait for the subscribe timed out (the client is being disconnected then):
+	// the subscribe fails, nothing of the channel may come before its result.
+	pushUnsubscribe := push && (removedMapLoad || channelHasFlag(chCtx.flags, flagSubscribed))
 	if removedNow && disconnect == nil && c.perChannelWriter != nil {
 		c.perChannelWriter.delWriter(channel, false)
 	}
@@ -6374,7 +6397,7 @@ func (c *Client) unsubscribeWaiting(channel string, unsubscribe Unsubscribe, dis
 		c.perChannelWriter.delWriter(channel, false)
 	}
 	if push {
-		if err == nil {
+		if err == nil && pushUnsubscribe {
 			_ = c.sendUnsubscribe(channel, unsubscribe)
 		}
 		c.finishPendingLeave(channel)
