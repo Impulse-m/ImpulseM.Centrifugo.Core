@@ -15,3 +15,24 @@ func (c *Client) OnDisconnectIfConnected(h DisconnectHandler) bool {
 	c.eventHub.disconnectHandler = h
 	return true
 }
+
+// BeginDisconnect starts closing the client with disconnect, as Disconnect does, and marks it closing before it returns,
+// so Closing reports true from then on although the close itself runs in its own goroutine. It reports false and starts
+// nothing when a close of the client has begun already: that close completes with its own disconnect, as a second
+// Disconnect would. A client which is still connecting is closed once its connect completes, as with Disconnect.
+func (c *Client) BeginDisconnect(disconnect Disconnect) bool {
+	if c.closing.Swap(true) {
+		return false
+	}
+	go func() {
+		_ = c.close(disconnect)
+	}()
+	return true
+}
+
+// Closing reports whether a close of the client has begun: by BeginDisconnect, by the goroutine of Disconnect, or by the
+// transport. It stays true once the client is closed. A client which reports false has no close begun: it is new,
+// connecting or connected.
+func (c *Client) Closing() bool {
+	return c.closing.Load()
+}
