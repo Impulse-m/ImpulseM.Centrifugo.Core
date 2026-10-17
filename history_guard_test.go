@@ -27,7 +27,10 @@ func TestClientHistoryRefusedWhenSubscribeCommitsDuringCall(t *testing.T) {
 	node.OnConnect(func(client *Client) {
 		client.OnSubscribe(func(e SubscribeEvent, cb SubscribeCallback) {
 			go func() {
-				<-releaseSub
+				select {
+				case <-releaseSub:
+				case <-time.After(historyGuardWaitLimit):
+				}
 				cb(SubscribeReply{Options: filteredSubscribeOptions()}, nil)
 				close(subDone)
 			}()
@@ -68,7 +71,10 @@ func TestClientHistoryRefusedWhenUnsubscribedDuringCall(t *testing.T) {
 	node.OnConnect(func(client *Client) {
 		client.OnSubscribe(func(e SubscribeEvent, cb SubscribeCallback) {
 			go func() {
-				<-releaseSub
+				select {
+				case <-releaseSub:
+				case <-time.After(historyGuardWaitLimit):
+				}
 				cb(SubscribeReply{Options: filteredSubscribeOptions()}, nil)
 				close(subDone)
 			}()
@@ -126,7 +132,9 @@ func TestClientHistoryRefusedWhenFilteredSubscriptionComesAndGoesDuringCall(t *t
 }
 
 // A subscribe in flight at the callback (a reservation, without a committed
-// subscription) must not get the history served.
+// subscription) must not get the history served. The counter row also refuses
+// this case, since the subscribe takes a new generation, so the test pins the
+// result and not the individual row.
 func TestClientHistoryRefusedWhenReservationAtCallback(t *testing.T) {
 	t.Parallel()
 	node := defaultNodeNoHandlers()
@@ -146,11 +154,17 @@ func TestClientHistoryRefusedWhenReservationAtCallback(t *testing.T) {
 	client := newTestConnectedClientV2(t, node, "user1")
 	publishHistoryForTest(t, node, "g")
 
+	// Deferred after the Shutdown defer, so it runs first and a failed
+	// assertion does not leave the subscribe parked for the shutdown to wait on.
+	defer func() {
+		if parkedSub != nil {
+			parkedSub(SubscribeReply{}, nil)
+		}
+	}()
+
 	histRW := testReplyWriterWrapper()
 	require.NoError(t, client.handleHistory(&protocol.HistoryRequest{Channel: "g", Limit: 100}, &protocol.Command{Id: 2}, time.Now(), histRW.rw))
 	requireHistoryRefusedReply(t, histRW)
-
-	parkedSub(SubscribeReply{}, nil)
 }
 
 // Nothing subscribed on entry or at the callback, and no subscription was
@@ -306,7 +320,8 @@ func TestClientHistoryRefusedWhenRefreshAddsFilterDuringCall(t *testing.T) {
 
 // A map subscription which starts loading while the application decides on
 // history (an entry in mapSubscribing at the callback only) makes the callback
-// refuse it.
+// refuse it. The counter row also refuses this case, since seedMapSubscribing
+// takes a new generation, so the test pins the result and not the individual row.
 func TestClientHistoryRefusedWhenMapSubscribeStartsDuringCall(t *testing.T) {
 	t.Parallel()
 	node := defaultNodeNoHandlers()
