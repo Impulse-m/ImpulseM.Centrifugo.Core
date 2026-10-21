@@ -5,7 +5,6 @@ Unreleased fork changes
 * History is refused with permission denied when a subscription of the client changed while the application decided on it, and the application may retry the call. This covers a history call racing a subscribe, unsubscribe or resubscribe of its channel, with or without a server tags filter, a map subscription loading, and, for a client which may read history without a subscription, any subscribe the client starts during the call.
 * `Client.OnDisconnectIfConnected` sets the disconnect handler of a connected client and reports whether it was set. It reports false for a closed or not yet connected client, and the handler of a client which reports true runs when the client closes, until another handler is set, so a caller may attach state to the connection and release it in the handler.
 * `Client.BeginDisconnect` starts closing a client as `Disconnect` does and marks it closing before it returns; `Client.Closing` reports whether a close has begun, so a caller which disconnects asynchronously can tell a client it already closes.
-* `Config.ClientPongAtWrite` starts the pong timeout when a ping is written to the transport, not when it is queued, so a ping held behind a large queue does not count against the pong timeout. The wait for the ping is then bounded by the socket send buffer, not by `ClientQueueMaxSize`. Off by default, and with it off nothing changes. Unidirectional transports and a client without a pong timeout are not affected.
 
 v0.29.4 and higher
 ==================
