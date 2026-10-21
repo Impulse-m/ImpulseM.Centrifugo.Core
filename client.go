@@ -2506,7 +2506,7 @@ func (c *Client) handleRefresh(req *protocol.RefreshRequest, cmd *protocol.Comma
 		ttl := expireAt - nowUnix
 
 		if ttl > 0 {
-			res.Ttl = uint32(ttl)
+			res.Ttl = replyTTL(c.node.config.ClientRefreshLead, ttl)
 		}
 
 		if expireAt > 0 {
@@ -4043,7 +4043,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 			c.node.logger.log(newLogEntry(LogLevelInfo, "connection expiration must be greater than now", map[string]any{"client": c.uid, "user": c.UserID()}))
 			return ErrorExpired
 		}
-		ttl = uint32(exp - now)
+		ttl = replyTTL(c.node.config.ClientRefreshLead, exp-now)
 	}
 	c.mu.RUnlock()
 

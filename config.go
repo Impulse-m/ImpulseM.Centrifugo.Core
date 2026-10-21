@@ -132,6 +132,11 @@ type Config struct {
 	// a client-side refresh workflow.
 	// Zero value means 25 * time.Second.
 	ClientExpiredCloseDelay time.Duration
+	// ClientRefreshLead is how long before its connection expires a client with
+	// client-side refresh is told to refresh. The ttl of connect and refresh replies
+	// is shortened by the lead, by at most half of the ttl. The expiry itself and
+	// ClientExpiredCloseDelay do not change. Whole seconds count. Zero means no lead.
+	ClientRefreshLead time.Duration
 	// ClientExpiredSubCloseDelay is an extra time given to client to
 	// refresh its expiring subscription in the end of subscription TTL.
 	// At the moment only used for a client-side subscription refresh workflow.
