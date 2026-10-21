@@ -13,6 +13,9 @@ type writerConfig struct {
 	WriteManyFn  func(...queue.Item) error
 	WriteFn      func(item queue.Item) error
 	MaxQueueSize int
+	// AfterPingWriteFn is called, with no writer lock held, after a drain
+	// that wrote a ping. Nil disables the call.
+	AfterPingWriteFn func()
 }
 
 // writer helps to manage per-connection message byte queue.
@@ -121,9 +124,13 @@ func (w *writer) waitSendMessage(maxMessagesInFrame int, writeDelay time.Duratio
 			writeErr = w.config.WriteManyFn(items...)
 		}
 
+		pingWritten := pingWrittenIn(w.config.AfterPingWriteFn, items)
 		putItemBuf(itemBuf)
 		w.mu.Unlock()
 		w.messages.FinishCollect(shrinkDelay)
+		if writeErr == nil && pingWritten {
+			w.config.AfterPingWriteFn()
+		}
 
 		if writeErr != nil {
 			// Write failed, transport must close itself, here we just return from routine.
@@ -169,8 +176,12 @@ func (w *writer) waitSendMessage(maxMessagesInFrame int, writeDelay time.Duratio
 		writeErr = w.config.WriteManyFn(items...)
 	}
 
+	pingWritten := pingWrittenIn(w.config.AfterPingWriteFn, items)
 	putItemBuf(itemBuf)
 	w.mu.Unlock()
+	if writeErr == nil && pingWritten {
+		w.config.AfterPingWriteFn()
+	}
 
 	if writeErr != nil {
 		// Write failed, transport must close itself, here we just return from routine.
@@ -246,6 +257,7 @@ func (w *writer) flush() {
 		writeErr = w.config.WriteManyFn(items...)
 	}
 
+	pingWritten := pingWrittenIn(w.config.AfterPingWriteFn, items)
 	putItemBuf(itemBuf)
 
 	// If there are still messages and no error, schedule another flush
@@ -262,6 +274,9 @@ func (w *writer) flush() {
 	}
 
 	w.mu.Unlock()
+	if writeErr == nil && pingWritten {
+		w.config.AfterPingWriteFn()
+	}
 	w.messages.FinishCollect(w.shrinkDelay)
 }
 

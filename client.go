@@ -335,6 +335,8 @@ type Client struct {
 	lastPing               int64
 	pingInterval           time.Duration
 	pongTimeout            time.Duration
+	pongAtWriteOn          bool // Set once in startWriter, see client_pong_at_write.go.
+	pingQueued             bool // Guarded by c.mu, see client_pong_at_write.go.
 	eventHub               *clientEventHub
 	timer                  *time.Timer
 	timerCanceler          TimerCanceler // TimerCanceler if TimerScheduler is used.
@@ -680,6 +682,10 @@ func getPingData(uni bool, protoType ProtocolType) []byte {
 }
 
 func (c *Client) sendPing() {
+	if c.pongAtWriteOn {
+		c.sendPingAtWrite()
+		return
+	}
 	c.mu.Lock()
 	c.lastPing = time.Now().UnixNano()
 	c.mu.Unlock()
@@ -3982,8 +3988,8 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 			}
 		}
 	} else {
-		c.startWriter(0, 0, 0, 0, false)
 		c.pingInterval, c.pongTimeout = getPingPongPeriodValues(c.transport.PingPongConfig())
+		c.startWriter(0, 0, 0, 0, false)
 	}
 
 	if channelLimit > 0 && len(subscriptions) > channelLimit {
@@ -4399,9 +4405,11 @@ func (c *Client) getConnectPushReply(res *protocol.ConnectResult) (*protocol.Rep
 
 func (c *Client) startWriter(batchDelay time.Duration, maxMessagesInFrame int, queueInitialCap int, queueShrinkDelay time.Duration, writeWithTimer bool) {
 	c.startWriterOnce.Do(func() {
+		c.pongAtWriteOn = c.node.config.ClientPongAtWrite && !c.transport.Unidirectional() && c.pongTimeout > 0
 		var writeMu sync.Mutex
 		messageWriterConf := writerConfig{
-			MaxQueueSize: c.node.config.ClientQueueMaxSize,
+			MaxQueueSize:     c.node.config.ClientQueueMaxSize,
+			AfterPingWriteFn: c.afterPingWriteFn(),
 			WriteFn: func(item queue.Item) error {
 				c.node.metrics.incTransportMessagesSent(c.transport.Name(), item.FrameType, item.Channel, len(item.Data), c)
 

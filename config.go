@@ -161,6 +161,9 @@ type Config struct {
 	// bytes. After this queue size exceeded Centrifuge closes client's connection.
 	// Zero value means 1048576 bytes (1MB).
 	ClientQueueMaxSize int
+	// ClientPongAtWrite starts the pong timeout when a ping is written to the
+	// transport, not when it is queued. Zero value means false.
+	ClientPongAtWrite bool
 	// ClientChannelLimit sets upper limit of client-side channels each client
 	// can subscribe to. Client-side subscriptions attempts will get an ErrorLimitExceeded
 	// in subscribe reply. Server-side subscriptions above limit will result into
