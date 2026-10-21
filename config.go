@@ -163,6 +163,8 @@ type Config struct {
 	ClientQueueMaxSize int
 	// ClientPongAtWrite starts the pong timeout when a ping is written to the
 	// transport, not when it is queued. Zero value means false.
+	// Needs bidirectional transport writes that are bounded (a positive write
+	// timeout). While a ping is blocked in a write, no pong timeout runs.
 	ClientPongAtWrite bool
 	// ClientChannelLimit sets upper limit of client-side channels each client
 	// can subscribe to. Client-side subscriptions attempts will get an ErrorLimitExceeded

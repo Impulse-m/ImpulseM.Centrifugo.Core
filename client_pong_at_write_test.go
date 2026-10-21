@@ -3,7 +3,6 @@ package centrifuge
 import (
 	"bytes"
 	"context"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -18,16 +17,23 @@ import (
 // gatedTransport is a bidirectional test transport. A ping waits for one token from gate, so a
 // test decides when the writer may write pings: admit adds tokens, and releaseAll lets
 // everything through. With gateAll every message waits, not only pings. A write of several
-// messages takes one token per waiting message.
+// messages takes one token per waiting message. The embedded testTransport supplies the other
+// methods; its Write and WriteMany are not called, so its sink and closed behaviour do not apply.
+// The counters and the callback use the embedded mutex.
 type gatedTransport struct {
 	*testTransport
 	gate    chan struct{}
 	gateAll bool
 	// onPingWritten, when set, runs inside a ping write once its token is taken, before the write returns.
 	onPingWritten func()
-	mu            sync.Mutex
 	pingAttempts  int
 	pingWrites    int
+}
+
+// pingCounts is how many ping messages reached the gate and how many passed it.
+type pingCounts struct {
+	attempts int
+	writes   int
 }
 
 func newGatedTransport(cancelFn func(), pingInterval, pongTimeout time.Duration) *gatedTransport {
@@ -52,11 +58,11 @@ func (t *gatedTransport) releaseAll() {
 	close(t.gate)
 }
 
-// counts returns how many ping messages reached the gate and how many passed it.
-func (t *gatedTransport) counts() (int, int) {
+// counts returns the ping counters.
+func (t *gatedTransport) counts() pingCounts {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.pingAttempts, t.pingWrites
+	return pingCounts{attempts: t.pingAttempts, writes: t.pingWrites}
 }
 
 func (t *gatedTransport) take(data []byte) {
@@ -128,6 +134,13 @@ type pongAtWriteFixture struct {
 	disconnectCode atomic.Uint32
 }
 
+// pongState is the client fields the tests check, read under the client lock.
+type pongState struct {
+	nextPong   int64
+	lastPing   int64
+	pingQueued bool
+}
+
 func newPongAtWriteFixture(t *testing.T, setup pongAtWriteSetup) *pongAtWriteFixture {
 	f := &pongAtWriteFixture{
 		node: defaultNodeNoHandlers(),
@@ -141,7 +154,9 @@ func newPongAtWriteFixture(t *testing.T, setup pongAtWriteSetup) *pongAtWriteFix
 			f.disconnectCode.Store(event.Disconnect.Code)
 		})
 	})
-	ctx, cancelFn := context.WithCancel(context.Background())
+	var ctx context.Context
+	var cancelFn context.CancelFunc
+	ctx, cancelFn = context.WithCancel(context.Background())
 	f.transport = newGatedTransport(cancelFn, setup.pingInterval, setup.pongTimeout)
 	f.transport.setUnidirectional(setup.uni)
 	f.transport.gateAll = setup.gateAll
@@ -160,16 +175,20 @@ func (f *pongAtWriteFixture) shutdown() {
 	_ = f.node.Shutdown(context.Background())
 }
 
-// deliverPong sends the pong for the outstanding ping, the way the reader does.
+// deliverPong sends the pong for the outstanding ping, the way the reader does: an empty
+// command with no id and no send is a pong.
 func (f *pongAtWriteFixture) deliverPong() bool {
-	return f.client.HandleCommand(&protocol.Command{Connect: &protocol.ConnectRequest{}}, 0)
+	return f.client.HandleCommand(&protocol.Command{}, 0)
 }
 
-// state returns the fields the tests check, read under the client lock.
-func (f *pongAtWriteFixture) state() (nextPong int64, lastPing int64, pingQueued bool) {
+func (f *pongAtWriteFixture) state() pongState {
 	f.client.mu.Lock()
 	defer f.client.mu.Unlock()
-	return f.client.nextPong, f.client.lastPing, f.client.pingQueued
+	return pongState{
+		nextPong:   f.client.nextPong,
+		lastPing:   f.client.lastPing,
+		pingQueued: f.client.pingQueued,
+	}
 }
 
 // advance moves the fake clock by d and lets the timers it wakes run to rest.
@@ -188,8 +207,8 @@ func TestPongAtWriteOffArmsAtEnqueue(t *testing.T) {
 
 		enqueuedAt := time.Now()
 		f.client.sendPing()
-		nextPong, _, _ := f.state()
-		require.Equal(t, enqueuedAt.Add(8*time.Second).UnixNano(), nextPong)
+		st := f.state()
+		require.Equal(t, enqueuedAt.Add(8*time.Second).UnixNano(), st.nextPong)
 	})
 }
 
@@ -204,9 +223,9 @@ func TestPongAtWriteOnNotArmedWhileQueued(t *testing.T) {
 
 		f.client.sendPing()
 		advance(10 * 8 * time.Second)
-		nextPong, lastPing, _ := f.state()
-		require.Zero(t, nextPong)
-		require.NotZero(t, lastPing)
+		st := f.state()
+		require.Zero(t, st.nextPong)
+		require.NotZero(t, st.lastPing)
 		require.Zero(t, f.disconnectCode.Load())
 	})
 }
@@ -220,6 +239,8 @@ func TestPongAtWriteArmedAtWrite(t *testing.T) {
 		})
 		defer f.shutdown()
 
+		// The callback runs inside the write, before the hook. No fake time passes between
+		// the two, so it reads the same instant the hook arms from.
 		var writtenAt atomic.Int64
 		f.transport.setOnPingWritten(func() {
 			writtenAt.Store(time.Now().UnixNano())
@@ -232,8 +253,8 @@ func TestPongAtWriteArmedAtWrite(t *testing.T) {
 
 		written := writtenAt.Load()
 		require.Equal(t, int64(24*time.Second), written-enqueuedAt)
-		nextPong, _, _ := f.state()
-		require.Equal(t, written+int64(8*time.Second), nextPong)
+		st := f.state()
+		require.Equal(t, written+int64(8*time.Second), st.nextPong)
 	})
 }
 
@@ -246,6 +267,9 @@ func TestPongAtWriteNoPongDisconnects(t *testing.T) {
 		})
 		defer f.shutdown()
 
+		// The writer config holds the hook only when the feature is on, and the
+		// connect path must have wired it.
+		require.NotNil(t, f.client.messageWriter.config.AfterPingWriteFn)
 		f.client.sendPing()
 		f.transport.admit(1)
 		synctest.Wait()
@@ -285,12 +309,13 @@ func TestPongAtWriteSkipsWhileUnanswered(t *testing.T) {
 		f.client.sendPing()
 		advance(25 * time.Second)
 		advance(25 * time.Second)
+		advance(25 * time.Second)
 		f.transport.admit(1)
 		synctest.Wait()
 
-		attempts, writes := f.transport.counts()
-		require.Equal(t, 1, attempts)
-		require.Equal(t, 1, writes)
+		counts := f.transport.counts()
+		require.Equal(t, 1, counts.attempts)
+		require.Equal(t, 1, counts.writes)
 	})
 }
 
@@ -313,13 +338,13 @@ func TestPongAtWriteStaleDeadlineNoFalseNoPong(t *testing.T) {
 		// The tick at t=25s enqueues ping N+1, and that write stays blocked. Run on to t=40s.
 		advance(19900 * time.Millisecond)
 
-		nextPong, _, pingQueued := f.state()
-		require.Zero(t, nextPong)
-		require.True(t, pingQueued)
+		st := f.state()
+		require.Zero(t, st.nextPong)
+		require.True(t, st.pingQueued)
 		require.Zero(t, f.disconnectCode.Load())
-		attempts, writes := f.transport.counts()
-		require.Equal(t, 2, attempts)
-		require.Equal(t, 1, writes)
+		counts := f.transport.counts()
+		require.Equal(t, 2, counts.attempts)
+		require.Equal(t, 1, counts.writes)
 	})
 }
 
@@ -340,61 +365,60 @@ func TestPongAtWritePongBetweenWriteAndHook(t *testing.T) {
 		f.client.sendPing()
 		f.transport.admit(1)
 		synctest.Wait()
-		attempts, writes := f.transport.counts()
-		require.Equal(t, 1, attempts)
-		require.Equal(t, 1, writes)
+		counts := f.transport.counts()
+		require.Equal(t, 1, counts.attempts)
+		require.Equal(t, 1, counts.writes)
 
 		// The deadline armed by the hook is cleared by the pong at its check.
 		advance(26 * time.Second)
 		require.Zero(t, f.disconnectCode.Load())
-		nextPong, _, _ := f.state()
-		require.Zero(t, nextPong)
+		st := f.state()
+		require.Zero(t, st.nextPong)
 	})
 }
 
-func TestPongAtWriteUnidirectionalUnchanged(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newPongAtWriteFixture(t, pongAtWriteSetup{
-			pongAtWrite:  true,
-			uni:          true,
-			pingInterval: 25 * time.Second,
-			pongTimeout:  8 * time.Second,
+func TestPongAtWriteUnchangedWhenOff(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup pongAtWriteSetup
+	}{
+		{
+			name: "unidirectional transport",
+			setup: pongAtWriteSetup{
+				pongAtWrite:  true,
+				uni:          true,
+				pingInterval: 25 * time.Second,
+				pongTimeout:  8 * time.Second,
+			},
+		},
+		{
+			name: "pong timeout disabled",
+			setup: pongAtWriteSetup{
+				pongAtWrite:  true,
+				pingInterval: 25 * time.Second,
+				pongTimeout:  -1,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newPongAtWriteFixture(t, tt.setup)
+				defer f.shutdown()
+
+				f.transport.admit(3)
+				f.client.sendPing()
+				advance(25 * time.Second)
+				advance(25 * time.Second)
+				synctest.Wait()
+
+				counts := f.transport.counts()
+				require.Equal(t, 3, counts.writes)
+				st := f.state()
+				require.Zero(t, st.nextPong)
+			})
 		})
-		defer f.shutdown()
-
-		f.transport.admit(3)
-		f.client.sendPing()
-		advance(25 * time.Second)
-		advance(25 * time.Second)
-		synctest.Wait()
-
-		_, writes := f.transport.counts()
-		require.Equal(t, 3, writes)
-		nextPong, _, _ := f.state()
-		require.Zero(t, nextPong)
-	})
-}
-
-func TestPongAtWritePongDisabledUnchanged(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newPongAtWriteFixture(t, pongAtWriteSetup{
-			pongAtWrite:  true,
-			pingInterval: 25 * time.Second,
-			pongTimeout:  -1,
-		})
-		defer f.shutdown()
-
-		f.transport.admit(3)
-		f.client.sendPing()
-		advance(25 * time.Second)
-		advance(25 * time.Second)
-		synctest.Wait()
-
-		_, writes := f.transport.counts()
-		require.Equal(t, 3, writes)
-		nextPong, _, _ := f.state()
-		require.Zero(t, nextPong)
-	})
+	}
 }
 
 func TestPongAtWriteClosedClientDoesNotArm(t *testing.T) {
@@ -408,9 +432,9 @@ func TestPongAtWriteClosedClientDoesNotArm(t *testing.T) {
 
 		_ = f.client.close(DisconnectForceNoReconnect)
 		f.client.armPongAfterWrite()
-		nextPong, _, pingQueued := f.state()
-		require.Zero(t, nextPong)
-		require.False(t, pingQueued)
+		st := f.state()
+		require.Zero(t, st.nextPong)
+		require.False(t, st.pingQueued)
 	})
 }
 
@@ -434,26 +458,8 @@ func TestPongAtWriteNoConnectingHandler(t *testing.T) {
 		f.transport.admit(1)
 		synctest.Wait()
 
-		nextPong, _, _ := f.state()
-		require.Equal(t, writtenAt.Load()+int64(8*time.Second), nextPong)
-	})
-}
-
-func TestPongAtWriteStartWriterWiresHook(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newPongAtWriteFixture(t, pongAtWriteSetup{
-			pongAtWrite:  true,
-			pingInterval: 25 * time.Second,
-			pongTimeout:  8 * time.Second,
-		})
-		defer f.shutdown()
-		require.NotNil(t, f.client.messageWriter.config.AfterPingWriteFn)
-
-		f.client.sendPing()
-		f.transport.admit(1)
-		synctest.Wait()
-		advance(8*time.Second + time.Nanosecond)
-		require.Equal(t, DisconnectNoPong.Code, f.disconnectCode.Load())
+		st := f.state()
+		require.Equal(t, writtenAt.Load()+int64(8*time.Second), st.nextPong)
 	})
 }
 
@@ -478,20 +484,24 @@ func TestPongAtWriteSlowDrainNoNoPong(t *testing.T) {
 		}
 		f.client.sendPing()
 
-		for {
-			_, writes := f.transport.counts()
-			if writes > 0 {
+		// 33 admitted messages are needed: 32 replies and the ping. The bound stops the
+		// loop if the ping is never written.
+		var counts pingCounts
+		for range 64 {
+			counts = f.transport.counts()
+			if counts.writes > 0 {
 				break
 			}
-			nextPong, _, _ := f.state()
-			require.Zero(t, nextPong, "pong armed before the ping was written")
+			st := f.state()
+			require.Zero(t, st.nextPong, "pong armed before the ping was written")
 			require.Zero(t, f.disconnectCode.Load(), "disconnect while the queue drains")
 			advance(time.Second)
 			f.transport.admit(1)
 			synctest.Wait()
 		}
-		nextPong, _, _ := f.state()
-		require.NotZero(t, nextPong)
+		require.NotZero(t, counts.writes, "the ping was never written")
+		st := f.state()
+		require.NotZero(t, st.nextPong)
 		require.Zero(t, f.disconnectCode.Load())
 	})
 }

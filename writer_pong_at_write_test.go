@@ -12,8 +12,8 @@ import (
 )
 
 var (
-	pongAtWritePingItem = queue.Item{Data: []byte("{}"), FrameType: protocol.FrameTypeServerPing}
-	pongAtWriteDataItem = queue.Item{Data: []byte("data"), FrameType: protocol.FrameTypePushMessage}
+	pongAtWritePingItem queue.Item = queue.Item{Data: []byte("{}"), FrameType: protocol.FrameTypeServerPing}
+	pongAtWriteDataItem queue.Item = queue.Item{Data: []byte("data"), FrameType: protocol.FrameTypePushMessage}
 )
 
 // newPongAtWriteTestWriter returns a writer whose transport calls return writeErr. The hook is
@@ -48,15 +48,33 @@ func TestWriterAfterPingWriteFnCalledOnPing(t *testing.T) {
 		maxMessagesInFrame int
 		writeDelay         time.Duration
 	}{
-		{name: "lone ping", items: []queue.Item{pongAtWritePingItem}, maxMessagesInFrame: 16},
-		{name: "ping with data", items: []queue.Item{pongAtWriteDataItem, pongAtWritePingItem}, maxMessagesInFrame: 16},
-		{name: "lone ping, write delay", items: []queue.Item{pongAtWritePingItem}, maxMessagesInFrame: 1, writeDelay: time.Millisecond},
-		{name: "ping with data, write delay", items: []queue.Item{pongAtWriteDataItem, pongAtWritePingItem}, maxMessagesInFrame: 2, writeDelay: time.Millisecond},
+		{
+			name:               "lone ping",
+			items:              []queue.Item{pongAtWritePingItem},
+			maxMessagesInFrame: 16,
+		},
+		{
+			name:               "ping with data",
+			items:              []queue.Item{pongAtWriteDataItem, pongAtWritePingItem},
+			maxMessagesInFrame: 16,
+		},
+		{
+			name:               "lone ping, write delay",
+			items:              []queue.Item{pongAtWritePingItem},
+			maxMessagesInFrame: 1,
+			writeDelay:         time.Millisecond,
+		},
+		{
+			name:               "ping with data, write delay",
+			items:              []queue.Item{pongAtWriteDataItem, pongAtWritePingItem},
+			maxMessagesInFrame: 2,
+			writeDelay:         time.Millisecond,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			calls := 0
+			var calls int
 			w := newPongAtWriteTestWriter(nil, func() {
 				calls++
 			})
@@ -68,7 +86,7 @@ func TestWriterAfterPingWriteFnCalledOnPing(t *testing.T) {
 
 func TestWriterAfterPingWriteFnNotCalledWithoutPing(t *testing.T) {
 	t.Parallel()
-	calls := 0
+	var calls int
 	w := newPongAtWriteTestWriter(nil, func() {
 		calls++
 	})
@@ -82,13 +100,19 @@ func TestWriterAfterPingWriteFnNotCalledOnError(t *testing.T) {
 		name  string
 		items []queue.Item
 	}{
-		{name: "lone ping", items: []queue.Item{pongAtWritePingItem}},
-		{name: "ping with data", items: []queue.Item{pongAtWriteDataItem, pongAtWritePingItem}},
+		{
+			name:  "lone ping",
+			items: []queue.Item{pongAtWritePingItem},
+		},
+		{
+			name:  "ping with data",
+			items: []queue.Item{pongAtWriteDataItem, pongAtWritePingItem},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			calls := 0
+			var calls int
 			w := newPongAtWriteTestWriter(errors.New("write failed"), func() {
 				calls++
 			})
@@ -114,7 +138,7 @@ func TestWriterAfterPingWriteFnRunsUnlocked(t *testing.T) {
 
 func TestWriterAfterPingWriteFnNilIsNoop(t *testing.T) {
 	t.Parallel()
-	writes := 0
+	var writes int
 	w := newWriter(writerConfig{
 		WriteFn: func(_ queue.Item) error {
 			writes++

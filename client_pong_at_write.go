@@ -4,8 +4,6 @@ import (
 	"time"
 
 	"github.com/centrifugal/protocol"
-
-	"github.com/centrifugal/centrifuge/internal/queue"
 )
 
 // afterPingWriteFn returns the hook the writer calls, with no writer lock held, after a drain
@@ -54,23 +52,4 @@ func (c *Client) armPongAfterWrite() {
 	c.nextPong = time.Now().Add(c.pongTimeout).UnixNano()
 	c.scheduleNextTimer()
 	c.mu.Unlock()
-}
-
-// pingWrittenIn reports whether a drain of items wrote a ping. It is false at once when hook is
-// nil, so with pong-at-write off the writer does no work per drain.
-func pingWrittenIn(hook func(), items []queue.Item) bool {
-	if hook == nil {
-		return false
-	}
-	return containsPingFrame(items)
-}
-
-// containsPingFrame reports whether items holds a server ping frame.
-func containsPingFrame(items []queue.Item) bool {
-	for i := range items {
-		if items[i].FrameType == protocol.FrameTypeServerPing {
-			return true
-		}
-	}
-	return false
 }

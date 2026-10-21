@@ -127,10 +127,10 @@ func (w *writer) waitSendMessage(maxMessagesInFrame int, writeDelay time.Duratio
 		pingWritten := pingWrittenIn(w.config.AfterPingWriteFn, items)
 		putItemBuf(itemBuf)
 		w.mu.Unlock()
-		w.messages.FinishCollect(shrinkDelay)
 		if writeErr == nil && pingWritten {
 			w.config.AfterPingWriteFn()
 		}
+		w.messages.FinishCollect(shrinkDelay)
 
 		if writeErr != nil {
 			// Write failed, transport must close itself, here we just return from routine.
