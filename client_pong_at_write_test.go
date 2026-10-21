@@ -123,6 +123,7 @@ type pongAtWriteSetup struct {
 	pingInterval time.Duration
 	pongTimeout  time.Duration
 	queueMaxSize int
+	connecting   bool
 }
 
 // pongAtWriteFixture is a connected client on a gatedTransport. Its own connect-time ping timer
@@ -154,6 +155,11 @@ func newPongAtWriteFixture(t *testing.T, setup pongAtWriteSetup) *pongAtWriteFix
 			f.disconnectCode.Store(event.Disconnect.Code)
 		})
 	})
+	if setup.connecting {
+		f.node.OnConnecting(func(context.Context, ConnectEvent) (ConnectReply, error) {
+			return ConnectReply{}, nil
+		})
+	}
 	var ctx context.Context
 	var cancelFn context.CancelFunc
 	ctx, cancelFn = context.WithCancel(context.Background())
@@ -238,6 +244,7 @@ func TestPongAtWriteArmedAtWrite(t *testing.T) {
 			pongTimeout:  8 * time.Second,
 		})
 		defer f.shutdown()
+		require.True(t, f.client.pongAtWriteOn)
 
 		// The callback runs inside the write, before the hook. No fake time passes between
 		// the two, so it reads the same instant the hook arms from.
@@ -357,14 +364,16 @@ func TestPongAtWritePongBetweenWriteAndHook(t *testing.T) {
 		})
 		defer f.shutdown()
 
+		var pongDelivered atomic.Bool
 		// The pong and a tick both arrive inside the write, before the hook runs.
 		f.transport.setOnPingWritten(func() {
-			_ = f.deliverPong()
+			pongDelivered.Store(f.deliverPong())
 			f.client.sendPing()
 		})
 		f.client.sendPing()
 		f.transport.admit(1)
 		synctest.Wait()
+		require.True(t, pongDelivered.Load())
 		counts := f.transport.counts()
 		require.Equal(t, 1, counts.attempts)
 		require.Equal(t, 1, counts.writes)
@@ -377,7 +386,7 @@ func TestPongAtWritePongBetweenWriteAndHook(t *testing.T) {
 	})
 }
 
-func TestPongAtWriteUnchangedWhenOff(t *testing.T) {
+func TestPongAtWriteInertWhenNotApplicable(t *testing.T) {
 	tests := []struct {
 		name  string
 		setup pongAtWriteSetup
@@ -438,12 +447,13 @@ func TestPongAtWriteClosedClientDoesNotArm(t *testing.T) {
 	})
 }
 
-func TestPongAtWriteNoConnectingHandler(t *testing.T) {
+func TestPongAtWriteArmedWithConnectingHandler(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// The fixture has OnConnect only, so connect takes the else branch. There the
-		// writer must start after pongTimeout is set, or pong-at-write stays off.
+		// OnConnecting returns an empty reply, so connect runs the handler branch. The
+		// fixture has OnConnect only otherwise, which takes the else branch.
 		f := newPongAtWriteFixture(t, pongAtWriteSetup{
 			pongAtWrite:  true,
+			connecting:   true,
 			pingInterval: 25 * time.Second,
 			pongTimeout:  8 * time.Second,
 		})
