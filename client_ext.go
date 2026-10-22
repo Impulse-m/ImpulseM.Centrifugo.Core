@@ -6,7 +6,10 @@ import (
 
 // clientExt holds the state of the fork features that most connections do not set: the token identity and the
 // extension state. It is allocated when one of them is set first, so a connection without them holds one pointer.
-// The token identity is guarded by Client.mu, and the extension state is atomic.
+// The trade-off: a connection with a token identity pays one more allocation, 48 bytes in the size class of clientExt,
+// which is 16 bytes more than holding the identity inline in Client, and the 40 bytes of a connection without them are
+// saved. BenchmarkClientExt measures both cases. The token identity is guarded by Client.mu, and the extension state is
+// atomic.
 type clientExt struct {
 	tokenIdentity TokenIdentity
 	extState      atomic.Pointer[extStateBox]

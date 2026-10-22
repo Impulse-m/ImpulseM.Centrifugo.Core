@@ -23,3 +23,27 @@ func TestClientExtAllocatedOnlyWhenSet(t *testing.T) {
 	require.NotNil(t, client.ext.Load())
 	require.Equal(t, uint64(1), client.TokenIdentity().Generation)
 }
+
+// BenchmarkClientExt measures a new connection with and without a token identity. A connection without one allocates
+// no fork state, and a connection with one allocates the clientExt struct once.
+func BenchmarkClientExt(b *testing.B) {
+	identity := TokenIdentity{Generation: 1}
+	b.Run("NoIdentity", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			client := &Client{}
+			client.mu.Lock()
+			client.setTokenIdentity(TokenIdentity{})
+			client.mu.Unlock()
+		}
+	})
+	b.Run("TokenIdentity", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			client := &Client{}
+			client.mu.Lock()
+			client.setTokenIdentity(identity)
+			client.mu.Unlock()
+		}
+	})
+}
