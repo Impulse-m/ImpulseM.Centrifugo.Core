@@ -788,9 +788,9 @@ func TestPresenceStateRemBoundsExpiredCleanup(t *testing.T) {
 	require.Equal(t, int64(0), hashLen())
 }
 
-// TestNewPresenceStateRejectsIntervalsBelowFloors checks that the channel state config refuses a sweep interval below
-// 100ms and a lease TTL below 5ms, and accepts a sweep interval of 100ms.
-func TestNewPresenceStateRejectsIntervalsBelowFloors(t *testing.T) {
+// TestNewPresenceStateRaisesSweepIntervalToFloor checks that the channel state config raises a sweep interval below
+// 100ms to 100ms, keeps a sweep interval of 100ms, and refuses a lease TTL below 5ms.
+func TestNewPresenceStateRaisesSweepIntervalToFloor(t *testing.T) {
 	node := testStateNode(t)
 	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
 	require.NoError(t, err)
@@ -815,17 +815,14 @@ func TestNewPresenceStateRejectsIntervalsBelowFloors(t *testing.T) {
 			ChannelState: &state,
 		})
 	}
-	for _, state := range []RedisChannelStateConfig{
-		channelState(time.Millisecond, 0),
-		channelState(99*time.Millisecond, 0),
-		channelState(0, time.Millisecond),
-	} {
-		_, err := newManager(state)
-		require.Error(t, err, "sweep interval %s, lease TTL %s", state.SweepInterval, state.LeaseTTL)
+	for _, sweepInterval := range []time.Duration{time.Millisecond, 99 * time.Millisecond, 100 * time.Millisecond} {
+		pm, err := newManager(channelState(sweepInterval, 0))
+		require.NoError(t, err)
+		require.Equal(t, 100*time.Millisecond, pm.state.sweepInterval, "sweep interval %s", sweepInterval)
+		require.NoError(t, pm.Close(t.Context()))
 	}
-	pm, err := newManager(channelState(100*time.Millisecond, 0))
-	require.NoError(t, err)
-	require.NoError(t, pm.Close(t.Context()))
+	_, err = newManager(channelState(0, time.Millisecond))
+	require.Error(t, err, "lease TTL below 5ms must be refused")
 }
 
 func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {

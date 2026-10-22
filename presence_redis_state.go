@@ -136,8 +136,8 @@ type RedisChannelStateConfig struct {
 	// cap is not dropped: it stays pending, and a later sweep sends it once the stream has room.
 	// Dropped occupied events are counted in the events_dropped_count metric.
 	MaxStreamLength int
-	// SweepInterval is how often a partition is swept and its events are read. Must be at least 100ms, so values
-	// below it are refused when the manager is created. Default 1s.
+	// SweepInterval is how often a partition is swept and its events are read. A value below 100ms is raised to
+	// 100ms when the manager is created, and a warning is logged. Default 1s.
 	// Every partition of a node sweeps on this interval, so Redis load grows with 1/SweepInterval.
 	SweepInterval time.Duration
 	// LeaseTTL is how long a partition lease lasts without renewal. A lease is renewed every LeaseTTL/5,
@@ -173,6 +173,7 @@ type presenceState struct {
 	expiredBatch      string
 	metrics           *channelStateMetrics
 	dropLoggedAt      atomic.Int64
+	keptLoggedAt      atomic.Int64
 
 	addScript     *rueidis.Lua
 	remScript     *rueidis.Lua
@@ -214,7 +215,10 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 	if sweepInterval <= 0 {
 		sweepInterval = channelStateDefaultSweepInterval
 	} else if sweepInterval < channelStateMinSweepInterval {
-		return nil, errors.New("presence: channel state SweepInterval must be at least 100ms")
+		m.node.logger.log(newLogEntry(LogLevelWarn, "channel state SweepInterval is below 100ms, using 100ms", map[string]any{
+			"sweep_interval": sweepInterval.String(),
+		}))
+		sweepInterval = channelStateMinSweepInterval
 	}
 
 	leaseTTL := config.LeaseTTL
@@ -421,7 +425,8 @@ func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int
 
 // countResult counts the outcome of a state script: 1 is an event written to the stream,
 // 2 is an occupied event dropped because the stream is full. A vacated event kept pending
-// at the cap is 3 and is not counted, since it is sent later.
+// at the cap is 3 and is not counted, since it is sent later, but it is logged because it
+// stalls the sweep of its partition.
 func (s *presenceState) countResult(eventType ChannelStateEventType, result int64) {
 	switch result {
 	case 1:
@@ -429,21 +434,39 @@ func (s *presenceState) countResult(eventType ChannelStateEventType, result int6
 	case 2:
 		s.metrics.incDropped(eventType)
 		s.logDropped(eventType)
+	case channelStateKeptPending:
+		s.logKeptPending()
 	}
 }
 
 // logDropped logs a dropped event at most once per minute. A full stream means the backend does not
 // answer, so the log shows it without a line per dropped event.
 func (s *presenceState) logDropped(eventType ChannelStateEventType) {
-	now := time.Now().UnixNano()
-	last := s.dropLoggedAt.Load()
-	if now-last < int64(time.Minute) || !s.dropLoggedAt.CompareAndSwap(last, now) {
+	if !s.allowLog(&s.dropLoggedAt) {
 		return
 	}
 	s.manager.node.logger.log(newLogEntry(LogLevelWarn, "channel state event dropped: the stream of the partition is full", map[string]any{
 		"type":              string(eventType),
 		"max_stream_length": s.maxStreamLength,
 	}))
+}
+
+// logKeptPending logs a vacated event kept pending at the stream cap at most once per minute. The sweep of its
+// partition waits until the stream has room, so the log names the stall.
+func (s *presenceState) logKeptPending() {
+	if !s.allowLog(&s.keptLoggedAt) {
+		return
+	}
+	s.manager.node.logger.log(newLogEntry(LogLevelWarn, "channel state vacated event kept pending: the stream of the partition is full, its sweep waits", map[string]any{
+		"max_stream_length": s.maxStreamLength,
+	}))
+}
+
+// allowLog reports whether a log line may be written now, at most one per minute for the given timestamp.
+func (s *presenceState) allowLog(last *atomic.Int64) bool {
+	now := time.Now().UnixNano()
+	prev := last.Load()
+	return now-prev >= int64(time.Minute) && last.CompareAndSwap(prev, now)
 }
 
 // close stops the partition workers and releases their leases. It returns early with
