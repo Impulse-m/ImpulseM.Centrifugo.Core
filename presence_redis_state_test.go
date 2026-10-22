@@ -491,8 +491,10 @@ func TestRedisChannelStateOverlappingSweepKeepsOccupied(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{ch}, stale)
 
-	require.NoError(t, pm.state.worker.sweep(ctx, sh, p))
-	require.NoError(t, pm.state.checkChannels(ctx, sh, p, stale, nowMs))
+	_, err = pm.state.worker.sweep(ctx, sh, p)
+	require.NoError(t, err)
+	_, _, err = pm.state.checkChannels(ctx, sh, p, stale, nowMs)
+	require.NoError(t, err)
 	require.NoError(t, pm.AddPresence(ch, "client-2", &ClientInfo{}))
 
 	require.Eventually(t, func() bool {
@@ -746,7 +748,7 @@ func TestPresenceStateRemBoundsExpiredCleanup(t *testing.T) {
 
 	nowSec := int64(100)
 	keys := []string{presenceSet, presenceHash, userSet, userHash, pending, expire}
-	args := []string{"client-x", "", "0", "0", channel, strconv.FormatInt(nowSec, 10), strconv.FormatInt(nowSec*1000+5000, 10)}
+	args := []string{"client-x", "", "0", "0", channel, strconv.FormatInt(nowSec, 10), strconv.FormatInt(nowSec*1000+5000, 10), strconv.Itoa(expiredBatch)}
 	remove := func() {
 		require.NoError(t, pm.state.remScript.Exec(ctx, client, keys, args).Error())
 	}

@@ -150,8 +150,8 @@ func TestRedisChannelStateStreamCap(t *testing.T) {
 }
 
 // TestRedisChannelStateVacatedSurvivesStreamCap runs the check script on a stream at its cap, with a vacated
-// event due. The event is dropped, and its pending entry must stay, so that a later sweep sends the event once the
-// stream has room. The script runs on keys of the test, so the partition consumers do not touch them.
+// event due. The event is kept pending, and its pending entry must stay, so that a later sweep sends the event once
+// the stream has room. The script runs on keys of the test, so the partition consumers do not touch them.
 func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 	t.Parallel()
 	node := testStateNode(t)
@@ -171,11 +171,11 @@ func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 	nowMs := time.Now().UnixMilli()
 	require.NoError(t, client.Do(ctx, client.B().Zadd().Key(pending).ScoreMember().ScoreMember(float64(nowMs-1), channel).Build()).Error())
 
-	checkArgs := []string{channel, strconv.FormatInt(nowMs, 10), strconv.FormatInt(nowMs/1000, 10), strconv.FormatInt(nowMs, 10), "0", "3", "0"}
+	checkArgs := []string{channel, strconv.FormatInt(nowMs, 10), strconv.FormatInt(nowMs/1000, 10), strconv.FormatInt(nowMs, 10), "0", "3", "0", strconv.Itoa(channelStateExpiredBatch)}
 	keys := []string{set, hash, stream, pending, expire}
-	dropped, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs).AsInt64()
+	kept, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs).AsInt64()
 	require.NoError(t, err)
-	require.Equal(t, int64(2), dropped)
+	require.Equal(t, int64(channelStateKeptPending), kept)
 	_, err = client.Do(ctx, client.B().Zscore().Key(pending).Member(channel).Build()).AsFloat64()
 	require.NoError(t, err, "the pending entry of the dropped vacated event must stay")
 
@@ -186,6 +186,38 @@ func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 	length, err := client.Do(ctx, client.B().Xlen().Key(stream).Build()).AsInt64()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), length)
+}
+
+// TestRedisChannelStateSweepStopsAtFullStream leaves 150 due vacated channels pending in one partition whose stream
+// is full, and whose handler fails so the stream stays full. A sweep checks one page of them and stops there: the
+// pending entries stay at the head of the set, so the next page would check the same channels again.
+func TestRedisChannelStateSweepStopsAtFullStream(t *testing.T) {
+	t.Parallel()
+	state := testChannelStateConfig(&testChannelStateCollector{})
+	state.Handler = func(_ context.Context, _ []ChannelStateEvent) error {
+		return errors.New("backend unavailable")
+	}
+	state.NumPartitions = 1
+	state.MaxStreamLength = 1
+	node := testStateNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
+	client := pm.shards[0].client
+	ctx := context.Background()
+	pending := string(pm.state.partitionKey(0, "pending"))
+
+	const dueChannels = 150
+	nowMs := time.Now().UnixMilli()
+	for i := range dueChannels {
+		require.NoError(t, client.Do(ctx, client.B().Zadd().Key(pending).ScoreMember().ScoreMember(float64(nowMs-1000), "sweep-cap-"+strconv.Itoa(i)).Build()).Error())
+	}
+
+	checked, err := pm.state.worker.sweep(ctx, pm.state.shardOf(0), 0)
+	require.NoError(t, err)
+	require.Equal(t, channelStateSweepPageSize, checked, "a sweep must check one page while the stream is full")
+	left, err := client.Do(ctx, client.B().Zcard().Key(pending).Build()).AsInt64()
+	require.NoError(t, err)
+	require.Greater(t, left, int64(channelStateSweepPageSize), "the channels behind the page must stay pending for the next step")
+	require.Equal(t, 0.0, metricValue(t, pm.state.metrics.eventsDropped.WithLabelValues(string(ChannelStateVacated))), "a vacated event kept pending is not a drop")
 }
 
 // TestRedisChannelStateFailingDeliveryReturnsToSweep runs one consume step of a partition whose handler fails. The
@@ -218,16 +250,26 @@ func TestRedisChannelStateFailingDeliveryReturnsToSweep(t *testing.T) {
 	defer cancel()
 	returned := make(chan bool, 1)
 	var backoff channelStateBackoff
-	go func() {
-		returned <- pm.state.worker.consumeOnce(ctx, pm.shards[0], 0, part, &backoff)
-	}()
-	select {
-	case more := <-returned:
-		require.True(t, more)
-	case <-time.After(5 * time.Second):
-		t.Fatal("the consume step retried the failing batch in place and did not return to the sweep")
+	step := func() bool {
+		go func() {
+			returned <- pm.state.worker.consumeOnce(ctx, pm.shards[0], 0, part, &backoff)
+		}()
+		select {
+		case more := <-returned:
+			return more
+		case <-time.After(5 * time.Second):
+			t.Fatal("the consume step retried the failing batch in place and did not return to the sweep")
+			return false
+		}
 	}
+	require.True(t, step())
 	require.Equal(t, int64(1), testStreamLength(t, pm, 0), "the failed event must stay in the stream")
+
+	// A channel that becomes due after the first step is sent by the sweep of the second step, which runs before the
+	// batch is delivered again.
+	require.NoError(t, client.Do(ctx, client.B().Zadd().Key(string(pm.state.partitionKey(0, "pending"))).ScoreMember().ScoreMember(float64(time.Now().UnixMilli()-1000), "due-later").Build()).Error())
+	require.True(t, step())
+	require.Equal(t, int64(2), testStreamLength(t, pm, 0), "the sweep of the second step must run before the failing batch is delivered again")
 }
 
 func TestRedisChannelStateTwoNodes(t *testing.T) {

@@ -20,7 +20,8 @@ const (
 	channelStateLeaseRenewals = 5
 	// channelStateCallDivisor sets the timeout of a Redis call of the lease loop: a third of LeaseTTL.
 	channelStateCallDivisor = 3
-	// channelStateHeartbeatDivisor sets how often the worker writes its heartbeat: a third of LeaseTTL.
+	// channelStateHeartbeatDivisor sets the minimum interval between two heartbeats: a third of LeaseTTL. A heartbeat
+	// is written on the first lease tick after the interval, see leaseCycle.
 	channelStateHeartbeatDivisor = 3
 )
 
@@ -46,9 +47,9 @@ type channelStateWorker struct {
 	// consumers have stopped, so two consumers never run one partition. Only the lease loop goroutine
 	// accesses it.
 	retiring map[int]*channelStatePartition
-	// probeDelay is the delay after a probe that found no free partition. It is only accessed by the lease loop
+	// probe is the delay after a probe that found no free partition. It is only accessed by the lease loop
 	// goroutine, and it doubles from one lease tick up to LeaseTTL.
-	probeDelay time.Duration
+	probe channelStateBackoff
 	// probeUntil is the time before which the lease loop does not probe for partitions.
 	probeUntil time.Time
 	// probeShare is the share the probe delay was set for. A change of the share resets the delay.
@@ -99,9 +100,12 @@ func (p *channelStatePartition) stop() {
 	<-p.done
 }
 
-// channelStateBackoff doubles the delay between attempts of a failing step, from 100ms up to 20s.
+// channelStateBackoff doubles the delay between attempts of a failing step. The zero value doubles from
+// channelStateMinBackoff up to channelStateMaxBackoff; minDelay and maxDelay replace those bounds when set.
 type channelStateBackoff struct {
-	delay time.Duration
+	minDelay time.Duration
+	maxDelay time.Duration
+	delay    time.Duration
 }
 
 func newChannelStateWorker(state *presenceState, node *Node) *channelStateWorker {
@@ -113,6 +117,10 @@ func newChannelStateWorker(state *presenceState, node *Node) *channelStateWorker
 		stopped:   make(chan struct{}),
 		owned:     make(map[int]*channelStatePartition),
 		retiring:  make(map[int]*channelStatePartition),
+		probe: channelStateBackoff{
+			minDelay: state.leaseTTL / channelStateLeaseRenewals,
+			maxDelay: state.leaseTTL,
+		},
 	}
 }
 
@@ -142,8 +150,9 @@ func (w *channelStateWorker) run() {
 }
 
 // leaseCycle renews the owned leases, publishes this worker, and rebalances the partitions by the number of
-// workers the heartbeat counts. The worker publishes its heartbeat once per heartbeatInterval, and a cycle in
-// between uses the count of the last one. The renewals and the heartbeat run together, and the cycle waits for
+// workers the heartbeat counts. The worker writes its heartbeat at most once per heartbeatInterval, on the first
+// lease tick after the interval has passed, so with the default ticks the heartbeat comes up to about 0.4 * LeaseTTL
+// apart. A cycle in between uses the count of the last one. The renewals and the heartbeat run together, and the cycle waits for
 // their replies for at most callTimeout. A shard that does not answer in time is given up, so it cannot delay the
 // renewals of the others. The acquisitions wait for at most callTimeout too: a cycle lasts at most two call
 // timeouts, two thirds of LeaseTTL at the most, however long a shard takes to answer.
@@ -276,7 +285,7 @@ func waitWithin(wg *sync.WaitGroup, d time.Duration) {
 }
 
 // rebalance gives up one partition when the node owns more than its share, and takes free partitions
-// while it owns less. A probe that finds no free partition delays the next probe, see backOffProbe.
+// while it owns less. A probe that finds no free partition delays the next probe.
 func (w *channelStateWorker) rebalance(share int) {
 	if len(w.owned) > share {
 		for _, part := range w.owned {
@@ -286,31 +295,22 @@ func (w *channelStateWorker) rebalance(share int) {
 	} else if len(w.owned) < share {
 		if share != w.probeShare {
 			w.probeShare = share
-			w.resetProbe()
+			w.probe.reset()
+			w.probeUntil = time.Time{}
 		}
 		if time.Now().Before(w.probeUntil) {
 			return
 		}
+		// A probe that found every partition leased delays the next one: the delay doubles from one lease tick up to
+		// LeaseTTL, so a node that owns less than its share probes a few times per LeaseTTL instead of on every tick.
+		// A partition whose lease expires is taken at most LeaseTTL later than without the delay.
 		if w.acquire(share - len(w.owned)) {
-			w.backOffProbe()
+			w.probeUntil = time.Now().Add(w.probe.next())
 		} else {
-			w.resetProbe()
+			w.probe.reset()
+			w.probeUntil = time.Time{}
 		}
 	}
-}
-
-// backOffProbe delays the next probe, after a probe that found every partition leased. The delay doubles from one
-// lease tick up to LeaseTTL, so a node that owns less than its share probes a few times per LeaseTTL instead of on
-// every tick. A partition whose lease expires is taken at most LeaseTTL later than without the delay.
-func (w *channelStateWorker) backOffProbe() {
-	w.probeDelay = min(max(2*w.probeDelay, w.leaseTick), w.state.leaseTTL)
-	w.probeUntil = time.Now().Add(w.probeDelay)
-}
-
-// resetProbe removes the delay of the probes, so the next rebalance probes at once.
-func (w *channelStateWorker) resetProbe() {
-	w.probeDelay = 0
-	w.probeUntil = time.Time{}
 }
 
 // renewResult is the outcome of the renewals of one shard.
@@ -727,7 +727,7 @@ func (w *channelStateWorker) consume(ctx context.Context, part *channelStatePart
 // lease is lost. A failed delivery ends the step after its retry delay, and the next step sweeps
 // again before it retries. It returns false when ctx is done.
 func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p int, part *channelStatePartition, backoff *channelStateBackoff) bool {
-	if err := w.sweep(ctx, sh, p); err != nil {
+	if _, err := w.sweep(ctx, sh, p); err != nil {
 		if ctx.Err() != nil {
 			return false
 		}
@@ -788,23 +788,32 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 
 // sweep moves the channels that are due in the partition to their next state: a
 // vacated event when the delay has passed, or an armed delay when the presence expired.
-func (w *channelStateWorker) sweep(ctx context.Context, sh *RedisShard, p int) error {
+// It returns the number of channels it checked. A vacated event kept pending by a full stream
+// stops the sweep for this step: the pending entries stay at the head of the due set, so the next page
+// would hold the same channels, and the next step tries again once the consumer has made room.
+func (w *channelStateWorker) sweep(ctx context.Context, sh *RedisShard, p int) (int, error) {
 	nowMs := time.Now().UnixMilli()
+	checked := 0
 	for page := 0; page < channelStateSweepMaxPages; page++ {
 		channels, full, err := w.duePage(ctx, sh, p, nowMs)
 		if err != nil {
-			return err
+			return checked, err
 		}
 		if len(channels) > 0 {
-			if err := w.state.checkChannels(ctx, sh, p, channels, nowMs); err != nil {
-				return err
+			n, kept, err := w.state.checkChannels(ctx, sh, p, channels, nowMs)
+			checked += n
+			if err != nil {
+				return checked, err
+			}
+			if kept {
+				return checked, nil
 			}
 		}
 		if !full {
-			return nil
+			return checked, nil
 		}
 	}
-	return nil
+	return checked, nil
 }
 
 // duePage returns one page of the channels due in the pending and expire sets of the
@@ -969,13 +978,17 @@ func (w *channelStateWorker) reportCallErrors(message string, errs callErrors) {
 
 // next returns the delay before the next attempt and doubles the one after it.
 func (b *channelStateBackoff) next() time.Duration {
+	minDelay, maxDelay := b.minDelay, b.maxDelay
+	if minDelay == 0 {
+		minDelay = channelStateMinBackoff
+	}
+	if maxDelay == 0 {
+		maxDelay = channelStateMaxBackoff
+	}
 	if b.delay == 0 {
-		b.delay = channelStateMinBackoff
+		b.delay = minDelay
 	} else {
-		b.delay *= 2
-		if b.delay > channelStateMaxBackoff {
-			b.delay = channelStateMaxBackoff
-		}
+		b.delay = min(2*b.delay, maxDelay)
 	}
 	return b.delay
 }

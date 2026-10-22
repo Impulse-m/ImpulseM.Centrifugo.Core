@@ -13,6 +13,7 @@
 -- ARGV[5] - channel
 -- ARGV[6] - now in seconds
 -- ARGV[7] - fire at in milliseconds of the vacated event
+-- ARGV[8] - expired entries removed per call
 
 -- Only a client that was in the hash arms the vacated event: a repeated remove must not send another one.
 local existed = redis.call("hexists", KEYS[2], ARGV[1]) == 1
@@ -41,17 +42,17 @@ if ARGV[3] ~= '0' and clientExists then
 end
 
 -- Expired entries of dead nodes do not keep a channel occupied (same cleanup as presence_get.lua, but at most
--- 1000 entries per call, so one call does not block Redis on a large set).
+-- ARGV[8] entries per call, so one call does not block Redis on a large set).
 local more = false
 if ARGV[4] == '0' then
-    local expired = redis.call("zrangebyscore", KEYS[1], "0", ARGV[6], "LIMIT", 0, 1000)
+    local expired = redis.call("zrangebyscore", KEYS[1], "0", ARGV[6], "LIMIT", 0, ARGV[8])
     if #expired > 0 then
         for num = 1, #expired do
             redis.call("hdel", KEYS[2], expired[num])
         end
         redis.call("zrem", KEYS[1], unpack(expired))
     end
-    more = #expired >= 1000
+    more = #expired >= tonumber(ARGV[8])
 end
 
 -- The vacated event always goes through the pending zset, so a quick reconnect cancels it.

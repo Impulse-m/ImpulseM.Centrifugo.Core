@@ -51,3 +51,20 @@ func TestChannelStateBackoff(t *testing.T) {
 	require.Equal(t, 100*time.Millisecond, backoff.next())
 	require.Equal(t, 200*time.Millisecond, backoff.next())
 }
+
+// TestChannelStateProbeBackoffBounds checks the probe backoff of a worker: it starts at one lease tick and doubles up
+// to LeaseTTL, which is the bound the probes of an idle worker take.
+func TestChannelStateProbeBackoffBounds(t *testing.T) {
+	t.Parallel()
+	w := newChannelStateWorker(&presenceState{leaseTTL: 5 * time.Second}, &Node{})
+	want := []time.Duration{
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		5 * time.Second,
+		5 * time.Second,
+	}
+	for i, delay := range want {
+		require.Equal(t, delay, w.probe.next(), "probe %d", i)
+	}
+}

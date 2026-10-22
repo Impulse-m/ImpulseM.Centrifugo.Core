@@ -12,19 +12,22 @@
 -- ARGV[5] - use hash field TTL "0" or "1"
 -- ARGV[6] - max stream length, 0 means no cap
 -- ARGV[7] - presence TTL in milliseconds
+-- ARGV[8] - expired entries removed per call
+-- Returns 0 when nothing is written, 1 when the vacated event is written to the stream, and 3 when the event is
+-- kept pending because the stream is at its cap.
 
 local more = false
 if ARGV[5] == '0' then
     -- Expired entries do not keep a channel occupied (same cleanup as presence_get.lua, but at most
-    -- 1000 entries per call, so one call does not block Redis on a large set).
-    local expired = redis.call("zrangebyscore", KEYS[1], "0", ARGV[3], "LIMIT", 0, 1000)
+    -- ARGV[8] entries per call, so one call does not block Redis on a large set).
+    local expired = redis.call("zrangebyscore", KEYS[1], "0", ARGV[3], "LIMIT", 0, ARGV[8])
     if #expired > 0 then
         for num = 1, #expired do
             redis.call("hdel", KEYS[2], expired[num])
         end
         redis.call("zrem", KEYS[1], unpack(expired))
     end
-    more = #expired >= 1000
+    more = #expired >= tonumber(ARGV[8])
 end
 
 if redis.call("hlen", KEYS[2]) > 0 then
@@ -55,8 +58,8 @@ if tonumber(fire) > tonumber(ARGV[2]) then
 end
 
 if tonumber(ARGV[6]) > 0 and redis.call("xlen", KEYS[3]) >= tonumber(ARGV[6]) then
-    -- Dropped at the cap: the pending entry stays, so the next sweep sends the event once the stream has room.
-    return 2
+    -- Kept pending at the cap: the pending entry stays, so the next sweep sends the event once the stream has room.
+    return 3
 end
 redis.call("zrem", KEYS[4], ARGV[1])
 redis.call("xadd", KEYS[3], "*", "c", ARGV[1], "t", "vacated", "ms", ARGV[2])
