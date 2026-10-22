@@ -46,9 +46,10 @@ if tonumber(fire) > tonumber(ARGV[2]) then
     return 0
 end
 
-redis.call("zrem", KEYS[4], ARGV[1])
 if tonumber(ARGV[6]) > 0 and redis.call("xlen", KEYS[3]) >= tonumber(ARGV[6]) then
+    -- Dropped at the cap: the pending entry stays, so the next sweep sends the event once the stream has room.
     return 2
 end
+redis.call("zrem", KEYS[4], ARGV[1])
 redis.call("xadd", KEYS[3], "*", "c", ARGV[1], "t", "vacated", "ms", ARGV[2])
 return 1

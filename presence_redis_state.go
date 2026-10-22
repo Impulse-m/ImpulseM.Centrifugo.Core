@@ -121,6 +121,10 @@ type RedisChannelStateConfig struct {
 	VacatedEventDelay time.Duration
 	// MaxStreamLength caps the events waiting for delivery in one partition; new events
 	// are dropped when the cap is reached. Negative removes the cap. Default 8192.
+	// A dropped occupied event is not sent again, and later subscribes of the channel send none
+	// either, so the application must reconcile the state from presence. A dropped vacated event
+	// stays pending, and a later sweep sends it once the stream has room. Drops are counted per
+	// event type in the events_dropped_count metric.
 	MaxStreamLength int
 	// SweepInterval is how often a partition is swept and its events are read. Default 1s.
 	SweepInterval time.Duration

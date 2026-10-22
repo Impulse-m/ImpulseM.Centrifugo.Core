@@ -148,6 +148,45 @@ func TestRedisChannelStateStreamCap(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 }
 
+// TestRedisChannelStateVacatedSurvivesStreamCap runs the check script on a stream at its cap, with a vacated
+// event due. The event is dropped, and its pending entry must stay, so that a later sweep sends the event once the
+// stream has room. The script runs on keys of the test, so the partition consumers do not touch them.
+func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
+	t.Parallel()
+	node := testStateNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(&testChannelStateCollector{}), 0, false, 6379)
+	client := pm.shards[0].client
+	ctx := context.Background()
+
+	stream := getUniqueStatePrefix() + ".stream"
+	pending := getUniqueStatePrefix() + ".pending"
+	expire := getUniqueStatePrefix() + ".expire"
+	set := getUniqueStatePrefix() + ".set"
+	hash := getUniqueStatePrefix() + ".hash"
+	const channel = "vac-1"
+	for range 3 {
+		require.NoError(t, client.Do(ctx, client.B().Xadd().Key(stream).Id("*").FieldValue().FieldValue("c", "occupied").FieldValue("t", "occupied").FieldValue("ms", "1").Build()).Error())
+	}
+	nowMs := time.Now().UnixMilli()
+	require.NoError(t, client.Do(ctx, client.B().Zadd().Key(pending).ScoreMember().ScoreMember(float64(nowMs-1), channel).Build()).Error())
+
+	checkArgs := []string{channel, strconv.FormatInt(nowMs, 10), strconv.FormatInt(nowMs/1000, 10), strconv.FormatInt(nowMs, 10), "0", "3", "0"}
+	keys := []string{set, hash, stream, pending, expire}
+	dropped, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs).AsInt64()
+	require.NoError(t, err)
+	require.Equal(t, int64(2), dropped)
+	_, err = client.Do(ctx, client.B().Zscore().Key(pending).Member(channel).Build()).AsFloat64()
+	require.NoError(t, err, "the pending entry of the dropped vacated event must stay")
+
+	require.NoError(t, client.Do(ctx, client.B().Xtrim().Key(stream).Maxlen().Threshold("0").Build()).Error())
+	sent, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs).AsInt64()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), sent)
+	length, err := client.Do(ctx, client.B().Xlen().Key(stream).Build()).AsInt64()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), length)
+}
+
 func TestRedisChannelStateTwoNodes(t *testing.T) {
 	t.Parallel()
 	prefix := getUniqueStatePrefix()
