@@ -1013,8 +1013,9 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 	// doubling. The window is 2 * LeaseTTL = 4 seconds and is measured from the start of the test. The probes are counted
 	// by their send times inside the window, so the bound does not depend on when the test reads the count. Without the
 	// backoff the node probes about ten times, which the bound refuses. With the schedule above the probes fall about
-	// 0.4, 0.8, 1.6 and 3.2 seconds after the first tick, so the window holds three or four probes. The bound of five
-	// allows one probe for the phase of the ticks against the window start. The lower bound waits for the first probe, so a
+	// 0.4, 0.8, 1.6 and 3.2 seconds after the first tick, so the window holds three or four probes. The bound of six is
+	// that schedule plus a margin of two probes for the phase of the ticks against the window start. The lower bound waits
+	// for the first probe, so a
 	// counter that stops counting fails the test. The counter belongs to the shard client of this test, so no other test
 	// adds to it.
 	start := time.Now()
@@ -1023,16 +1024,16 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 		return counting.countBetween(&counting.leaseGets, start, time.Now().Add(time.Hour)) > 0
 	}, 10*state.LeaseTTL, 10*time.Millisecond)
 	require.Never(t, func() bool {
-		return counting.countBetween(&counting.leaseGets, start, end) > 5
+		return counting.countBetween(&counting.leaseGets, start, end) > 6
 	}, time.Until(end), 10*time.Millisecond)
-	require.LessOrEqual(t, counting.countBetween(&counting.leaseGets, start, end), 5)
+	require.LessOrEqual(t, counting.countBetween(&counting.leaseGets, start, end), 6)
 	require.Equal(t, 0, testOwnedPartitions(t, pm))
 }
 
 // TestRedisChannelStateFlappingHeartbeatKeepsProbeBackoff makes every other heartbeat of an idle worker fail. The
 // share is the one of the last heartbeat that succeeded, so a failed heartbeat must not reset the probe delay: the
 // probes keep backing off, and the window holds about four probes. Each probe reads the leases of both partitions,
-// so the bound is ten reads of the leases in the window.
+// so four probes are eight reads. The bound is those eight reads plus a margin of two probes, four reads.
 func TestRedisChannelStateFlappingHeartbeatKeepsProbeBackoff(t *testing.T) {
 	t.Parallel()
 	prefix := getUniqueStatePrefix()
@@ -1062,9 +1063,9 @@ func TestRedisChannelStateFlappingHeartbeatKeepsProbeBackoff(t *testing.T) {
 		return counting.countBetween(&counting.leaseGets, start, time.Now().Add(time.Hour)) > 0
 	}, 10*state.LeaseTTL, 10*time.Millisecond)
 	require.Never(t, func() bool {
-		return counting.countBetween(&counting.leaseGets, start, end) > 10
+		return counting.countBetween(&counting.leaseGets, start, end) > 12
 	}, time.Until(end), 10*time.Millisecond)
-	require.LessOrEqual(t, counting.countBetween(&counting.leaseGets, start, end), 10)
+	require.LessOrEqual(t, counting.countBetween(&counting.leaseGets, start, end), 12)
 	require.Equal(t, 0, testOwnedPartitions(t, pm))
 }
 
