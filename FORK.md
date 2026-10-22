@@ -59,6 +59,9 @@ per partition. A cycle in between uses the count of the last one. The heartbeat 
 renewals. The cycle waits for the renewals and the heartbeat for at most a call timeout, LeaseTTL/3. A shard that does
 not answer in time is given up, so it cannot delay the renewals of the others. The acquisitions wait for at most a call
 timeout too, so a cycle lasts at most two call timeouts, two thirds of LeaseTTL, however long a shard takes to answer.
+A node with no free partition probes for one after a delay that doubles from one lease tick up to LeaseTTL. So a
+partition whose lease expires, or that a rebalance frees, is taken up to LeaseTTL later than the renewals suggest, and
+a crashed worker's partitions move to the survivors within about 2 LeaseTTL of its last renewal in the worst case.
 
 ## Single flight
 
