@@ -73,8 +73,8 @@ Config.UseSingleFlight shares a call between the callers that ask for the same k
 - Each caller that starts a shared call pays for two goroutines and a 10 second context timer. Callers that join a shared
   call pay for neither.
 - A panic in the broker call is raised again on the goroutine of each caller, so a caller can recover it.
-- A broker call that ends its goroutine with runtime.Goexit gives its callers the error "singleflight: shared call ended
-  without a result", so no caller waits for a result that never comes.
+- A broker call that ends its goroutine with runtime.Goexit gives its callers the error "call ended without a result", so no caller
+  waits for a result that never comes.
 
 ## Backlog
 
