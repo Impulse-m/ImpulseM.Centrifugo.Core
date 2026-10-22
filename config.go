@@ -192,11 +192,11 @@ type Config struct {
 	RecoveryMaxPublicationLimit int
 	// ClientTagsFilterMaxNodes limits the number of nodes in the tags filter that a client sends, when
 	// AllowTagsFilter is on. A filter over the limit is refused with the bad request error.
-	// By default, no limit used. See FORK.md, Client tags filter limits.
+	// Zero means the default, 128. A negative value turns the limit off. See FORK.md, Client tags filter limits.
 	ClientTagsFilterMaxNodes int
 	// ClientTagsFilterMaxValues limits the number of values in the comparisons of the tags filter that a client
 	// sends, when AllowTagsFilter is on. A filter over the limit is refused with the bad request error.
-	// By default, no limit used. See FORK.md, Client tags filter limits.
+	// Zero means the default, 128. A negative value turns the limit off. See FORK.md, Client tags filter limits.
 	ClientTagsFilterMaxValues int
 	// UseSingleFlight allows turning on mode where singleflight will be automatically used
 	// for Node.History (including recovery), Node.Presence/Node.PresenceStats,
