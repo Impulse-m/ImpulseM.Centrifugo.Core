@@ -19,7 +19,7 @@ const (
 	channelStateDefaultSweepInterval     = time.Second
 	channelStateDefaultLeaseTTL          = 5 * time.Second
 	channelStateDefaultBatchSize         = 100
-	channelStateMinLeaseTTL              = 5 * time.Millisecond
+	channelStateMinLeaseTTL              = 500 * time.Millisecond
 	channelStateMinSweepInterval         = 100 * time.Millisecond
 	channelStateSweepPageSize            = 100
 	channelStateSweepMaxPages            = 10
@@ -150,8 +150,8 @@ type RedisChannelStateConfig struct {
 	// renewals for its share: 64 s with 128 partitions and the default 5s. A node with no free partition
 	// probes for one after a delay that doubles from LeaseTTL/5 up to LeaseTTL, so a partition freed by a
 	// rebalance can be taken up to LeaseTTL later than the renewals suggest.
-	// Must be at least 5ms. Values below 500ms run the lease loop more often than every 100ms, with the
-	// Redis calls of each renewal and heartbeat, so use them only in tests. Default 5s.
+	// A value below 500ms is raised to 500ms when the manager is created, and a warning is logged, so the lease loop
+	// runs at most every 100ms. A negative value is refused. Default 5s.
 	LeaseTTL time.Duration
 	// BatchSize is the maximum number of events in one Handler call. Default 100.
 	BatchSize int
@@ -228,8 +228,14 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 	if leaseTTL == 0 {
 		leaseTTL = channelStateDefaultLeaseTTL
 	}
+	if leaseTTL < 0 {
+		return nil, errors.New("presence: channel state LeaseTTL must not be negative")
+	}
 	if leaseTTL < channelStateMinLeaseTTL {
-		return nil, errors.New("presence: channel state LeaseTTL must be at least 5ms")
+		m.node.logger.log(newLogEntry(LogLevelWarn, "channel state LeaseTTL is below 500ms, using 500ms", map[string]any{
+			"lease_ttl": leaseTTL.String(),
+		}))
+		leaseTTL = channelStateMinLeaseTTL
 	}
 
 	batchSize := config.BatchSize

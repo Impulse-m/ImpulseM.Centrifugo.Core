@@ -981,6 +981,19 @@ func TestRedisChannelStateCloseReleasesWhileConsumerHangs(t *testing.T) {
 // TestRedisChannelStateIdleWorkerProbeBackoff holds the only partition of the prefix with a lease of another owner.
 // The node owns nothing and wants its share, so it probes the lease key on each tick. Over ten ticks it must not
 // probe on every tick: the probes back off while every probe finds the partition held.
+// TestRedisChannelStateTinyTimingsAreRaised sets a SweepInterval and a LeaseTTL below their floors. The sweep is raised
+// to 100ms and the lease is raised to 500ms, so the lease loop runs at most every 100ms.
+func TestRedisChannelStateTinyTimingsAreRaised(t *testing.T) {
+	t.Parallel()
+	node := testStateNode(t)
+	config := testChannelStateConfig(&testChannelStateCollector{})
+	config.SweepInterval = time.Millisecond
+	config.LeaseTTL = 5 * time.Millisecond
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), config, 0, false, 6379)
+	require.Equal(t, 100*time.Millisecond, pm.state.sweepInterval)
+	require.Equal(t, 500*time.Millisecond, pm.state.leaseTTL)
+}
+
 func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 	t.Parallel()
 	prefix := getUniqueStatePrefix()

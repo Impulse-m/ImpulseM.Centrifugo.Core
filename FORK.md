@@ -31,6 +31,8 @@ with larger filters.
 ## Channel state
 
 RedisChannelStateConfig.SweepInterval below 100ms is raised to 100ms when the manager is created, and a warning is logged.
+RedisChannelStateConfig.LeaseTTL below 500ms is raised to 500ms the same way, so the lease tick is at least 100ms. Both
+floors are clamps, not refusals, and the defaults are unchanged.
 Every partition of a node sweeps on this interval, so the Redis load grows with 1/SweepInterval.
 
 A vacated event kept pending at the stream cap is retried after one SweepInterval, so the channels due behind it are
@@ -80,9 +82,3 @@ The items below are deferred. Each one needs a measurement or a design before a 
 - Owned partitions are swept on idle ticks. This is polling and needs an event-driven design under the no-polling rule.
 - A failing event blocks its partition. The sweep runs once per backoff step (see Cost of a failing delivery), not on
   every tick. A dead-letter design is still open, and no dead-letter stream exists.
-- Open, owner decision: the minimum LeaseTTL. The minimum is 5ms, which gives a lease tick of 1ms, so a LeaseTTL of 5ms
-  runs the lease loop about 1000 times per second. A floor, for example a LeaseTTL of 500ms with a tick of 100ms, is not
-  set, because the owner has not chosen the minimum. Any floor must leave every default unchanged. The
-  RedisChannelStateConfig.LeaseTTL note says to use values below 500ms only in tests.
-- Open, owner decision: the 100ms floor of SweepInterval. An explicit value below it is raised to 100ms with a warning.
-  The owner has not confirmed that floor, or refusing such values at config time instead.
