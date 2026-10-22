@@ -18,10 +18,11 @@ const (
 	channelStateMaxBackoff = 20 * time.Second
 	// channelStateLeaseRenewals is how many times a lease is renewed within its TTL.
 	channelStateLeaseRenewals = 5
-	// channelStateCallDivisor sets the timeout of a Redis call of the lease loop, and the minimum interval between two
-	// heartbeats: a third of LeaseTTL each. A heartbeat is written on the first lease tick after the interval, see
-	// leaseCycle.
+	// channelStateCallDivisor sets the timeout of a Redis call of the lease loop: a third of LeaseTTL each.
 	channelStateCallDivisor = 3
+	// channelStateHeartbeatDivisor sets the minimum interval between two heartbeats: a third of LeaseTTL. A heartbeat
+	// is written on the first lease tick after the interval, see leaseCycle.
+	channelStateHeartbeatDivisor = 3
 )
 
 // channelStateWorker holds the leases of the channel state partitions of a node and
@@ -192,10 +193,10 @@ func (w *channelStateWorker) leaseCycle() {
 	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
-// heartbeatInterval is the minimum time between two heartbeats of the worker: a third of LeaseTTL, the same
-// divisor as callTimeout, so an entry is renewed well before it expires.
+// heartbeatInterval is the minimum time between two heartbeats of the worker: a third of LeaseTTL, so an entry is
+// renewed well before it expires.
 func (w *channelStateWorker) heartbeatInterval() time.Duration {
-	return w.state.leaseTTL / channelStateCallDivisor
+	return w.state.leaseTTL / channelStateHeartbeatDivisor
 }
 
 // startHeartbeat writes the heartbeat on its own goroutine and returns the channel of its outcome.
