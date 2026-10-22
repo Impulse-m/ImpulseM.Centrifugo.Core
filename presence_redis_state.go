@@ -140,14 +140,13 @@ type RedisChannelStateConfig struct {
 	// Every partition of a node sweeps on this interval, so Redis load grows with 1/SweepInterval. Values
 	// below 100ms add that load for each partition and are only useful in tests.
 	SweepInterval time.Duration
-	// LeaseTTL is how long a partition lease lasts without renewal; a lease is renewed
-	// every LeaseTTL/5, and a Redis call of the lease loop gives up after LeaseTTL/3, so a reply that
-	// is slower than that gives up the shard for the cycle. A
-	// node that holds more than its share gives up one partition per
-	// renewal, so a node that joins a worker holding every partition waits about half of
-	// NumPartitions renewals for its share: 64 s with 128 partitions and the default 5s. A node with no free
-	// partition probes for one after a delay that doubles from LeaseTTL/5 up to LeaseTTL, so a partition
-	// freed by a rebalance can be taken up to LeaseTTL later than the renewals suggest.
+	// LeaseTTL is how long a partition lease lasts without renewal. A lease is renewed every LeaseTTL/5,
+	// and a Redis call of the lease loop gives up after LeaseTTL/3, so a reply that is slower than that
+	// gives up the shard for the cycle. A node that holds more than its share gives up one partition per
+	// renewal, so a node that joins a worker holding every partition waits about half of NumPartitions
+	// renewals for its share: 64 s with 128 partitions and the default 5s. A node with no free partition
+	// probes for one after a delay that doubles from LeaseTTL/5 up to LeaseTTL, so a partition freed by a
+	// rebalance can be taken up to LeaseTTL later than the renewals suggest.
 	// Must be at least 5ms. Values below 500ms run the lease loop more often than every 100ms, with the
 	// Redis calls of each renewal and heartbeat, so use them only in tests. Default 5s.
 	LeaseTTL time.Duration
