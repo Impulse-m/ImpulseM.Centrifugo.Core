@@ -537,7 +537,8 @@ func (w *channelStateWorker) leave() {
 // most the slots left of need. The loop waits for each shard for at most callTimeout: a shard that is given up
 // releases the leases it takes when it returns. A node whose worker count is unknown takes every free partition it
 // can (see leaseCycle), so it may exceed its share until the count is back. It returns true when it took no
-// partition and every probe got an answer, which means that no partition was free: the caller backs off.
+// partition, every probe got an answer, and no probe found a free partition, so no partition was free: the caller
+// backs off. A free partition that another node takes first keeps the caller from backing off.
 func (w *channelStateWorker) acquire(need int) bool {
 	w.forgetStopped()
 	candidates := make([]int, 0, w.state.numPartitions-len(w.owned))
@@ -567,7 +568,7 @@ func (w *channelStateWorker) acquire(need int) bool {
 			idle = false
 			continue
 		}
-		if res.value.failed || len(res.value.taken) > 0 {
+		if res.value.failed || res.value.sawFree || len(res.value.taken) > 0 {
 			idle = false
 		}
 		for _, part := range res.value.taken {
@@ -583,6 +584,8 @@ type acquireResult struct {
 	taken []*channelStatePartition
 	// failed says whether a probe or an attempt failed, so the partitions are unknown.
 	failed bool
+	// sawFree says whether a probe found a free partition, whether or not the attempt took it.
+	sawFree bool
 }
 
 // forgetStopped removes the partitions whose consumers have stopped from the retiring set.
@@ -618,6 +621,7 @@ func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int, rema
 
 	var errs callErrors
 	free := w.freePartitions(ctx, sh, partitions, &errs)
+	sawFree := len(free) > 0
 	free = free[:claimSlots(remaining, len(free))]
 
 	attempts := make([]*channelStatePartition, 0, len(free))
@@ -646,7 +650,7 @@ func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int, rema
 	}
 	w.releaseParts(failed)
 	w.reportCallErrors("channel state lease acquire failed", errs)
-	return acquireResult{taken: taken, failed: errs.failed > 0}
+	return acquireResult{taken: taken, failed: errs.failed > 0, sawFree: sawFree}
 }
 
 // freePartitions returns the partitions of one shard whose lease key is not held, in the order given. The keys are
