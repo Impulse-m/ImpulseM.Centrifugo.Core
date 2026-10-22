@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/rueidis"
 	"github.com/stretchr/testify/require"
 )
 
@@ -777,11 +778,13 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "OK", held)
 
-	// Ten lease ticks: a tick is a fifth of LeaseTTL.
+	// Ten lease ticks: a tick is a fifth of LeaseTTL. The backoff probes at about 0.4, 0.8, 1.6 and 3.2 seconds, so four
+	// probes fall in the window. INFO commandstats counts the GETs of other tests on the shared server too, so the bound
+	// adds two for them. Without the backoff the node probes about ten times, which the bound refuses.
 	before := testCommandCalls(t, pm.shards[0], "get")
 	time.Sleep(2 * state.LeaseTTL)
 	probes := testCommandCalls(t, pm.shards[0], "get") - before
-	require.LessOrEqual(t, probes, int64(5))
+	require.LessOrEqual(t, probes, int64(6))
 	require.Equal(t, 0, testOwnedPartitions(t, pm))
 }
 
@@ -796,11 +799,39 @@ func TestRedisChannelStateHeartbeatRate(t *testing.T) {
 	waitForChannelStatePartitions(t, pm, 1)
 
 	// Ten lease ticks, which is two LeaseTTL: one heartbeat per tick would write ten times.
-	before := testCommandCalls(t, pm.shards[0], "zadd")
-	time.Sleep(2 * state.LeaseTTL)
-	heartbeats := testCommandCalls(t, pm.shards[0], "zadd") - before
-	require.LessOrEqual(t, heartbeats, int64(7))
+	heartbeats := testHeartbeatWrites(t, pm, 2*state.LeaseTTL)
+	require.GreaterOrEqual(t, heartbeats, 1)
+	require.LessOrEqual(t, heartbeats, 7)
 	require.Equal(t, 1, testOwnedPartitions(t, pm))
+}
+
+// testHeartbeatWrites samples the score of the node's own entry in the workers set for the window and returns how
+// many times the score changed. A heartbeat sets the score to the time of the write plus LeaseTTL, and two heartbeats
+// are at least a heartbeat interval apart, so each change is one heartbeat. The entry is per node, so the writes of
+// other tests on the shared server do not count.
+func testHeartbeatWrites(tb testing.TB, pm *RedisPresenceManager, window time.Duration) int {
+	tb.Helper()
+	client := pm.state.workersShard.client
+	member := pm.state.worker.node.uid
+	ctx := context.Background()
+	score := func() (float64, bool) {
+		value, err := client.Do(ctx, client.B().Zscore().Key(pm.state.workersKey).Member(member).Build()).AsFloat64()
+		if rueidis.IsRedisNil(err) {
+			return 0, false
+		}
+		require.NoError(tb, err)
+		return value, true
+	}
+	last, _ := score()
+	writes := 0
+	for deadline := time.Now().Add(window); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		value, ok := score()
+		if ok && value != last {
+			writes++
+			last = value
+		}
+	}
+	return writes
 }
 
 // countChannelStateGoroutines counts the goroutines that run the channel state worker.
