@@ -153,9 +153,12 @@ func (w *channelStateWorker) run() {
 // leaseCycle renews the owned leases, publishes this worker, and rebalances the partitions by the number of
 // workers the heartbeat counts. The worker writes its heartbeat at most once per heartbeatInterval, on the first
 // lease tick after the interval has passed, so with the default ticks the heartbeat comes up to about 0.4 * LeaseTTL
-// apart. Under a slow shard the gap can reach about 0.87 * LeaseTTL: one buffered tick plus a cycle of up to two
-// call timeouts. That is still under LeaseTTL, with a margin of about 0.13 * LeaseTTL. A cycle in between uses the
-// count of the last one. The heartbeat runs only when it is due, beside the renewals, and the cycle waits for their
+// apart. Under a slow shard the gap can reach about one LeaseTTL: a cycle can start up to two call timeouts after the
+// one before it, and its heartbeat can land up to one call timeout after its start. Master has the same worst case,
+// since it heartbeats in every cycle. A worker that is counted out for that long is left out of the share of the
+// other workers for about one cycle, so they take a few more partitions meanwhile. The lease is the guard: it keeps
+// one consumer per partition. A cycle in between uses the count of the last one. The heartbeat runs only when it is
+// due, beside the renewals, and the cycle waits for their
 // replies for at most callTimeout. A shard that does not answer in time is given up, so it cannot delay the renewals
 // of the others. The acquisitions wait for at most callTimeout too: a cycle lasts at most two call timeouts, two
 // thirds of LeaseTTL at the most, however long a shard takes to answer.
@@ -182,7 +185,7 @@ func (w *channelStateWorker) leaseCycle() {
 		// one consumer per partition. The worker may hold more than its share until the count is known again.
 		w.state.metrics.incSweepErrors()
 		w.node.logger.log(newErrorLogEntry(hb.err, "channel state worker heartbeat failed", nil))
-		w.rebalance(w.state.numPartitions)
+		w.takeFree()
 	} else {
 		if due {
 			w.lastHeartbeat = start
@@ -301,18 +304,32 @@ func (w *channelStateWorker) rebalance(share int) {
 			w.probe.reset()
 			w.probeUntil = time.Time{}
 		}
-		if time.Now().Before(w.probeUntil) {
-			return
-		}
-		// A probe that found every partition leased delays the next one: the delay doubles from one lease tick up to
-		// LeaseTTL, so a node with no free partition probes about once per LeaseTTL in steady state.
-		// A partition whose lease expires is taken at most LeaseTTL later than without the delay.
-		if w.acquire(share - len(w.owned)) {
-			w.probeUntil = time.Now().Add(w.probe.next())
-		} else {
-			w.probe.reset()
-			w.probeUntil = time.Time{}
-		}
+		w.probeFree(share - len(w.owned))
+	}
+}
+
+// takeFree takes free partitions while the share is unknown, because the heartbeat failed. The owned partitions
+// are kept. The probe state of the last known share is kept too, so a heartbeat that flaps between errors and
+// successes does not reset the probe delay on every cycle.
+func (w *channelStateWorker) takeFree() {
+	if len(w.owned) < w.state.numPartitions {
+		w.probeFree(w.state.numPartitions - len(w.owned))
+	}
+}
+
+// probeFree acquires up to want partitions unless the probe delay has not passed. A probe that finds every partition
+// leased delays the next one: the delay doubles from one lease tick up to LeaseTTL, so a node with no free partition
+// probes about once per LeaseTTL in steady state. A partition whose lease expires is taken at most LeaseTTL later than
+// without the delay.
+func (w *channelStateWorker) probeFree(want int) {
+	if time.Now().Before(w.probeUntil) {
+		return
+	}
+	if w.acquire(want) {
+		w.probeUntil = time.Now().Add(w.probe.next())
+	} else {
+		w.probe.reset()
+		w.probeUntil = time.Time{}
 	}
 }
 
@@ -768,7 +785,7 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 				}
 				// The events stay in the stream, so the same batch is delivered again. The step returns after the
 				// delay, so the consumer runs the sweep of the partition before it delivers the batch again: the
-				// sweeps keep running while a failing event blocks the delivery, unless the stream is full (see sweep).
+				// sweeps keep running while a failing event blocks the delivery, also when the stream is full (see sweep).
 				w.state.metrics.incDeliveryErrors()
 				w.logError(err, "channel state delivery failed", p)
 				return w.wait(ctx, backoff)
@@ -795,9 +812,8 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 
 // sweep moves the channels that are due in the partition to their next state: a
 // vacated event when the delay has passed, or an armed delay when the presence expired.
-// A vacated event kept pending by a full stream stops the sweep for this step: the pending entries
-// stay at the head of the due set, so the next page would hold the same channels, and the next step
-// tries again once the consumer has made room.
+// A vacated event kept pending by a full stream is moved one sweep interval ahead by its check, so it leaves
+// the due set and the pages behind it are swept in the same step. The pages are bounded by channelStateSweepMaxPages.
 func (w *channelStateWorker) sweep(ctx context.Context, sh *RedisShard, p int) error {
 	nowMs := time.Now().UnixMilli()
 	for page := 0; page < channelStateSweepMaxPages; page++ {
@@ -806,12 +822,8 @@ func (w *channelStateWorker) sweep(ctx context.Context, sh *RedisShard, p int) e
 			return err
 		}
 		if len(channels) > 0 {
-			kept, err := w.state.checkChannels(ctx, sh, p, channels, nowMs)
-			if err != nil {
+			if err := w.state.checkChannels(ctx, sh, p, channels, nowMs); err != nil {
 				return err
-			}
-			if kept {
-				return nil
 			}
 		}
 		if !full {

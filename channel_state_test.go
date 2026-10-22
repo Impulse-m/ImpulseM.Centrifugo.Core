@@ -84,6 +84,11 @@ type countingShardClient struct {
 	mu          sync.Mutex
 	leaseGets   []time.Time
 	workerZadds []time.Time
+	// flapping makes every other heartbeat fail. The failing heartbeats are sent to wrongTypeKey, a string key,
+	// which Redis refuses for a sorted set command. heartbeatFails is the state of the flapping.
+	flapping       bool
+	heartbeatFails bool
+	wrongTypeKey   string
 }
 
 // DoMulti records the commands of the pipeline and sends them on.
@@ -98,9 +103,43 @@ func (c *countingShardClient) DoMulti(ctx context.Context, multi ...rueidis.Comp
 			c.record(&c.leaseGets)
 		case words[0] == "ZADD" && strings.HasSuffix(words[1], ".channel_state.workers"):
 			c.record(&c.workerZadds)
+			if c.nextHeartbeatFails() {
+				return c.Client.DoMulti(ctx, c.failingCommands(len(multi))...)
+			}
 		}
 	}
 	return c.Client.DoMulti(ctx, multi...)
+}
+
+// flapHeartbeats makes every other heartbeat from now on fail, with the wrong type error of wrongTypeKey.
+func (c *countingShardClient) flapHeartbeats(wrongTypeKey string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flapping = true
+	c.wrongTypeKey = wrongTypeKey
+}
+
+// nextHeartbeatFails reports whether the heartbeat that is sent now fails. It toggles the flapping state.
+func (c *countingShardClient) nextHeartbeatFails() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.flapping {
+		return false
+	}
+	c.heartbeatFails = !c.heartbeatFails
+	return c.heartbeatFails
+}
+
+// failingCommands returns count sorted set commands on the wrong type key, which Redis refuses.
+func (c *countingShardClient) failingCommands(count int) []rueidis.Completed {
+	c.mu.Lock()
+	key := c.wrongTypeKey
+	c.mu.Unlock()
+	cmds := make([]rueidis.Completed, 0, count)
+	for range count {
+		cmds = append(cmds, c.B().Zadd().Key(key).ScoreMember().ScoreMember(0, "failing").Build())
+	}
+	return cmds
 }
 
 // record appends the current time to the events.
@@ -220,8 +259,9 @@ func TestRedisChannelStateStreamCap(t *testing.T) {
 }
 
 // TestRedisChannelStateVacatedSurvivesStreamCap runs the check script on a stream at its cap, with a vacated
-// event due. The event is kept pending, and its pending entry must stay, so that a later sweep sends the event once
-// the stream has room. The script runs on keys of the test, so the partition consumers do not touch them.
+// event due. The event is kept pending, and its pending entry stays, moved one sweep interval ahead, so that a later
+// sweep sends the event once the stream has room. The script runs on keys of the test, so the partition consumers do
+// not touch them.
 func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 	t.Parallel()
 	node := testStateNode(t)
@@ -241,16 +281,21 @@ func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 	nowMs := time.Now().UnixMilli()
 	require.NoError(t, client.Do(ctx, client.B().Zadd().Key(pending).ScoreMember().ScoreMember(float64(nowMs-1), channel).Build()).Error())
 
-	checkArgs := []string{channel, strconv.FormatInt(nowMs, 10), strconv.FormatInt(nowMs/1000, 10), strconv.FormatInt(nowMs, 10), "0", "3", "0", strconv.Itoa(channelStateExpiredBatch)}
+	const sweepIntervalMs = 1000
+	checkArgs := func(now int64) []string {
+		return []string{channel, strconv.FormatInt(now, 10), strconv.FormatInt(now/1000, 10), strconv.FormatInt(now, 10), "0", "3", "0", strconv.Itoa(channelStateExpiredBatch), strconv.Itoa(sweepIntervalMs)}
+	}
 	keys := []string{set, hash, stream, pending, expire}
-	kept, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs).AsInt64()
+	kept, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs(nowMs)).AsInt64()
 	require.NoError(t, err)
 	require.Equal(t, int64(channelStateKeptPending), kept)
-	_, err = client.Do(ctx, client.B().Zscore().Key(pending).Member(channel).Build()).AsFloat64()
-	require.NoError(t, err, "the pending entry of the dropped vacated event must stay")
+	// The kept event is moved one sweep interval ahead, so the sweep does not find it due again before then.
+	score, err := client.Do(ctx, client.B().Zscore().Key(pending).Member(channel).Build()).AsFloat64()
+	require.NoError(t, err, "the pending entry of the kept vacated event must stay")
+	require.Equal(t, float64(nowMs+sweepIntervalMs), score)
 
 	require.NoError(t, client.Do(ctx, client.B().Xtrim().Key(stream).Maxlen().Threshold("0").Build()).Error())
-	sent, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs).AsInt64()
+	sent, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs(nowMs+sweepIntervalMs)).AsInt64()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), sent)
 	length, err := client.Do(ctx, client.B().Xlen().Key(stream).Build()).AsInt64()
@@ -259,8 +304,9 @@ func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 }
 
 // TestRedisChannelStateSweepStopsAtFullStream leaves 150 due vacated channels pending in one partition whose stream
-// is full, and whose handler never runs, so the stream stays full. A sweep checks one page of them and stops there:
-// the pending entries stay at the head of the set, so the next page would check the same channels again.
+// is full, and whose handler never runs, so the stream stays full. One sweep checks every page of them: each kept
+// event moves one sweep interval ahead, so no channel is due after the sweep and the sweep does not stop at the
+// first page.
 func TestRedisChannelStateSweepStopsAtFullStream(t *testing.T) {
 	t.Parallel()
 	state := testChannelStateConfig(&testChannelStateCollector{})
@@ -295,10 +341,55 @@ func TestRedisChannelStateSweepStopsAtFullStream(t *testing.T) {
 
 	err = pm.state.worker.sweep(ctx, pm.state.shardOf(0), 0)
 	require.NoError(t, err)
+	due, err := client.Do(ctx, client.B().Zcount().Key(pending).Min("-inf").Max(strconv.FormatInt(nowMs, 10)).Build()).AsInt64()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), due, "every due channel is checked in one sweep, and the kept ones are due again after the interval")
 	left, err := client.Do(ctx, client.B().Zcard().Key(pending).Build()).AsInt64()
 	require.NoError(t, err)
-	require.Greater(t, left, int64(channelStateSweepPageSize), "the channels behind the page must stay pending for the next step")
+	require.Equal(t, int64(dueChannels), left, "the kept channels stay pending, one interval ahead")
 	require.Equal(t, 0.0, metricValue(t, pm.state.metrics.eventsDropped.WithLabelValues(string(ChannelStateVacated))), "a vacated event kept pending is not a drop")
+}
+
+// TestRedisChannelStateKeptChannelDoesNotStopSweep leaves 100 due vacated channels in one partition whose stream is
+// full, so their events are kept, and one channel behind them whose presence expired. The sweep checks the channels in
+// batches of 100, and the channel behind the kept ones is in the second batch, so it is resolved only if a kept event
+// does not end the sweep.
+func TestRedisChannelStateKeptChannelDoesNotStopSweep(t *testing.T) {
+	t.Parallel()
+	state := testChannelStateConfig(&testChannelStateCollector{})
+	state.Handler = func(_ context.Context, _ []ChannelStateEvent) error {
+		return errors.New("backend unavailable")
+	}
+	state.NumPartitions = 1
+	state.MaxStreamLength = 1
+	// The partition is leased by another owner for the whole test, so the node runs no consumer of its own.
+	state.LeaseTTL = time.Minute
+	node := testStateNode(t)
+	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
+	require.NoError(t, err)
+	pm := newTestRedisPresenceStateManagerWithShards(t, node, getUniqueStatePrefix(), state, 0, false, []*RedisShard{shard})
+	client := pm.shards[0].client
+	ctx := context.Background()
+	held, err := client.Do(ctx, client.B().Set().Key(string(pm.state.partitionKey(0, "lease"))).Value("other-owner").Nx().PxMilliseconds(60000).Build()).ToString()
+	require.NoError(t, err)
+	require.Equal(t, "OK", held)
+	pending := string(pm.state.partitionKey(0, "pending"))
+	expire := string(pm.state.partitionKey(0, "expire"))
+
+	require.NoError(t, client.Do(ctx, client.B().Xadd().Key(string(pm.state.partitionKey(0, "stream"))).Id("*").FieldValue().FieldValue("c", "full").FieldValue("t", "occupied").FieldValue("ms", "1").Build()).Error())
+	require.Equal(t, int64(1), testStreamLength(t, pm, 0), "the stream must be full before the sweep")
+
+	nowMs := time.Now().UnixMilli()
+	for i := range channelStateSweepPageSize {
+		require.NoError(t, client.Do(ctx, client.B().Zadd().Key(pending).ScoreMember().ScoreMember(float64(nowMs-1000), "a-kept-"+strconv.Itoa(i)).Build()).Error())
+	}
+	require.NoError(t, client.Do(ctx, client.B().Zadd().Key(expire).ScoreMember().ScoreMember(float64(nowMs-1000), "z-behind").Build()).Error())
+
+	require.NoError(t, pm.state.worker.sweep(ctx, pm.state.shardOf(0), 0))
+	_, err = client.Do(ctx, client.B().Zscore().Key(pending).Member("z-behind").Build()).AsFloat64()
+	require.NoError(t, err, "the channel behind the kept events must be swept in the same step")
+	_, err = client.Do(ctx, client.B().Zscore().Key(expire).Member("z-behind").Build()).AsFloat64()
+	require.True(t, rueidis.IsRedisNil(err), "the expired presence of the channel behind the kept events must be resolved")
 }
 
 // TestRedisChannelStateFailingDeliveryReturnsToSweep runs one consume step of a partition whose handler fails. The
@@ -429,7 +520,9 @@ func TestRedisChannelStateCrashedWorkerPartitionsMove(t *testing.T) {
 	}, 3*testChannelStateLeaseTTL, 10*time.Millisecond)
 
 	// The survivor takes the partitions once the lease of the crashed worker has expired. Its probe of a held
-	// partition backs off up to LeaseTTL, so the takeover can take about 1.5 LeaseTTL after the crash.
+	// partition backs off up to LeaseTTL. The worst case is about 2 LeaseTTL: the lease of the crashed worker expires up
+	// to LeaseTTL after its last renewal, and the probe delay of the survivor can add up to another LeaseTTL. The bound
+	// below, 3 LeaseTTL and one second, covers that worst case.
 	shards2[0].Close()
 	require.Eventually(t, func() bool {
 		return testOwnedPartitions(t, pm1) == 8
@@ -848,7 +941,9 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 	// tick and is capped at LeaseTTL, and the probes land on the ticks, so the spacing is quantized and not exactly the
 	// doubling. The window is 2 * LeaseTTL = 4 seconds and is measured from the start of the test. The probes are counted
 	// by their send times inside the window, so the bound does not depend on when the test reads the count. Without the
-	// backoff the node probes about ten times, which the bound refuses. The lower bound waits for the first probe, so a
+	// backoff the node probes about ten times, which the bound refuses. With the schedule above the probes fall about
+	// 0.4, 0.8, 1.6 and 3.2 seconds after the first tick, so the window holds three or four probes. The bound of five
+	// allows one probe for the phase of the ticks against the window start. The lower bound waits for the first probe, so a
 	// counter that stops counting fails the test. The counter belongs to the shard client of this test, so no other test
 	// adds to it.
 	start := time.Now()
@@ -860,6 +955,45 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 		return counting.countBetween(&counting.leaseGets, start, end) > 5
 	}, time.Until(end), 10*time.Millisecond)
 	require.LessOrEqual(t, counting.countBetween(&counting.leaseGets, start, end), 5)
+	require.Equal(t, 0, testOwnedPartitions(t, pm))
+}
+
+// TestRedisChannelStateFlappingHeartbeatKeepsProbeBackoff makes every other heartbeat of an idle worker fail. The
+// share is the one of the last heartbeat that succeeded, so a failed heartbeat must not reset the probe delay: the
+// probes keep backing off, and the window holds about four probes. Each probe reads the leases of both partitions,
+// so the bound is ten reads of the leases in the window.
+func TestRedisChannelStateFlappingHeartbeatKeepsProbeBackoff(t *testing.T) {
+	t.Parallel()
+	prefix := getUniqueStatePrefix()
+	state := testChannelStateConfig(&testChannelStateCollector{})
+	state.NumPartitions = 2
+	state.LeaseTTL = 2 * time.Second
+	pm, counting := newCountingChannelStateNode(t, prefix, state)
+
+	client := pm.shards[0].client
+	ctx := context.Background()
+	// Another worker counts in the workers set, so the share of this node is one of the two partitions.
+	require.NoError(t, client.Do(ctx, client.B().Zadd().Key(pm.state.workersKey).ScoreMember().ScoreMember(float64(time.Now().Add(time.Hour).UnixMilli()), "other-worker").Build()).Error())
+	for p := range state.NumPartitions {
+		held, err := client.Do(ctx, client.B().Set().Key(string(pm.state.partitionKey(p, "lease"))).Value("other-owner").Nx().PxMilliseconds(60000).Build()).ToString()
+		require.NoError(t, err)
+		require.Equal(t, "OK", held)
+	}
+	wrongTypeKey := prefix + ".string"
+	require.NoError(t, client.Do(ctx, client.B().Set().Key(wrongTypeKey).Value("string").Build()).Error())
+	counting.flapHeartbeats(wrongTypeKey)
+
+	// The window is two LeaseTTL. The lower bound waits for the first probe of the window, so a counter that stops
+	// counting fails the test.
+	start := time.Now()
+	end := start.Add(2 * state.LeaseTTL)
+	require.Eventually(t, func() bool {
+		return counting.countBetween(&counting.leaseGets, start, time.Now().Add(time.Hour)) > 0
+	}, 2*state.LeaseTTL, 10*time.Millisecond)
+	require.Never(t, func() bool {
+		return counting.countBetween(&counting.leaseGets, start, end) > 10
+	}, time.Until(end), 10*time.Millisecond)
+	require.LessOrEqual(t, counting.countBetween(&counting.leaseGets, start, end), 10)
 	require.Equal(t, 0, testOwnedPartitions(t, pm))
 }
 

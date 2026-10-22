@@ -13,8 +13,10 @@
 -- ARGV[6] - max stream length, 0 means no cap
 -- ARGV[7] - presence TTL in milliseconds
 -- ARGV[8] - expired entries removed per call
+-- ARGV[9] - sweep interval in milliseconds, the delay of a vacated event kept pending
 -- Returns 0 when nothing is written, 1 when the vacated event is written to the stream, and 3 when the event is
--- kept pending because the stream is at its cap.
+-- kept pending because the stream is at its cap. A kept event is moved one sweep interval ahead in the pending set,
+-- so the sweep of the partition moves on to the channels due behind it.
 
 local more = false
 if ARGV[5] == '0' then
@@ -58,7 +60,9 @@ if tonumber(fire) > tonumber(ARGV[2]) then
 end
 
 if tonumber(ARGV[6]) > 0 and redis.call("xlen", KEYS[3]) >= tonumber(ARGV[6]) then
-    -- Kept pending at the cap: the pending entry stays, so the next sweep sends the event once the stream has room.
+    -- Kept pending at the cap: the next sweep retries it after one sweep interval, and sends the event once the stream
+    -- has room. Until then the entry is not due, so the channels behind it are swept.
+    redis.call("zadd", KEYS[4], tonumber(ARGV[2]) + tonumber(ARGV[9]), ARGV[1])
     return 3
 end
 redis.call("zrem", KEYS[4], ARGV[1])

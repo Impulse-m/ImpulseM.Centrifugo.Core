@@ -33,10 +33,9 @@ with larger filters.
 RedisChannelStateConfig.SweepInterval below 100ms is raised to 100ms when the manager is created, and a warning is logged.
 Every partition of a node sweeps on this interval, so the Redis load grows with 1/SweepInterval.
 
-A vacated event kept pending at the stream cap stops the sweep of its partition until the stream has room, so the
-channels due behind it wait too. The partition then logs "channel state vacated event kept pending" at most once a
-minute, which is the signal of the stall. A dropped occupied event is counted in the events_dropped_count metric and
-logged at the same rate.
+A vacated event kept pending at the stream cap is retried after one SweepInterval, so the channels due behind it are
+swept in the same step. The partition logs "channel state vacated event kept pending" at most once a minute while a
+stream stays full. A dropped occupied event is counted in the events_dropped_count metric and logged at the same rate.
 
 ## Single flight
 
@@ -62,3 +61,7 @@ The items below are deferred. Each one needs a measurement or a design before a 
   is still open, and no dead-letter stream exists.
 - A broker call that ends its goroutine with runtime.Goexit leaves its callers waiting for their own contexts. A fix
   needs a goroutine per shared call or a bound on the caller side.
+- The minimum LeaseTTL is 5ms, which gives a lease tick of 1ms. A floor that gives a tick of 100ms, a LeaseTTL of
+  500ms, is not set, because the owner has not chosen the minimum and the tests use short leases. Below 500ms the
+  lease loop runs more often than every 100ms, with the Redis calls of each renewal and heartbeat, so the
+  RedisChannelStateConfig.LeaseTTL note says to use such values only in tests.

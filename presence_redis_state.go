@@ -117,9 +117,9 @@ type RedisChannelStateConfig struct {
 	// Handler receives the events. Required. An error keeps the batch in the stream, and the batch is
 	// delivered again after a delay that grows. The redelivery comes at the first sweep tick after the
 	// delay, so the gap is the delay plus up to one SweepInterval. So an event that always fails blocks
-	// the delivery of its partition, while the sweeps of the partition keep running. The exception is a full
-	// stream: a vacated event kept pending at the cap stops the sweep of the partition until the stream has
-	// room, so the channels due behind it wait too. There is no dead-letter stream.
+	// the delivery of its partition, while the sweeps of the partition keep running. A full stream does not stop
+	// the sweeps either: a vacated event kept pending at the cap is retried after SweepInterval, so the channels
+	// due behind it are swept too. There is no dead-letter stream.
 	Handler ChannelStateHandler
 	// NumPartitions is the number of partitions that serialize channel state in Redis.
 	// It must not change while channels are occupied. Default 128.
@@ -383,9 +383,10 @@ func (s *presenceState) removePresence(sh *RedisShard, channel string, clientID 
 }
 
 // checkChannels runs the sweep check of the channels of one partition, in batches of
-// channelStateSweepPageSize pipelined commands. It stops after the batch in which a vacated event is kept
-// pending by a full stream, and reports that with kept: the next batch would find the stream full as well.
-func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int, channels []string, nowMs int64) (kept bool, err error) {
+// channelStateSweepPageSize pipelined commands. A vacated event kept pending by a full stream is not an error:
+// the script moves its pending entry one sweep interval ahead, so the next sweep retries it, and the channels due
+// behind it are checked in the batches that follow.
+func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int, channels []string, nowMs int64) error {
 	stream := string(s.partitionKey(p, "stream"))
 	pending := string(s.partitionKey(p, "pending"))
 	expire := string(s.partitionKey(p, "expire"))
@@ -395,6 +396,7 @@ func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int
 	useHashFieldTTL := s.manager.useHashFieldTTLArg()
 	maxLenStr := strconv.Itoa(s.maxStreamLength)
 	ttlStr := strconv.FormatInt(s.manager.config.PresenceTTL.Milliseconds(), 10)
+	sweepIntervalStr := strconv.FormatInt(s.sweepInterval.Milliseconds(), 10)
 
 	for start := 0; start < len(channels); start += channelStateSweepPageSize {
 		end := min(start+channelStateSweepPageSize, len(channels))
@@ -402,25 +404,18 @@ func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int
 		for _, channel := range channels[start:end] {
 			execs = append(execs, rueidis.LuaExec{
 				Keys: []string{string(s.stateSetKey(channel)), string(s.stateHashKey(channel)), stream, pending, expire},
-				Args: []string{channel, nowStr, nowSecStr, fireStr, useHashFieldTTL, maxLenStr, ttlStr, s.expiredBatch},
+				Args: []string{channel, nowStr, nowSecStr, fireStr, useHashFieldTTL, maxLenStr, ttlStr, s.expiredBatch, sweepIntervalStr},
 			})
 		}
-		batchKept := false
 		for _, res := range s.checkScript.ExecMulti(ctx, sh.client, execs...) {
 			result, err := res.AsInt64()
 			if err != nil {
-				return false, err
+				return err
 			}
 			s.countResult(ChannelStateVacated, result)
-			if result == channelStateKeptPending {
-				batchKept = true
-			}
-		}
-		if batchKept {
-			return true, nil
 		}
 	}
-	return false, nil
+	return nil
 }
 
 // countResult counts the outcome of a state script: 1 is an event written to the stream,
@@ -451,13 +446,13 @@ func (s *presenceState) logDropped(eventType ChannelStateEventType) {
 	}))
 }
 
-// logKeptPending logs a vacated event kept pending at the stream cap at most once per minute. The sweep of its
-// partition waits until the stream has room, so the log names the stall.
+// logKeptPending logs a vacated event kept pending at the stream cap at most once per minute. The event is retried
+// after one sweep interval, so the log names the full stream as the cause.
 func (s *presenceState) logKeptPending() {
 	if !s.allowLog(&s.keptLoggedAt) {
 		return
 	}
-	s.manager.node.logger.log(newLogEntry(LogLevelWarn, "channel state vacated event kept pending: the stream of the partition is full, its sweep waits", map[string]any{
+	s.manager.node.logger.log(newLogEntry(LogLevelWarn, "channel state vacated event kept pending: the stream of the partition is full, the event is retried", map[string]any{
 		"max_stream_length": s.maxStreamLength,
 	}))
 }
