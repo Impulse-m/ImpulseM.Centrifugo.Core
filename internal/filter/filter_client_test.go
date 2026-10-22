@@ -33,19 +33,18 @@ func TestValidateClientRejectsLargeFilters(t *testing.T) {
 	require.Error(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}, maxNodes, maxValues))
 }
 
-// TestValidateClientDefaultLimits checks that a zero limit selects the default limits, and that a negative limit
-// means no limit.
-func TestValidateClientDefaultLimits(t *testing.T) {
+// TestValidateClientZeroMeansNoLimit checks that a zero or negative limit accepts a filter of any size that
+// the filter validation accepts, so no limit is on unless it is set.
+func TestValidateClientZeroMeansNoLimit(t *testing.T) {
 	t.Parallel()
-	require.NoError(t, ValidateClient(notChain(DefaultClientMaxNodes-1), 0, 0))
-	require.Error(t, ValidateClient(notChain(DefaultClientMaxNodes), 0, 0))
+	require.NoError(t, ValidateClient(notChain(1000), 0, 0))
 	require.NoError(t, ValidateClient(notChain(1000), -1, -1))
 
-	vals := make([]string, DefaultClientMaxValues+1)
+	vals := make([]string, 2000)
 	for i := range vals {
 		vals[i] = "v" + fmt.Sprint(i)
 	}
-	require.Error(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}, 0, 0))
+	require.NoError(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}, 0, 0))
 	require.NoError(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}, 0, -1))
 }
 

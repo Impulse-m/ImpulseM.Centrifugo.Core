@@ -22,8 +22,19 @@ that Redis expires the fields itself.
 ## Client tags filter limits
 
 A client filter is limited in size by Config.ClientTagsFilterMaxNodes and Config.ClientTagsFilterMaxValues, when
-SubscribeOptions.AllowTagsFilter is on. Zero selects the defaults of 256 nodes and 1024 values. A negative value means
-no limit. A filter over the limit is refused with the bad request error.
+SubscribeOptions.AllowTagsFilter is on. Zero, the default, means no limit, and so does a negative value. A filter over a
+set limit is refused with the bad request error. A limit of 256 nodes and 1024 values is a reasonable choice for an
+application whose clients are not trusted.
+
+## Channel state
+
+RedisChannelStateConfig.SweepInterval below 100ms is raised to 100ms when the manager is created, and a warning is logged.
+Every partition of a node sweeps on this interval, so the Redis load grows with 1/SweepInterval.
+
+A vacated event kept pending at the stream cap stops the sweep of its partition until the stream has room, so the
+channels due behind it wait too. The partition then logs "channel state vacated event kept pending" at most once a
+minute, which is the signal of the stall. A dropped occupied event is counted in the events_dropped_count metric and
+logged at the same rate.
 
 ## Single flight
 

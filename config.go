@@ -150,7 +150,7 @@ type Config struct {
 	// ClientChannelPositionCheckDelay defines minimal time from previous
 	// client position check in channel. If client does not pass check it
 	// will be disconnected with DisconnectInsufficientState.
-	// Zero value means 40 * time.Second.
+	// Zero value means 40 * time.Second. See FORK.md, Client channel position check, for the cost on large channels.
 	ClientChannelPositionCheckDelay time.Duration
 	// Maximum allowed time lag for publications for subscribers with positioning on.
 	// When exceeded we mark connection with insufficient state. By default, not used - i.e.
@@ -191,16 +191,16 @@ type Config struct {
 	// By default, no limit used.
 	RecoveryMaxPublicationLimit int
 	// ClientTagsFilterMaxNodes limits the number of nodes in the tags filter that a client sends, when
-	// AllowTagsFilter is on. A filter over the limit is refused with the bad request error. Zero selects
-	// the default of 256 nodes, and a negative value means no limit.
+	// AllowTagsFilter is on. A filter over the limit is refused with the bad request error.
+	// By default, no limit used. See FORK.md, Client tags filter limits.
 	ClientTagsFilterMaxNodes int
 	// ClientTagsFilterMaxValues limits the number of values in the comparisons of the tags filter that a client
-	// sends, when AllowTagsFilter is on. A filter over the limit is refused with the bad request error. Zero
-	// selects the default of 1024 values, and a negative value means no limit.
+	// sends, when AllowTagsFilter is on. A filter over the limit is refused with the bad request error.
+	// By default, no limit used. See FORK.md, Client tags filter limits.
 	ClientTagsFilterMaxValues int
 	// UseSingleFlight allows turning on mode where singleflight will be automatically used
 	// for Node.History (including recovery), Node.Presence/Node.PresenceStats,
-	// and Node.MapStateRead/Node.MapStreamRead/Node.MapStats calls.
+	// and Node.MapStateRead/Node.MapStreamRead/Node.MapStats calls. See FORK.md, Single flight, for the bound of a shared read.
 	UseSingleFlight bool
 	// HistoryMetaTTL sets a time of stream meta key expiration in Redis. Stream
 	// meta key is a Redis HASH that contains top offset in channel and epoch value.
