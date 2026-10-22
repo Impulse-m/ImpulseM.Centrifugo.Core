@@ -213,12 +213,14 @@ func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
 	node := newSingleFlightTestNode(t)
 	broker := &singleFlightBlockingMapBroker{release: make(chan struct{})}
 	node.SetMapBroker(broker)
+	const ch = "singleflight-map-leader"
+	mapStateReads := node.metrics.actionCount.WithLabelValues("map_state_read", node.metrics.getChannelNamespaceLabel(ch))
 
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	defer cancelLeader()
 	leaderErr := make(chan error, 1)
 	go func() {
-		_, err := node.MapStateRead(leaderCtx, "singleflight-map-leader", MapReadStateOptions{})
+		_, err := node.MapStateRead(leaderCtx, ch, MapReadStateOptions{})
 		leaderErr <- err
 	}()
 	require.Eventually(t, func() bool {
@@ -227,15 +229,29 @@ func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
 
 	followerErr := make(chan error, 1)
 	go func() {
-		_, err := node.MapStateRead(context.Background(), "singleflight-map-leader", MapReadStateOptions{})
+		_, err := node.MapStateRead(context.Background(), ch, MapReadStateOptions{})
 		followerErr <- err
 	}()
-	time.Sleep(100 * time.Millisecond)
+	// A read counts its action before it joins the shared read, so the count of two shows that the follower
+	// reached the join while the leader's read is still blocked.
+	require.Eventually(t, func() bool {
+		return metricValue(t, mapStateReads) == 2
+	}, 5*time.Second, time.Millisecond)
 
 	cancelLeader()
-	require.ErrorIs(t, <-leaderErr, context.Canceled)
+	select {
+	case err := <-leaderErr:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cancelled leader did not return")
+	}
 	close(broker.release)
-	require.NoError(t, <-followerErr)
+	select {
+	case err := <-followerErr:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the follower did not get the shared read")
+	}
 	require.Equal(t, int32(1), broker.calls.Load())
 }
 
