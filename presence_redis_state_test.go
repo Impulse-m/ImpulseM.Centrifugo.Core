@@ -770,6 +770,39 @@ func TestPresenceStateRemBoundsExpiredCleanup(t *testing.T) {
 	require.Equal(t, int64(0), hashLen())
 }
 
+// TestNewPresenceStateRejectsTinyIntervals checks that the channel state config refuses a sweep interval and a lease
+// TTL so small that the lease loop would spin.
+func TestNewPresenceStateRejectsTinyIntervals(t *testing.T) {
+	node := testStateNode(t)
+	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
+	require.NoError(t, err)
+	defer shard.Close()
+
+	channelState := func(sweepInterval time.Duration, leaseTTL time.Duration) RedisChannelStateConfig {
+		return RedisChannelStateConfig{
+			Enabled: func(_ string) bool {
+				return true
+			},
+			Handler: func(_ context.Context, _ []ChannelStateEvent) error {
+				return nil
+			},
+			SweepInterval: sweepInterval,
+			LeaseTTL:      leaseTTL,
+		}
+	}
+	for _, state := range []RedisChannelStateConfig{
+		channelState(time.Millisecond, 0),
+		channelState(0, time.Millisecond),
+	} {
+		_, err := NewRedisPresenceManager(node, RedisPresenceManagerConfig{
+			Prefix:       getUniqueStatePrefix(),
+			Shards:       []*RedisShard{shard},
+			ChannelState: &state,
+		})
+		require.Error(t, err, "sweep interval %s, lease TTL %s", state.SweepInterval, state.LeaseTTL)
+	}
+}
+
 func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
 	node := testStateNode(t)
 	s, err := NewRedisShard(node, testSingleRedisConf(6379))

@@ -19,7 +19,8 @@ const (
 	channelStateDefaultSweepInterval     = time.Second
 	channelStateDefaultLeaseTTL          = 5 * time.Second
 	channelStateDefaultBatchSize         = 100
-	channelStateMinLeaseTTL              = 5 * time.Millisecond
+	channelStateMinLeaseTTL              = 50 * time.Millisecond
+	channelStateMinSweepInterval         = 10 * time.Millisecond
 	channelStateSweepPageSize            = 100
 	channelStateSweepMaxPages            = 10
 )
@@ -126,14 +127,14 @@ type RedisChannelStateConfig struct {
 	// stays pending, and a later sweep sends it once the stream has room. Drops are counted per
 	// event type in the events_dropped_count metric.
 	MaxStreamLength int
-	// SweepInterval is how often a partition is swept and its events are read. Default 1s.
+	// SweepInterval is how often a partition is swept and its events are read. Must be at least 10ms. Default 1s.
 	SweepInterval time.Duration
 	// LeaseTTL is how long a partition lease lasts without renewal; a lease is renewed
 	// every LeaseTTL/5, and a Redis call of the lease loop gives up after LeaseTTL/3. A
 	// node that holds more than its share gives up one partition per
 	// renewal, so a node that joins a worker holding every partition waits about half of
 	// NumPartitions renewals for its share: 64 s with 128 partitions and the default 5s.
-	// Must be at least 5ms. Default 5s.
+	// Must be at least 50ms. Default 5s.
 	LeaseTTL time.Duration
 	// BatchSize is the maximum number of events in one Handler call. Default 100.
 	BatchSize int
@@ -197,6 +198,8 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 	sweepInterval := config.SweepInterval
 	if sweepInterval <= 0 {
 		sweepInterval = channelStateDefaultSweepInterval
+	} else if sweepInterval < channelStateMinSweepInterval {
+		return nil, errors.New("presence: channel state SweepInterval must be at least 10ms")
 	}
 
 	leaseTTL := config.LeaseTTL
@@ -204,7 +207,7 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 		leaseTTL = channelStateDefaultLeaseTTL
 	}
 	if leaseTTL < channelStateMinLeaseTTL {
-		return nil, errors.New("presence: channel state LeaseTTL must be at least 5ms")
+		return nil, errors.New("presence: channel state LeaseTTL must be at least 50ms")
 	}
 
 	batchSize := config.BatchSize
