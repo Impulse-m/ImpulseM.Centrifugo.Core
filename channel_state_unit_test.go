@@ -28,6 +28,26 @@ func TestChannelStateShare(t *testing.T) {
 	}
 }
 
+func TestPubSubProbeRestartBackoff(t *testing.T) {
+	t.Parallel()
+	interval := time.Second
+	want := []time.Duration{
+		0,
+		0,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		10 * time.Second,
+		10 * time.Second,
+	}
+	for restarts, delay := range want {
+		require.Equal(t, delay, pubSubProbeRestartBackoff(interval, restarts), "restarts %d", restarts)
+	}
+	require.Equal(t, 10*time.Second, pubSubProbeRestartBackoff(interval, 1000000))
+	require.Equal(t, time.Duration(0), pubSubProbeRestartBackoff(0, 5))
+}
+
 func TestChannelStateBackoff(t *testing.T) {
 	t.Parallel()
 	var backoff channelStateBackoff

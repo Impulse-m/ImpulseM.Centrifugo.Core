@@ -96,12 +96,9 @@ func pubSubProbeRestartBackoff(interval time.Duration, consecutiveRestarts int) 
 		return 0
 	}
 	maxBackoff := 10 * interval
-	backoff := interval
-	for i := 2; i < consecutiveRestarts; i++ {
-		backoff *= 2
-		if backoff >= maxBackoff {
-			return maxBackoff
-		}
+	var backoff time.Duration
+	for i := 2; i <= consecutiveRestarts && backoff < maxBackoff; i++ {
+		backoff = backoffStep(backoff, interval, maxBackoff)
 	}
 	return backoff
 }

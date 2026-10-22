@@ -946,12 +946,17 @@ func (b *channelStateBackoff) next() time.Duration {
 	if maxDelay == 0 {
 		maxDelay = channelStateMaxBackoff
 	}
-	if b.delay == 0 {
-		b.delay = minDelay
-	} else {
-		b.delay = min(2*b.delay, maxDelay)
-	}
+	b.delay = backoffStep(b.delay, minDelay, maxDelay)
 	return b.delay
+}
+
+// backoffStep returns the delay after prev in a doubling backoff. A zero prev gives minDelay, and each further step
+// doubles prev up to maxDelay.
+func backoffStep(prev, minDelay, maxDelay time.Duration) time.Duration {
+	if prev == 0 {
+		return minDelay
+	}
+	return min(2*prev, maxDelay)
 }
 
 func (b *channelStateBackoff) reset() {
