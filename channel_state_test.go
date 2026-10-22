@@ -347,7 +347,8 @@ func TestRedisChannelStateTwoNodes(t *testing.T) {
 
 	node2, pm2 := newTestChannelStateNode(t, prefix, state)
 	// Each node owns 4 partitions within 4 lease intervals. A node with no free partition waits up to one LeaseTTL
-	// between its probes, so the bound leaves room for that delay plus the renewals under race detector load.
+	// between its probes, and node 1 frees its last partition about 0.8 LeaseTTL after the start. The bound of 4 LeaseTTL
+	// covers that delay. It is not measured, and the probe delay itself is not asserted here.
 	require.Eventually(t, func() bool {
 		return testOwnedPartitions(t, pm1) == 4 && testOwnedPartitions(t, pm2) == 4
 	}, 4*testChannelStateLeaseTTL, 10*time.Millisecond)
@@ -817,13 +818,15 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "OK", held)
 
-	// Ten lease ticks: a tick is a fifth of LeaseTTL. The delay between probes doubles from 0.4 seconds and is capped at
-	// LeaseTTL, which is 2 seconds here, so the probes fall at about 0.4, 0.8, 1.6 and 3.2 seconds, and four of them
-	// fall in the window of 2 * LeaseTTL = 4 seconds. The sleep is that window, and the counter belongs to the shard client
-	// of this test, so no other test adds to it. Without the backoff the node probes about ten times, which the bound refuses.
+	// Ten lease ticks: a tick is a fifth of LeaseTTL, which is 0.4 seconds here. The delay between probes doubles from one
+	// tick and is capped at LeaseTTL, and the probes land on the ticks, so the spacing is quantized and not exactly the
+	// doubling. The sleep is the window of 2 * LeaseTTL = 4 seconds. The counter belongs to the shard client of this
+	// test, so no other test adds to it. Without the backoff the node probes about ten times, which the bound refuses,
+	// and the node must probe at least once, so a counter that stops counting fails the test.
 	before := counting.leaseGets.Load()
 	time.Sleep(2 * state.LeaseTTL)
 	probes := counting.leaseGets.Load() - before
+	require.GreaterOrEqual(t, probes, int64(1))
 	require.LessOrEqual(t, probes, int64(5))
 	require.Equal(t, 0, testOwnedPartitions(t, pm))
 }
