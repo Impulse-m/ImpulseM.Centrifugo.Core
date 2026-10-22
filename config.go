@@ -193,11 +193,11 @@ type Config struct {
 	// By default, no limit used.
 	RecoveryMaxPublicationLimit int
 	// ClientTagsFilterMaxNodes limits the number of nodes in the tags filter that a client sends, when
-	// AllowTagsFilter is on. A filter over the limit is refused with a bad request disconnect. Zero or less
+	// AllowTagsFilter is on. A filter over the limit is refused with the bad request error. Zero or less
 	// means no limit, which is the default.
 	ClientTagsFilterMaxNodes int
 	// ClientTagsFilterMaxValues limits the number of values in the comparisons of the tags filter that a client
-	// sends, when AllowTagsFilter is on. A filter over the limit is refused with a bad request disconnect. Zero
+	// sends, when AllowTagsFilter is on. A filter over the limit is refused with the bad request error. Zero
 	// or less means no limit, which is the default.
 	ClientTagsFilterMaxValues int
 	// UseSingleFlight allows turning on mode where singleflight will be automatically used
