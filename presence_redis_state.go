@@ -129,7 +129,7 @@ type RedisChannelStateConfig struct {
 	// 5s, so a configured zero delay must be passed as a negative value: that means no delay,
 	// and the vacated event is sent by the next sweep. Default 5s.
 	VacatedEventDelay time.Duration
-	// MaxStreamLength caps the events waiting for delivery in one partition; new events
+	// MaxStreamLength caps the events waiting for delivery in one partition; new occupied events
 	// are dropped when the cap is reached. Negative removes the cap. Default 8192.
 	// A dropped occupied event is not sent again, and later subscribes of the channel send none
 	// either while the channel stays occupied, so the application must reconcile the state from presence. A vacated event at the

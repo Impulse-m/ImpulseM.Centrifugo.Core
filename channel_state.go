@@ -100,7 +100,8 @@ func (p *channelStatePartition) stop() {
 }
 
 // channelStateBackoff doubles the delay between attempts of a failing step. The zero value doubles from
-// channelStateMinBackoff up to channelStateMaxBackoff; minDelay and maxDelay replace those bounds when set.
+// channelStateMinBackoff up to channelStateMaxBackoff; minDelay and maxDelay replace those bounds when set. Unlike
+// pubSubProbeRestartBackoff in redis_pubsub_shared.go, whose first restart is immediate, the first delay is minDelay.
 type channelStateBackoff struct {
 	minDelay time.Duration
 	maxDelay time.Duration
@@ -151,7 +152,9 @@ func (w *channelStateWorker) run() {
 // leaseCycle renews the owned leases, publishes this worker, and rebalances the partitions by the number of
 // workers the heartbeat counts. The worker writes its heartbeat at most once per heartbeatInterval, on the first
 // lease tick after the interval has passed, so with the default ticks the heartbeat comes up to about 0.4 * LeaseTTL
-// apart. A cycle in between uses the count of the last one. The heartbeat runs only when it is due, beside the
+// apart. Under a slow shard the gap can reach about 0.87 * LeaseTTL: one buffered tick plus a cycle of up to two call
+// timeouts. That is still under LeaseTTL, with a margin of about 0.13 * LeaseTTL. A cycle in between uses the count
+// of the last one. The heartbeat runs only when it is due, beside the
 // renewals, and the cycle waits for their replies for at most callTimeout. A shard that does not answer in time is given up, so it cannot delay the
 // renewals of the others. The acquisitions wait for at most callTimeout too: a cycle lasts at most two call
 // timeouts, two thirds of LeaseTTL at the most, however long a shard takes to answer.
@@ -301,7 +304,7 @@ func (w *channelStateWorker) rebalance(share int) {
 			return
 		}
 		// A probe that found every partition leased delays the next one: the delay doubles from one lease tick up to
-		// LeaseTTL, so a node that owns less than its share probes a few times per LeaseTTL instead of on every tick.
+		// LeaseTTL, so a node with no free partition probes about once per LeaseTTL in steady state.
 		// A partition whose lease expires is taken at most LeaseTTL later than without the delay.
 		if w.acquire(share - len(w.owned)) {
 			w.probeUntil = time.Now().Add(w.probe.next())
