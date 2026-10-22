@@ -54,6 +54,8 @@ type channelStateWorker struct {
 	probeUntil time.Time
 	// probeShare is the share the probe delay was set for. A change of the share resets the delay.
 	probeShare int
+	// probes counts the lease keys the worker read to find a free partition. The tests read it.
+	probes atomic.Int64
 	// lastHeartbeat is when the last heartbeat was written, and workers is the count it returned. The lease loop
 	// goroutine only accesses them. A cycle within heartbeatInterval of the last heartbeat uses the count again.
 	lastHeartbeat time.Time
@@ -654,6 +656,7 @@ func (w *channelStateWorker) freePartitions(ctx context.Context, sh *RedisShard,
 	for _, p := range partitions {
 		cmds = append(cmds, sh.client.B().Get().Key(w.leaseKey(p)).Build())
 	}
+	w.probes.Add(int64(len(cmds)))
 	free := make([]int, 0, len(partitions))
 	for i, res := range sh.client.DoMulti(ctx, cmds...) {
 		err := res.Error()

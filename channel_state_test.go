@@ -754,28 +754,6 @@ func TestRedisChannelStateCloseReleasesWhileConsumerHangs(t *testing.T) {
 	require.Equal(t, int64(0), members)
 }
 
-// testCommandCalls returns how many calls of the command the Redis server of the shard has served, from INFO
-// commandstats. The tests that use it do not run in parallel, so no other test adds to the count.
-func testCommandCalls(tb testing.TB, sh *RedisShard, command string) int64 {
-	tb.Helper()
-	info, err := sh.client.Do(context.Background(), sh.client.B().Info().Section("commandstats").Build()).ToString()
-	require.NoError(tb, err)
-	for _, line := range strings.Split(info, "\n") {
-		name, stats, ok := strings.Cut(strings.TrimSpace(line), ":")
-		if !ok || name != "cmdstat_"+command {
-			continue
-		}
-		for _, field := range strings.Split(stats, ",") {
-			if value, found := strings.CutPrefix(field, "calls="); found {
-				calls, err := strconv.ParseInt(value, 10, 64)
-				require.NoError(tb, err)
-				return calls
-			}
-		}
-	}
-	return 0
-}
-
 // TestRedisChannelStateIdleWorkerProbeBackoff holds the only partition of the prefix with a lease of another owner.
 // The node owns nothing and wants its share, so it probes the lease key on each tick. Over ten ticks it must not
 // probe on every tick: the probes back off while every probe finds the partition held.
@@ -792,12 +770,12 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 	require.Equal(t, "OK", held)
 
 	// Ten lease ticks: a tick is a fifth of LeaseTTL. The backoff probes at about 0.4, 0.8, 1.6 and 3.2 seconds, so four
-	// probes fall in the window. INFO commandstats counts the GETs of other tests on the shared server too, so the bound
-	// adds two for them. Without the backoff the node probes about ten times, which the bound refuses.
-	before := testCommandCalls(t, pm.shards[0], "get")
+	// probes fall in the window. The count is the probes of this worker, so no other client adds to it. Without the
+	// backoff the node probes about ten times, which the bound refuses.
+	before := pm.state.worker.probes.Load()
 	time.Sleep(2 * state.LeaseTTL)
-	probes := testCommandCalls(t, pm.shards[0], "get") - before
-	require.LessOrEqual(t, probes, int64(6))
+	probes := pm.state.worker.probes.Load() - before
+	require.LessOrEqual(t, probes, int64(5))
 	require.Equal(t, 0, testOwnedPartitions(t, pm))
 }
 
