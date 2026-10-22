@@ -19,21 +19,51 @@ func notChain(depth int) *protocol.FilterNode {
 
 func TestValidateClientRejectsLargeFilters(t *testing.T) {
 	t.Parallel()
-	require.NoError(t, ValidateClient(&protocol.FilterNode{Cmp: CompareEQ, Key: "env", Val: "prod"}))
-	require.NoError(t, ValidateClient(notChain(MaxClientNodes-1)))
-	require.Error(t, ValidateClient(notChain(MaxClientNodes)))
+	const maxNodes = 256
+	const maxValues = 1024
+	require.NoError(t, ValidateClient(&protocol.FilterNode{Cmp: CompareEQ, Key: "env", Val: "prod"}, maxNodes, maxValues))
+	require.NoError(t, ValidateClient(notChain(maxNodes-1), maxNodes, maxValues))
+	require.Error(t, ValidateClient(notChain(maxNodes), maxNodes, maxValues))
 
-	vals := make([]string, MaxClientValues+1)
+	vals := make([]string, maxValues+1)
 	for i := range vals {
 		vals[i] = "v" + fmt.Sprint(i)
 	}
-	require.NoError(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals[:MaxClientValues]}))
-	require.Error(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}))
+	require.NoError(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals[:maxValues]}, maxNodes, maxValues))
+	require.Error(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}, maxNodes, maxValues))
 }
 
-// TestValidateKeepsServerFilterLimits checks that the limits of client filters do not apply to the filters the
+// TestValidateClientNoLimitByDefault checks that a zero limit accepts a client filter of any size that Validate
+// accepts, which is the behaviour of a server that does not set the limits.
+func TestValidateClientNoLimitByDefault(t *testing.T) {
+	t.Parallel()
+	require.NoError(t, ValidateClient(notChain(1000), 0, 0))
+	require.NoError(t, ValidateClient(notChain(1000), -1, -1))
+
+	vals := make([]string, 10000)
+	for i := range vals {
+		vals[i] = "v" + fmt.Sprint(i)
+	}
+	require.NoError(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}, 0, 0))
+}
+
+// TestValidateClientLimitsAreIndependent checks that each limit applies on its own when the other one is not set.
+func TestValidateClientLimitsAreIndependent(t *testing.T) {
+	t.Parallel()
+	require.Error(t, ValidateClient(notChain(10), 5, 0))
+	require.NoError(t, ValidateClient(notChain(10), 0, 1))
+
+	vals := make([]string, 10)
+	for i := range vals {
+		vals[i] = "v" + fmt.Sprint(i)
+	}
+	require.Error(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}, 0, 5))
+	require.NoError(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}, 5, 0))
+}
+
+// TestValidateKeepsServerFilterLimits checks that Validate itself keeps no node limit on the filters the
 // application sets on the server.
 func TestValidateKeepsServerFilterLimits(t *testing.T) {
 	t.Parallel()
-	require.NoError(t, Validate(notChain(MaxClientNodes)))
+	require.NoError(t, Validate(notChain(256)))
 }

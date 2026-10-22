@@ -6,27 +6,24 @@ import (
 	"github.com/centrifugal/protocol"
 )
 
-// Limits of a filter that a client sends: the nodes of its tree and the values of its comparisons. The filter is
-// matched for every publication of every subscriber, so a client may not send one that costs more than these.
-const (
-	MaxClientNodes  = 256
-	MaxClientValues = 1024
-)
-
-// ValidateClient is Validate with the limits of MaxClientNodes and MaxClientValues. It checks the filters that
-// clients send. The filters the application sets on the server are checked by Validate only. The count is a second
-// walk of the tree, after Validate has checked it.
-func ValidateClient(f *protocol.FilterNode) error {
+// ValidateClient is Validate with the limits on the size of a filter that a client sends: at most maxNodes nodes
+// of its tree and at most maxValues values of its comparisons. A limit of zero or less means no limit, so the
+// default accepts every filter that Validate accepts. The filters the application sets on the server are checked
+// by Validate only. The size is counted by a second walk of the tree, which runs only when a limit is set.
+func ValidateClient(f *protocol.FilterNode, maxNodes int, maxValues int) error {
 	if err := Validate(f); err != nil {
 		return err
 	}
+	if maxNodes <= 0 && maxValues <= 0 {
+		return nil
+	}
 	var nodes, values int
 	countFilter(f, &nodes, &values)
-	if nodes > MaxClientNodes {
-		return fmt.Errorf("filter has more than %d nodes", MaxClientNodes)
+	if maxNodes > 0 && nodes > maxNodes {
+		return fmt.Errorf("filter has more than %d nodes", maxNodes)
 	}
-	if values > MaxClientValues {
-		return fmt.Errorf("filter has more than %d values", MaxClientValues)
+	if maxValues > 0 && values > maxValues {
+		return fmt.Errorf("filter has more than %d values", maxValues)
 	}
 	return nil
 }

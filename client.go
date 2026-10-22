@@ -5196,7 +5196,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 			c.node.logger.log(newLogEntry(LogLevelInfo, "tags filter not allowed", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			return errorDisconnectContext(ErrorBadRequest, nil)
 		}
-		if err := filter.ValidateClient(req.Tf); err != nil {
+		if err := filter.ValidateClient(req.Tf, c.node.config.ClientTagsFilterMaxNodes, c.node.config.ClientTagsFilterMaxValues); err != nil {
 			c.node.logger.log(newLogEntry(LogLevelInfo, "invalid tags filter", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid}))
 			return errorDisconnectContext(ErrorBadRequest, nil)
 		}

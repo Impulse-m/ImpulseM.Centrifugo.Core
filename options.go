@@ -216,6 +216,8 @@ type SubscribeOptions struct {
 	// and client provided a filter – the BadRequest error will be returned.
 	// Important note here, since channel permissions are managed on channel level, tags filtering
 	// must be used as a bandwidth optimization, not an access control mechanism.
+	// A client filter is also limited in size by Config.ClientTagsFilterMaxNodes and
+	// Config.ClientTagsFilterMaxValues, which are off by default.
 	AllowTagsFilter bool
 	// ServerTagsFilter is a server-controlled tags filter applied to publications before delivery.
 	// Unlike AllowTagsFilter (which enables client-side filtering), this filter is set by the server
