@@ -822,6 +822,41 @@ func TestNewPresenceStateRejectsTinyIntervals(t *testing.T) {
 	}
 }
 
+// TestNewPresenceStateRejectsTinySweepInterval checks that the channel state refuses a sweep interval below 10ms, and
+// accepts 10ms.
+func TestNewPresenceStateRejectsTinySweepInterval(t *testing.T) {
+	node := testStateNode(t)
+	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
+	require.NoError(t, err)
+	defer shard.Close()
+
+	channelState := func(sweepInterval time.Duration) RedisChannelStateConfig {
+		return RedisChannelStateConfig{
+			Enabled: func(_ string) bool {
+				return true
+			},
+			Handler: func(_ context.Context, _ []ChannelStateEvent) error {
+				return nil
+			},
+			SweepInterval: sweepInterval,
+		}
+	}
+	newManager := func(state RedisChannelStateConfig) (*RedisPresenceManager, error) {
+		return NewRedisPresenceManager(node, RedisPresenceManagerConfig{
+			Prefix:       getUniqueStatePrefix(),
+			Shards:       []*RedisShard{shard},
+			ChannelState: &state,
+		})
+	}
+	for _, sweepInterval := range []time.Duration{time.Millisecond, 9 * time.Millisecond} {
+		_, err := newManager(channelState(sweepInterval))
+		require.Error(t, err, "sweep interval %s", sweepInterval)
+	}
+	pm, err := newManager(channelState(10 * time.Millisecond))
+	require.NoError(t, err)
+	require.NoError(t, pm.Close(t.Context()))
+}
+
 func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
 	node := testStateNode(t)
 	s, err := NewRedisShard(node, testSingleRedisConf(6379))
