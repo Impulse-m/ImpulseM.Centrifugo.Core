@@ -788,6 +788,59 @@ func TestPresenceStateRemBoundsExpiredCleanup(t *testing.T) {
 	require.Equal(t, int64(0), hashLen())
 }
 
+// TestRedisChannelStateCheckRearmsFullBatchAfterSweep runs the check script on an occupied channel whose presence holds
+// more expired entries than one batch. The script removes one batch and arms the channel one millisecond after the
+// sweep time, so the sweep that runs it does not select the channel again, and the next sweep does.
+func TestRedisChannelStateCheckRearmsFullBatchAfterSweep(t *testing.T) {
+	t.Parallel()
+	node := testStateNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(&testChannelStateCollector{}), 0, false, 6379)
+	client := pm.shards[0].client
+	ctx := context.Background()
+
+	prefix := getUniqueStatePrefix()
+	presenceSet := prefix + ".presence"
+	presenceHash := prefix + ".hash"
+	stream := prefix + ".stream"
+	pending := prefix + ".pending"
+	expire := prefix + ".expire"
+	const channel = "expired-rearm"
+	const expiredCount = channelStateExpiredBatch + 500
+
+	cmds := make([]rueidis.Completed, 0, 2*expiredCount)
+	for i := range expiredCount {
+		member := "expired-" + strconv.Itoa(i)
+		cmds = append(cmds, client.B().Zadd().Key(presenceSet).ScoreMember().ScoreMember(1, member).Build())
+		cmds = append(cmds, client.B().Hset().Key(presenceHash).FieldValue().FieldValue(member, "{}").Build())
+	}
+	for _, res := range client.DoMulti(ctx, cmds...) {
+		require.NoError(t, res.Error())
+	}
+
+	nowMs := int64(100000)
+	keys := []string{presenceSet, presenceHash, stream, pending, expire}
+	args := []string{
+		channel,
+		strconv.FormatInt(nowMs, 10),
+		strconv.FormatInt(nowMs/1000, 10),
+		strconv.FormatInt(nowMs, 10),
+		"0",
+		"0",
+		"60000",
+		strconv.Itoa(channelStateExpiredBatch),
+		"1000",
+	}
+	_, err := pm.state.checkScript.Exec(ctx, client, keys, args).AsInt64()
+	require.NoError(t, err)
+
+	hashLen, err := client.Do(ctx, client.B().Hlen().Key(presenceHash).Build()).AsInt64()
+	require.NoError(t, err)
+	require.Equal(t, int64(expiredCount-channelStateExpiredBatch), hashLen, "one call must remove one batch of expired entries")
+	score, err := client.Do(ctx, client.B().Zscore().Key(expire).Member(channel).Build()).AsFloat64()
+	require.NoError(t, err)
+	require.Equal(t, float64(nowMs+1), score, "a full batch must arm the channel one millisecond after the sweep time")
+}
+
 // TestNewPresenceStateRaisesSweepIntervalToFloor checks that the channel state config raises a sweep interval below
 // 100ms to 100ms, keeps a sweep interval of 100ms, and refuses a lease TTL below 5ms.
 func TestNewPresenceStateRaisesSweepIntervalToFloor(t *testing.T) {

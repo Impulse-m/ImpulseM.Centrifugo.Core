@@ -34,11 +34,12 @@ end
 
 if redis.call("hlen", KEYS[2]) > 0 then
     -- Occupied: no vacated event is pending, the presence can expire at the upper bound. A full batch
-    -- may leave expired entries, so the channel is checked again at once.
+    -- may leave expired entries, so the channel is checked again by the next sweep. It is armed one
+    -- millisecond ahead, so the sweep that runs this script does not select the channel again.
     redis.call("zrem", KEYS[4], ARGV[1])
     local expireAt = tonumber(ARGV[2]) + tonumber(ARGV[7])
     if more then
-        expireAt = tonumber(ARGV[2])
+        expireAt = tonumber(ARGV[2]) + 1
     end
     redis.call("zadd", KEYS[5], expireAt, ARGV[1])
     return 0
