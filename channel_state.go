@@ -724,7 +724,8 @@ func (w *channelStateWorker) consume(ctx context.Context, part *channelStatePart
 }
 
 // consumeOnce runs the sweep and delivers the stream of the partition until it is empty or the
-// lease is lost. It returns false when ctx is done.
+// lease is lost. A failed delivery ends the step after its retry delay, and the next step sweeps
+// again before it retries. It returns false when ctx is done.
 func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p int, part *channelStatePartition, backoff *channelStateBackoff) bool {
 	if err := w.sweep(ctx, sh, p); err != nil {
 		if ctx.Err() != nil {
@@ -758,13 +759,12 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 					// Stopped while the handler ran: the events stay in the stream.
 					return false
 				}
-				// The events stay in the stream, so the same batch is delivered again.
+				// The events stay in the stream, so the same batch is delivered again. The step returns after the
+				// delay, so the consumer runs the sweep of the partition before it delivers the batch again: the
+				// sweeps keep running while a failing event blocks the delivery.
 				w.state.metrics.incDeliveryErrors()
 				w.logError(err, "channel state delivery failed", p)
-				if !w.wait(ctx, backoff) {
-					return false
-				}
-				continue
+				return w.wait(ctx, backoff)
 			}
 			w.state.metrics.addDelivered(len(events))
 		}

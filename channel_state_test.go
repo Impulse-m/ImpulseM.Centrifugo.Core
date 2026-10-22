@@ -4,6 +4,7 @@ package centrifuge
 
 import (
 	"context"
+	"errors"
 	"net"
 	"runtime"
 	"strconv"
@@ -185,6 +186,48 @@ func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 	length, err := client.Do(ctx, client.B().Xlen().Key(stream).Build()).AsInt64()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), length)
+}
+
+// TestRedisChannelStateFailingDeliveryReturnsToSweep runs one consume step of a partition whose handler fails. The
+// batch stays in the stream and is delivered again, but the step returns after the retry delay, so the consumer goes
+// back to the sweep of the partition on its next tick. A step that retried in place would never sweep again.
+func TestRedisChannelStateFailingDeliveryReturnsToSweep(t *testing.T) {
+	t.Parallel()
+	state := testChannelStateConfig(&testChannelStateCollector{})
+	state.Handler = func(_ context.Context, _ []ChannelStateEvent) error {
+		return errors.New("backend unavailable")
+	}
+	state.NumPartitions = 1
+	state.LeaseTTL = 2 * time.Second
+	node := testStateNode(t)
+	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
+	require.NoError(t, err)
+	pm := newTestRedisPresenceStateManagerWithShards(t, node, getUniqueStatePrefix(), state, 0, false, []*RedisShard{shard})
+
+	// The partition is leased by another owner before the first lease cycle of the node, so the node runs no consumer
+	// of its own and the consume step below is the only one.
+	client := pm.shards[0].client
+	held, err := client.Do(context.Background(), client.B().Set().Key(string(pm.state.partitionKey(0, "lease"))).Value("other-owner").Nx().PxMilliseconds(60000).Build()).ToString()
+	require.NoError(t, err)
+	require.Equal(t, "OK", held)
+	require.NoError(t, pm.AddPresence("poison", "client-1", &ClientInfo{}))
+	part := &channelStatePartition{p: 0, shard: pm.shards[0]}
+	part.extendLease(time.Now(), time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	returned := make(chan bool, 1)
+	var backoff channelStateBackoff
+	go func() {
+		returned <- pm.state.worker.consumeOnce(ctx, pm.shards[0], 0, part, &backoff)
+	}()
+	select {
+	case more := <-returned:
+		require.True(t, more)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the consume step retried the failing batch in place and did not return to the sweep")
+	}
+	require.Equal(t, int64(1), testStreamLength(t, pm, 0), "the failed event must stay in the stream")
 }
 
 func TestRedisChannelStateTwoNodes(t *testing.T) {

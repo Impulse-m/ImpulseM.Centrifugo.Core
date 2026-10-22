@@ -110,7 +110,9 @@ type RedisChannelStateConfig struct {
 	// must not change for a channel while it has subscribers: keys are chosen per call, so toggling
 	// it on live channels is not supported.
 	Enabled func(channel string) bool
-	// Handler receives the events. Required.
+	// Handler receives the events. Required. An error keeps the batch in the stream, and the batch is
+	// delivered again after a delay that grows. So an event that always fails blocks the delivery of its
+	// partition, while the sweeps of the partition keep running. There is no dead-letter stream.
 	Handler ChannelStateHandler
 	// NumPartitions is the number of partitions that serialize channel state in Redis.
 	// It must not change while channels are occupied. Default 128.
