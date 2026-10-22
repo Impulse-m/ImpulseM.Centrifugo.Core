@@ -709,11 +709,28 @@ func TestRedisChannelStateScriptsKeepPresenceBodies(t *testing.T) {
 
 	require.NotEmpty(t, luaExpiredCleanup(presenceScriptSource, "ARGV[1]"), "presence_get.lua has no cleanup of the expired entries")
 	// The state scripts bound their cleanup to one batch per call, so their cleanup differs from presence_get.lua on
-	// purpose, and presence_get.lua keeps the unbounded one. The two state scripts keep the same bounded cleanup.
+	// purpose, and presence_get.lua keeps the unbounded one. The two state scripts keep the same bounded cleanup, and
+	// without the batch bound that cleanup must stay the one of presence_get.lua.
 	cleanup := luaExpiredCleanup(presenceStateCheckScriptSource, "ARGV[3]")
 	require.NotEmpty(t, cleanup, "presence_state_check.lua has no cleanup of the expired entries")
 	require.Equal(t, cleanup, luaExpiredCleanup(presenceStateRemScriptSource, "ARGV[6]"),
 		"presence_state_rem.lua does not keep the cleanup of presence_state_check.lua")
+	require.Equal(t, luaExpiredCleanup(presenceScriptSource, "ARGV[1]"), luaUnboundedCleanup(cleanup),
+		"presence_state_check.lua does not keep the cleanup of presence_get.lua apart from the batch bound")
+}
+
+// luaUnboundedCleanup returns a bounded cleanup in the form of the upstream one: the LIMIT arguments are dropped,
+// and the removal of the batch becomes the range removal of the upstream cleanup.
+func luaUnboundedCleanup(block []string) []string {
+	unbounded := make([]string, 0, len(block))
+	for _, line := range block {
+		line = strings.ReplaceAll(line, `, "LIMIT", 0, ARGV[8])`, `)`)
+		if line == `redis.call("zrem", KEYS[1], unpack(expired))` {
+			line = `redis.call("zremrangebyscore", KEYS[1], "0", ARGV[now])`
+		}
+		unbounded = append(unbounded, line)
+	}
+	return unbounded
 }
 
 // TestPresenceStateRemBoundsExpiredCleanup removes a client from a channel whose presence holds more expired entries
