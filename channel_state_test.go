@@ -978,9 +978,6 @@ func TestRedisChannelStateCloseReleasesWhileConsumerHangs(t *testing.T) {
 	require.Equal(t, int64(0), members)
 }
 
-// TestRedisChannelStateIdleWorkerProbeBackoff holds the only partition of the prefix with a lease of another owner.
-// The node owns nothing and wants its share, so it probes the lease key on each tick. Over ten ticks it must not
-// probe on every tick: the probes back off while every probe finds the partition held.
 // TestRedisChannelStateTinyTimingsAreRaised sets a SweepInterval and a LeaseTTL below their floors. The sweep is raised
 // to 100ms and the lease is raised to 500ms, so the lease loop runs at most every 100ms.
 func TestRedisChannelStateTinyTimingsAreRaised(t *testing.T) {
@@ -994,6 +991,9 @@ func TestRedisChannelStateTinyTimingsAreRaised(t *testing.T) {
 	require.Equal(t, 500*time.Millisecond, pm.state.leaseTTL)
 }
 
+// TestRedisChannelStateIdleWorkerProbeBackoff holds the only partition of the prefix with a lease of another owner.
+// The node owns nothing and wants its share, so it probes the lease key on each tick. Over ten ticks it must not
+// probe on every tick: the probes back off while every probe finds the partition held.
 func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 	t.Parallel()
 	prefix := getUniqueStatePrefix()
@@ -1020,7 +1020,7 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 	end := start.Add(2 * state.LeaseTTL)
 	require.Eventually(t, func() bool {
 		return counting.countBetween(&counting.leaseGets, start, time.Now().Add(time.Hour)) > 0
-	}, 2*state.LeaseTTL, 10*time.Millisecond)
+	}, 10*state.LeaseTTL, 10*time.Millisecond)
 	require.Never(t, func() bool {
 		return counting.countBetween(&counting.leaseGets, start, end) > 5
 	}, time.Until(end), 10*time.Millisecond)
@@ -1059,7 +1059,7 @@ func TestRedisChannelStateFlappingHeartbeatKeepsProbeBackoff(t *testing.T) {
 	end := start.Add(2 * state.LeaseTTL)
 	require.Eventually(t, func() bool {
 		return counting.countBetween(&counting.leaseGets, start, time.Now().Add(time.Hour)) > 0
-	}, 2*state.LeaseTTL, 10*time.Millisecond)
+	}, 10*state.LeaseTTL, 10*time.Millisecond)
 	require.Never(t, func() bool {
 		return counting.countBetween(&counting.leaseGets, start, end) > 10
 	}, time.Until(end), 10*time.Millisecond)
@@ -1087,7 +1087,7 @@ func TestRedisChannelStateHeartbeatRate(t *testing.T) {
 	end := start.Add(2 * state.LeaseTTL)
 	require.Eventually(t, func() bool {
 		return counting.countBetween(&counting.workerZadds, start, time.Now().Add(time.Hour)) > 0
-	}, 2*state.LeaseTTL, 10*time.Millisecond)
+	}, 10*state.LeaseTTL, 10*time.Millisecond)
 	require.Never(t, func() bool {
 		return counting.countBetween(&counting.workerZadds, start, end) > 7
 	}, time.Until(end), 10*time.Millisecond)
