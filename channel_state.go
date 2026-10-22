@@ -727,7 +727,7 @@ func (w *channelStateWorker) consume(ctx context.Context, part *channelStatePart
 // lease is lost. A failed delivery ends the step after its retry delay, and the next step sweeps
 // again before it retries. It returns false when ctx is done.
 func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p int, part *channelStatePartition, backoff *channelStateBackoff) bool {
-	if _, err := w.sweep(ctx, sh, p); err != nil {
+	if err := w.sweep(ctx, sh, p); err != nil {
 		if ctx.Err() != nil {
 			return false
 		}
@@ -761,7 +761,7 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 				}
 				// The events stay in the stream, so the same batch is delivered again. The step returns after the
 				// delay, so the consumer runs the sweep of the partition before it delivers the batch again: the
-				// sweeps keep running while a failing event blocks the delivery.
+				// sweeps keep running while a failing event blocks the delivery, unless the stream is full (see sweep).
 				w.state.metrics.incDeliveryErrors()
 				w.logError(err, "channel state delivery failed", p)
 				return w.wait(ctx, backoff)
@@ -788,32 +788,30 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 
 // sweep moves the channels that are due in the partition to their next state: a
 // vacated event when the delay has passed, or an armed delay when the presence expired.
-// It returns the number of channels it checked. A vacated event kept pending by a full stream
-// stops the sweep for this step: the pending entries stay at the head of the due set, so the next page
-// would hold the same channels, and the next step tries again once the consumer has made room.
-func (w *channelStateWorker) sweep(ctx context.Context, sh *RedisShard, p int) (int, error) {
+// A vacated event kept pending by a full stream stops the sweep for this step: the pending entries
+// stay at the head of the due set, so the next page would hold the same channels, and the next step
+// tries again once the consumer has made room.
+func (w *channelStateWorker) sweep(ctx context.Context, sh *RedisShard, p int) error {
 	nowMs := time.Now().UnixMilli()
-	checked := 0
 	for page := 0; page < channelStateSweepMaxPages; page++ {
 		channels, full, err := w.duePage(ctx, sh, p, nowMs)
 		if err != nil {
-			return checked, err
+			return err
 		}
 		if len(channels) > 0 {
-			n, kept, err := w.state.checkChannels(ctx, sh, p, channels, nowMs)
-			checked += n
+			kept, err := w.state.checkChannels(ctx, sh, p, channels, nowMs)
 			if err != nil {
-				return checked, err
+				return err
 			}
 			if kept {
-				return checked, nil
+				return nil
 			}
 		}
 		if !full {
-			return checked, nil
+			return nil
 		}
 	}
-	return checked, nil
+	return nil
 }
 
 // duePage returns one page of the channels due in the pending and expire sets of the

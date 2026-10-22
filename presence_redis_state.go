@@ -19,7 +19,7 @@ const (
 	channelStateDefaultSweepInterval     = time.Second
 	channelStateDefaultLeaseTTL          = 5 * time.Second
 	channelStateDefaultBatchSize         = 100
-	channelStateMinLeaseTTL              = 50 * time.Millisecond
+	channelStateMinLeaseTTL              = 5 * time.Millisecond
 	channelStateMinSweepInterval         = 10 * time.Millisecond
 	channelStateSweepPageSize            = 100
 	channelStateSweepMaxPages            = 10
@@ -117,8 +117,9 @@ type RedisChannelStateConfig struct {
 	// Handler receives the events. Required. An error keeps the batch in the stream, and the batch is
 	// delivered again after a delay that grows. The redelivery comes at the first sweep tick after the
 	// delay, so the gap is the delay plus up to one SweepInterval. So an event that always fails blocks
-	// the delivery of its partition, while the sweeps of the partition keep running. There is no
-	// dead-letter stream.
+	// the delivery of its partition, while the sweeps of the partition keep running. The exception is a full
+	// stream: a vacated event kept pending at the cap stops the sweep of the partition until the stream has
+	// room, so the channels due behind it wait too. There is no dead-letter stream.
 	Handler ChannelStateHandler
 	// NumPartitions is the number of partitions that serialize channel state in Redis.
 	// It must not change while channels are occupied. Default 128.
@@ -131,18 +132,24 @@ type RedisChannelStateConfig struct {
 	// MaxStreamLength caps the events waiting for delivery in one partition; new events
 	// are dropped when the cap is reached. Negative removes the cap. Default 8192.
 	// A dropped occupied event is not sent again, and later subscribes of the channel send none
-	// either, so the application must reconcile the state from presence. A vacated event at the
+	// either while the channel stays occupied, so the application must reconcile the state from presence. A vacated event at the
 	// cap is not dropped: it stays pending, and a later sweep sends it once the stream has room.
 	// Dropped occupied events are counted in the events_dropped_count metric.
 	MaxStreamLength int
 	// SweepInterval is how often a partition is swept and its events are read. Must be at least 10ms. Default 1s.
+	// Every partition of a node sweeps on this interval, so Redis load grows with 1/SweepInterval. Values
+	// below 100ms add that load for each partition and are only useful in tests.
 	SweepInterval time.Duration
 	// LeaseTTL is how long a partition lease lasts without renewal; a lease is renewed
-	// every LeaseTTL/5, and a Redis call of the lease loop gives up after LeaseTTL/3. A
+	// every LeaseTTL/5, and a Redis call of the lease loop gives up after LeaseTTL/3, so a reply that
+	// is slower than that gives up the shard for the cycle. A
 	// node that holds more than its share gives up one partition per
 	// renewal, so a node that joins a worker holding every partition waits about half of
-	// NumPartitions renewals for its share: 64 s with 128 partitions and the default 5s.
-	// Must be at least 50ms. Default 5s.
+	// NumPartitions renewals for its share: 64 s with 128 partitions and the default 5s. A node with no free
+	// partition probes for one after a delay that doubles from LeaseTTL/5 up to LeaseTTL, so a partition
+	// freed by a rebalance can be taken up to LeaseTTL later than the renewals suggest.
+	// Must be at least 5ms. Values below 500ms run the lease loop more often than every 100ms, with the
+	// Redis calls of each renewal and heartbeat, so use them only in tests. Default 5s.
 	LeaseTTL time.Duration
 	// BatchSize is the maximum number of events in one Handler call. Default 100.
 	BatchSize int
@@ -164,6 +171,7 @@ type presenceState struct {
 	sweepInterval     time.Duration
 	leaseTTL          time.Duration
 	batchSize         int
+	expiredBatch      string
 	metrics           *channelStateMetrics
 	dropLoggedAt      atomic.Int64
 
@@ -215,7 +223,7 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 		leaseTTL = channelStateDefaultLeaseTTL
 	}
 	if leaseTTL < channelStateMinLeaseTTL {
-		return nil, errors.New("presence: channel state LeaseTTL must be at least 50ms")
+		return nil, errors.New("presence: channel state LeaseTTL must be at least 5ms")
 	}
 
 	batchSize := config.BatchSize
@@ -249,6 +257,7 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 		sweepInterval:     sweepInterval,
 		leaseTTL:          leaseTTL,
 		batchSize:         batchSize,
+		expiredBatch:      strconv.Itoa(channelStateExpiredBatch),
 		metrics:           cm,
 
 		addScript:     rueidis.NewLuaScript(presenceStateAddScriptSource, rueidis.WithLoadSHA1(m.config.LoadSHA1)),
@@ -365,7 +374,7 @@ func (s *presenceState) removePresence(sh *RedisShard, channel string, clientID 
 		channel,
 		strconv.FormatInt(nowMs/1000, 10),
 		strconv.FormatInt(nowMs+s.vacatedEventDelay.Milliseconds(), 10),
-		strconv.Itoa(channelStateExpiredBatch),
+		s.expiredBatch,
 	)
 	return s.remScript.Exec(context.Background(), sh.client, keys, args).Error()
 }
@@ -373,8 +382,7 @@ func (s *presenceState) removePresence(sh *RedisShard, channel string, clientID 
 // checkChannels runs the sweep check of the channels of one partition, in batches of
 // channelStateSweepPageSize pipelined commands. It stops after the batch in which a vacated event is kept
 // pending by a full stream, and reports that with kept: the next batch would find the stream full as well.
-// It returns the number of channels checked.
-func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int, channels []string, nowMs int64) (checked int, kept bool, err error) {
+func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int, channels []string, nowMs int64) (kept bool, err error) {
 	stream := string(s.partitionKey(p, "stream"))
 	pending := string(s.partitionKey(p, "pending"))
 	expire := string(s.partitionKey(p, "expire"))
@@ -384,7 +392,6 @@ func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int
 	useHashFieldTTL := s.manager.useHashFieldTTLArg()
 	maxLenStr := strconv.Itoa(s.maxStreamLength)
 	ttlStr := strconv.FormatInt(s.manager.config.PresenceTTL.Milliseconds(), 10)
-	expiredBatchStr := strconv.Itoa(channelStateExpiredBatch)
 
 	for start := 0; start < len(channels); start += channelStateSweepPageSize {
 		end := min(start+channelStateSweepPageSize, len(channels))
@@ -392,26 +399,25 @@ func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int
 		for _, channel := range channels[start:end] {
 			execs = append(execs, rueidis.LuaExec{
 				Keys: []string{string(s.stateSetKey(channel)), string(s.stateHashKey(channel)), stream, pending, expire},
-				Args: []string{channel, nowStr, nowSecStr, fireStr, useHashFieldTTL, maxLenStr, ttlStr, expiredBatchStr},
+				Args: []string{channel, nowStr, nowSecStr, fireStr, useHashFieldTTL, maxLenStr, ttlStr, s.expiredBatch},
 			})
 		}
 		batchKept := false
 		for _, res := range s.checkScript.ExecMulti(ctx, sh.client, execs...) {
 			result, err := res.AsInt64()
 			if err != nil {
-				return checked, false, err
+				return false, err
 			}
 			s.countResult(ChannelStateVacated, result)
 			if result == channelStateKeptPending {
 				batchKept = true
 			}
 		}
-		checked += end - start
 		if batchKept {
-			return checked, true, nil
+			return true, nil
 		}
 	}
-	return checked, false, nil
+	return false, nil
 }
 
 // countResult counts the outcome of a state script: 1 is an event written to the stream,

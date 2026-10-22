@@ -491,9 +491,9 @@ func TestRedisChannelStateOverlappingSweepKeepsOccupied(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{ch}, stale)
 
-	_, err = pm.state.worker.sweep(ctx, sh, p)
+	err = pm.state.worker.sweep(ctx, sh, p)
 	require.NoError(t, err)
-	_, _, err = pm.state.checkChannels(ctx, sh, p, stale, nowMs)
+	_, err = pm.state.checkChannels(ctx, sh, p, stale, nowMs)
 	require.NoError(t, err)
 	require.NoError(t, pm.AddPresence(ch, "client-2", &ClientInfo{}))
 

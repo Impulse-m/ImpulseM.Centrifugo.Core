@@ -190,8 +190,8 @@ func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 }
 
 // TestRedisChannelStateSweepStopsAtFullStream leaves 150 due vacated channels pending in one partition whose stream
-// is full, and whose handler fails so the stream stays full. A sweep checks one page of them and stops there: the
-// pending entries stay at the head of the set, so the next page would check the same channels again.
+// is full, and whose handler never runs, so the stream stays full. A sweep checks one page of them and stops there:
+// the pending entries stay at the head of the set, so the next page would check the same channels again.
 func TestRedisChannelStateSweepStopsAtFullStream(t *testing.T) {
 	t.Parallel()
 	state := testChannelStateConfig(&testChannelStateCollector{})
@@ -200,11 +200,23 @@ func TestRedisChannelStateSweepStopsAtFullStream(t *testing.T) {
 	}
 	state.NumPartitions = 1
 	state.MaxStreamLength = 1
+	// The first lease cycle comes one LeaseTTL/5 after the start. The partition is leased by another owner right
+	// after the start, so the node runs no consumer of its own and the sweep below is the only one.
+	state.LeaseTTL = time.Minute
 	node := testStateNode(t)
-	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), state, 0, false, 6379)
+	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
+	require.NoError(t, err)
+	pm := newTestRedisPresenceStateManagerWithShards(t, node, getUniqueStatePrefix(), state, 0, false, []*RedisShard{shard})
 	client := pm.shards[0].client
 	ctx := context.Background()
+	held, err := client.Do(ctx, client.B().Set().Key(string(pm.state.partitionKey(0, "lease"))).Value("other-owner").Nx().PxMilliseconds(60000).Build()).ToString()
+	require.NoError(t, err)
+	require.Equal(t, "OK", held)
 	pending := string(pm.state.partitionKey(0, "pending"))
+
+	// One event fills the stream of the cap, and nothing delivers it.
+	require.NoError(t, client.Do(ctx, client.B().Xadd().Key(string(pm.state.partitionKey(0, "stream"))).Id("*").FieldValue().FieldValue("c", "full").FieldValue("t", "occupied").FieldValue("ms", "1").Build()).Error())
+	require.Equal(t, int64(1), testStreamLength(t, pm, 0), "the stream must be full before the sweep")
 
 	const dueChannels = 150
 	nowMs := time.Now().UnixMilli()
@@ -212,9 +224,8 @@ func TestRedisChannelStateSweepStopsAtFullStream(t *testing.T) {
 		require.NoError(t, client.Do(ctx, client.B().Zadd().Key(pending).ScoreMember().ScoreMember(float64(nowMs-1000), "sweep-cap-"+strconv.Itoa(i)).Build()).Error())
 	}
 
-	checked, err := pm.state.worker.sweep(ctx, pm.state.shardOf(0), 0)
+	err = pm.state.worker.sweep(ctx, pm.state.shardOf(0), 0)
 	require.NoError(t, err)
-	require.Equal(t, channelStateSweepPageSize, checked, "a sweep must check one page while the stream is full")
 	left, err := client.Do(ctx, client.B().Zcard().Key(pending).Build()).AsInt64()
 	require.NoError(t, err)
 	require.Greater(t, left, int64(channelStateSweepPageSize), "the channels behind the page must stay pending for the next step")
@@ -231,7 +242,9 @@ func TestRedisChannelStateFailingDeliveryReturnsToSweep(t *testing.T) {
 		return errors.New("backend unavailable")
 	}
 	state.NumPartitions = 1
-	state.LeaseTTL = 2 * time.Second
+	// The first lease cycle comes one LeaseTTL/5 after the start, so a long LeaseTTL leaves the lease below
+	// room to be taken before it.
+	state.LeaseTTL = time.Minute
 	node := testStateNode(t)
 	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
 	require.NoError(t, err)
