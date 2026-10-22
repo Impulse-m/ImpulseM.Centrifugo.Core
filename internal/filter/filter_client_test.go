@@ -59,6 +59,24 @@ func TestValidateClientZeroMeansDefault(t *testing.T) {
 	require.Error(t, ValidateClient(&protocol.FilterNode{Cmp: CompareIn, Key: "env", Vals: vals}, 0, 0))
 }
 
+// TestValidateClientValueCapIsPerComparison checks that the value cap applies to each comparison, not to the sum of
+// the values of the filter: two comparisons of 100 values each are accepted by the default limits.
+func TestValidateClientValueCapIsPerComparison(t *testing.T) {
+	t.Parallel()
+	vals := make([]string, 100)
+	for i := range vals {
+		vals[i] = "v" + fmt.Sprint(i)
+	}
+	pair := &protocol.FilterNode{
+		Op: OpAnd,
+		Nodes: []*protocol.FilterNode{
+			{Cmp: CompareIn, Key: "env", Vals: vals},
+			{Cmp: CompareIn, Key: "region", Vals: vals},
+		},
+	}
+	require.NoError(t, ValidateClient(pair, 0, 0))
+}
+
 // TestValidateClientNegativeDisablesCaps checks that a negative limit accepts a filter of any node or value count.
 func TestValidateClientNegativeDisablesCaps(t *testing.T) {
 	t.Parallel()

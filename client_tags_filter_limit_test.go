@@ -79,8 +79,9 @@ func TestClientTagsFilterLimitsRefuseLargeFilter(t *testing.T) {
 	require.Error(t, subscribeWithTagsFilter(t, node, tagsFilterNotChain(3)))
 }
 
-// TestClientTagsFilterZeroLimitsAreUnlimited checks that a node without the limits accepts a client filter of any
-// size that the filter validation accepts, so the limits are off unless they are set.
+// TestClientTagsFilterZeroLimitsUseDefaults checks that zero limits are the defaults, not unlimited: a node without
+// the limits accepts a filter of up to 128 nodes in total and up to 128 values in each comparison, refuses a
+// comparison of 129 values, and still refuses a NOT chain of 1000 nodes, because the depth limit always applies.
 func TestClientTagsFilterZeroLimitsUseDefaults(t *testing.T) {
 	t.Parallel()
 	node := newTagsFilterLimitNode(t, Config{})
@@ -88,6 +89,16 @@ func TestClientTagsFilterZeroLimitsUseDefaults(t *testing.T) {
 	require.NoError(t, subscribeWithTagsFilter(t, node, tagsFilterInValues(128)))
 	require.Error(t, subscribeWithTagsFilter(t, node, tagsFilterInValues(129)))
 	require.Error(t, subscribeWithTagsFilter(t, node, tagsFilterNotChain(1000)))
+
+	// The value cap is per comparison: two comparisons of 100 values each are within the defaults.
+	pair := &protocol.FilterNode{
+		Op: filter.OpAnd,
+		Nodes: []*protocol.FilterNode{
+			tagsFilterInValues(100),
+			{Cmp: filter.CompareIn, Key: "region", Vals: tagsFilterInValues(100).Vals},
+		},
+	}
+	require.NoError(t, subscribeWithTagsFilter(t, node, pair))
 }
 
 // TestClientTagsFilterNegativeLimitsDisableCaps checks that a negative limit lifts the node and value caps, while

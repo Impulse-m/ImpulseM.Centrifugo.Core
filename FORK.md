@@ -22,10 +22,11 @@ that Redis expires the fields itself.
 ## Client tags filter limits
 
 A client filter is limited in size by Config.ClientTagsFilterMaxNodes and Config.ClientTagsFilterMaxValues, when
-SubscribeOptions.AllowTagsFilter is on. Zero means the default of 128 nodes and 128 values, and a negative value turns
-that limit off. A filter over a set limit is refused with the bad request error. The nesting of a client filter is
-capped at 16 levels whatever the limits are. Raise the limits only for applications whose clients are trusted with
-larger filters.
+SubscribeOptions.AllowTagsFilter is on. The node limit counts the nodes of the whole filter, and the value limit applies
+to each comparison of the filter. Zero means the default of 128 nodes and 128 values per comparison, and a negative
+value turns that limit off. A filter over a set limit is refused with the bad request error. The nesting of a client
+filter is capped at 16 levels whatever the limits are. Raise the limits only for applications whose clients are trusted
+with larger filters.
 
 ## Channel state
 
