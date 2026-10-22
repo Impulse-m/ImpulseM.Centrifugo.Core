@@ -195,8 +195,8 @@ type Config struct {
 	// UseSingleFlight allows turning on mode where singleflight will be automatically used
 	// for Node.History (including recovery), Node.Presence/Node.PresenceStats,
 	// and Node.MapStateRead/Node.MapStreamRead/Node.MapStats calls.
-	// The map reads run their shared call on a goroutine of their own, so each of their calls costs a goroutine
-	// and a channel, and a panic in the broker call is raised on that goroutine rather than on the caller's.
+	// The map reads run their shared call on a goroutine of their own, which costs a goroutine and a channel per call.
+	// A panic in the broker call is raised again on the goroutine of the caller.
 	UseSingleFlight bool
 	// HistoryMetaTTL sets a time of stream meta key expiration in Redis. Stream
 	// meta key is a Redis HASH that contains top offset in channel and epoch value.
