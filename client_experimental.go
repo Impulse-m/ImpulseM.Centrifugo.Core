@@ -89,41 +89,6 @@ func (c *Client) AcquireStorage() (map[string]any, func(map[string]any)) {
 	}
 }
 
-// extStateBox wraps the value stored with SetExtState, so that it can be swapped
-// atomically regardless of the dynamic type of the value.
-type extStateBox struct {
-	v any
-}
-
-// ExtState returns the value previously set with SetExtState, or nil if no value
-// has been set. It is two atomic loads and is safe to call from any goroutine.
-// Intended for applications to attach cheap per-connection state (instead of an
-// AcquireStorage map entry). A connection that never sets it holds only the nil
-// pointer to its state: the first SetExtState of the connection allocates the state,
-// and each SetExtState allocates a value box. The recommended pattern is to
-// call SetExtState from the transport reader goroutine, for example in OnCommandRead
-// for the connect command, and read it later from any goroutine.
-// This API is EXPERIMENTAL and may be changed/removed.
-func (c *Client) ExtState() any {
-	e := c.ext.Load()
-	if e == nil {
-		return nil
-	}
-	box := e.extState.Load()
-	if box == nil {
-		return nil
-	}
-	return box.v
-}
-
-// SetExtState attaches an arbitrary value to the connection. Values set this way are
-// not visible in the connection storage map and are not affected by AcquireStorage.
-// Setting is safe from any goroutine; the last Set wins.
-// This API is EXPERIMENTAL and may be changed/removed.
-func (c *Client) SetExtState(v any) {
-	c.extension(true).extState.Store(&extStateBox{v: v})
-}
-
 // OnStateSnapshot allows settings StateSnapshotHandler.
 // This API is EXPERIMENTAL and may be changed/removed.
 func (c *Client) OnStateSnapshot(h StateSnapshotHandler) {

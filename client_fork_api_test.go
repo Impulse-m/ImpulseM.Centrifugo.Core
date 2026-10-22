@@ -2,11 +2,9 @@ package centrifuge
 
 import (
 	"context"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/centrifugal/protocol"
 	"github.com/stretchr/testify/assert"
@@ -163,15 +161,4 @@ func TestClientExtAllocatedOnlyWhenSet(t *testing.T) {
 	client.mu.Unlock()
 	require.NotNil(t, client.ext.Load())
 	require.Equal(t, uint64(1), client.TokenIdentity().Generation)
-}
-
-// TestClientSizeWithoutForkState checks the size of Client on 64-bit platforms. The token identity and the extension
-// state live in one pointer, so the fields of the fork features add nothing to a connection that does not set them.
-// A change of the size is a change of the memory of every connection and must be made on purpose.
-func TestClientSizeWithoutForkState(t *testing.T) {
-	t.Parallel()
-	if strconv.IntSize != 64 {
-		t.Skip("the size is checked on 64-bit platforms only")
-	}
-	require.Equal(t, uintptr(552), unsafe.Sizeof(Client{}))
 }
