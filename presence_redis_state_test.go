@@ -697,20 +697,77 @@ func luaExpiredCleanup(source string, expiryArg string) []string {
 }
 
 // TestRedisChannelStateScriptsKeepPresenceBodies fails when the upstream presence scripts change and the
-// channel state scripts keep the old body: the state scripts embed the bodies of the upstream scripts, and
-// the cleanup of the expired entries of presence_get.lua.
+// channel state scripts keep the old body: the state scripts embed the bodies of the upstream scripts. The
+// cleanup of the expired entries is bounded in the state scripts only, and the two state scripts must agree on it.
 func TestRedisChannelStateScriptsKeepPresenceBodies(t *testing.T) {
 	require.True(t, containsLuaLines(presenceStateAddScriptSource, luaScriptBody(addPresenceScriptSource)),
 		"presence_state_add.lua does not contain the body of presence_add.lua")
 	require.True(t, containsLuaLines(presenceStateRemScriptSource, luaScriptBody(remPresenceScriptSource)),
 		"presence_state_rem.lua does not contain the body of presence_rem.lua")
 
-	cleanup := luaExpiredCleanup(presenceScriptSource, "ARGV[1]")
-	require.NotEmpty(t, cleanup, "presence_get.lua has no cleanup of the expired entries")
-	require.Equal(t, cleanup, luaExpiredCleanup(presenceStateCheckScriptSource, "ARGV[3]"),
-		"presence_state_check.lua does not keep the cleanup of presence_get.lua")
+	require.NotEmpty(t, luaExpiredCleanup(presenceScriptSource, "ARGV[1]"), "presence_get.lua has no cleanup of the expired entries")
+	// The state scripts bound their cleanup to one batch per call, so their cleanup differs from presence_get.lua on
+	// purpose, and presence_get.lua keeps the unbounded one. The two state scripts keep the same bounded cleanup.
+	cleanup := luaExpiredCleanup(presenceStateCheckScriptSource, "ARGV[3]")
+	require.NotEmpty(t, cleanup, "presence_state_check.lua has no cleanup of the expired entries")
 	require.Equal(t, cleanup, luaExpiredCleanup(presenceStateRemScriptSource, "ARGV[6]"),
-		"presence_state_rem.lua does not keep the cleanup of presence_get.lua")
+		"presence_state_rem.lua does not keep the cleanup of presence_state_check.lua")
+}
+
+// TestPresenceStateRemBoundsExpiredCleanup removes a client from a channel whose presence holds more expired entries
+// than one batch. A call removes one batch and arms the channel to be checked again, so repeated calls converge.
+func TestPresenceStateRemBoundsExpiredCleanup(t *testing.T) {
+	t.Parallel()
+	node := testStateNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(&testChannelStateCollector{}), 0, false, 6379)
+	client := pm.shards[0].client
+	ctx := context.Background()
+
+	prefix := getUniqueStatePrefix()
+	presenceSet := prefix + ".presence"
+	presenceHash := prefix + ".hash"
+	userSet := prefix + ".user"
+	userHash := prefix + ".user.hash"
+	pending := prefix + ".pending"
+	expire := prefix + ".expire"
+	const channel = "expired-batch"
+	const expiredCount = 2500
+	const expiredBatch = 1000
+
+	cmds := make([]rueidis.Completed, 0, 2*expiredCount)
+	for i := range expiredCount {
+		member := "expired-" + strconv.Itoa(i)
+		cmds = append(cmds, client.B().Zadd().Key(presenceSet).ScoreMember().ScoreMember(1, member).Build())
+		cmds = append(cmds, client.B().Hset().Key(presenceHash).FieldValue().FieldValue(member, "{}").Build())
+	}
+	for _, res := range client.DoMulti(ctx, cmds...) {
+		require.NoError(t, res.Error())
+	}
+
+	nowSec := int64(100)
+	keys := []string{presenceSet, presenceHash, userSet, userHash, pending, expire}
+	args := []string{"client-x", "", "0", "0", channel, strconv.FormatInt(nowSec, 10), strconv.FormatInt(nowSec*1000+5000, 10)}
+	remove := func() {
+		require.NoError(t, pm.state.remScript.Exec(ctx, client, keys, args).Error())
+	}
+	hashLen := func() int64 {
+		length, err := client.Do(ctx, client.B().Hlen().Key(presenceHash).Build()).AsInt64()
+		require.NoError(t, err)
+		return length
+	}
+
+	remove()
+	require.Equal(t, int64(expiredCount-expiredBatch), hashLen(), "one call must remove one batch of expired entries")
+	_, err := client.Do(ctx, client.B().Zscore().Key(expire).Member(channel).Build()).AsFloat64()
+	require.NoError(t, err, "a full batch must arm the channel to be checked again")
+
+	for range 5 {
+		if hashLen() == 0 {
+			break
+		}
+		remove()
+	}
+	require.Equal(t, int64(0), hashLen())
 }
 
 func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {

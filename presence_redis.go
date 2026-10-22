@@ -59,6 +59,9 @@ type RedisPresenceManagerConfig struct {
 	// since Redis 7.4.0 thus disabled by default. Using hash field TTL can be useful to avoid
 	// maintaining expiration index in ZSET – so both useful from the throughput and memory usage
 	// perspective.
+	// Without it, Presence removes the expired entries of a channel in one script call, which blocks
+	// Redis for as long as the removal takes when the channel has many expired entries. For large
+	// channels enable it, so that Redis expires the fields itself.
 	UseHashFieldTTL bool
 
 	// ReadFromReplica enables reading presence information from replica Redis servers.
