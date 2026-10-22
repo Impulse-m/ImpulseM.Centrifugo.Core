@@ -42,15 +42,12 @@ jobs:
           VALKEY_VERSION: ${{ matrix.valkey-version }}
         run: docker compose up -d --wait
 
-      - name: Test root package
-        run: go test -v -race -tags integration -coverprofile=coverage.out .
-
-      - name: Test other packages
-        run: go test -v -race -tags integration -coverprofile=coverage_packages.out $(go list ./... | grep -v /_examples/ | grep -v -x github.com/centrifugal/centrifuge)
+      - name: Test
+        run: go test -v -race -tags integration -coverprofile=coverage.out $(go list ./... | grep -v /_examples/)
 
       - name: Upload code coverage to codecov
         if: matrix.go-version == '1.27' && matrix.redis-version == 8 && matrix.valkey-version == 9
         uses: codecov/codecov-action@v4
         with:
-          files: ./coverage.out,./coverage_packages.out
+          file: ./coverage.out
           token: ${{ secrets.CODECOV_TOKEN }}
