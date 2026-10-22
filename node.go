@@ -15,9 +15,9 @@ import (
 	"github.com/centrifugal/centrifuge/internal/controlproto"
 	"github.com/centrifugal/centrifuge/internal/dissolve"
 	"github.com/centrifugal/centrifuge/internal/filter"
+	"github.com/centrifugal/centrifuge/internal/metricsnap"
 	"github.com/centrifugal/centrifuge/internal/nowtime"
 
-	"github.com/FZambia/eagle"
 	"github.com/centrifugal/protocol"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
@@ -69,9 +69,10 @@ type Node struct {
 	// subLocks synchronizes access to adding/removing subscriptions.
 	subLocks map[int]*sync.Mutex
 
-	metricsMu       sync.Mutex
-	metricsExporter *eagle.Eagle
-	metricsSnapshot *eagle.Metrics
+	metricsMu sync.Mutex
+	// metricsSnapshot is the latest metrics snapshot not yet sent in node
+	// info, nil once sent.
+	metricsSnapshot map[string]float64
 
 	// subDissolver used to reliably clear unused subscriptions in Broker.
 	subDissolver *dissolve.Dissolver
@@ -443,12 +444,6 @@ func (n *Node) Shutdown(ctx context.Context) error {
 	if n.sharedPollManager != nil {
 		n.sharedPollManager.close()
 	}
-	// The metrics aggregator runs its own goroutine which does not watch
-	// shutdownCh, so without this it outlives the Node.
-	if n.metricsExporter != nil {
-		_ = n.metricsExporter.Close()
-	}
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -512,29 +507,33 @@ func (n *Node) initMetrics() error {
 		gatherer = prometheus.DefaultGatherer
 	}
 
-	metricsSink := make(chan eagle.Metrics)
-	n.metricsExporter = eagle.New(eagle.Config{
-		Gatherer:        gatherer,
-		Interval:        n.config.NodeInfoMetricsAggregateInterval,
-		Sink:            metricsSink,
-		PrefixWhitelist: []string{getMetricsNamespace(n.config.Metrics)},
+	snapshotter := metricsnap.New(gatherer, metricsnap.Options{
+		Prefixes: []string{getMetricsNamespace(n.config.Metrics)},
+		// Without native histograms every histogram has a summary twin with
+		// the same count and sum - no need to send both.
+		IncludeHistograms: n.config.Metrics.EnableNativeHistograms,
 	})
-	initialMetricsSnapshot, err := n.metricsExporter.Export()
+	initialSnapshot, err := snapshotter.Snapshot()
 	if err != nil {
 		return err
 	}
 	n.metricsMu.Lock()
-	n.metricsSnapshot = &initialMetricsSnapshot
+	n.metricsSnapshot = initialSnapshot
 	n.metricsMu.Unlock()
 	go func() {
+		ticker := time.NewTicker(n.config.NodeInfoMetricsAggregateInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-n.NotifyShutdown():
 				return
-			case metricsSnapshot := <-metricsSink:
-				n.metricsMu.Lock()
-				n.metricsSnapshot = &metricsSnapshot
-				n.metricsMu.Unlock()
+			case <-ticker.C:
+				snapshot, err := snapshotter.Snapshot()
+				if err == nil {
+					n.metricsMu.Lock()
+					n.metricsSnapshot = snapshot
+					n.metricsMu.Unlock()
+				}
 			}
 		}
 	}()
@@ -1040,10 +1039,10 @@ func (n *Node) publishControl(cmd *controlpb.Command, nodeID string) error {
 	return n.controller.PublishControl(data, nodeID, "")
 }
 
-func (n *Node) getMetrics(metrics eagle.Metrics) *controlpb.Metrics {
+func (n *Node) getMetrics(items map[string]float64) *controlpb.Metrics {
 	return &controlpb.Metrics{
 		Interval: n.config.NodeInfoMetricsAggregateInterval.Seconds(),
-		Items:    metrics.Flatten("."),
+		Items:    items,
 	}
 }
 
@@ -1070,7 +1069,7 @@ func (n *Node) pubNode(nodeID string) error {
 
 	n.metricsMu.Lock()
 	if n.metricsSnapshot != nil {
-		node.Metrics = n.getMetrics(*n.metricsSnapshot)
+		node.Metrics = n.getMetrics(n.metricsSnapshot)
 	}
 	// We only send metrics once when updated.
 	n.metricsSnapshot = nil
