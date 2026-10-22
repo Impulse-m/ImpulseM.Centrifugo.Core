@@ -843,7 +843,8 @@ func TestRedisChannelStateCheckRearmsFullBatchAfterSweep(t *testing.T) {
 }
 
 // TestNewPresenceStateRaisesSweepIntervalToFloor checks that the channel state config raises a sweep interval below
-// 100ms to 100ms, keeps a sweep interval of 100ms, and refuses a lease TTL below 5ms.
+// 100ms to 100ms, keeps a sweep interval of 100ms, raises a lease TTL below 500ms to 500ms, and refuses a negative
+// lease TTL.
 func TestNewPresenceStateRaisesSweepIntervalToFloor(t *testing.T) {
 	node := testStateNode(t)
 	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
@@ -875,8 +876,12 @@ func TestNewPresenceStateRaisesSweepIntervalToFloor(t *testing.T) {
 		require.Equal(t, 100*time.Millisecond, pm.state.sweepInterval, "sweep interval %s", sweepInterval)
 		require.NoError(t, pm.Close(t.Context()))
 	}
-	_, err = newManager(channelState(0, time.Millisecond))
-	require.Error(t, err, "lease TTL below 5ms must be refused")
+	pm, err := newManager(channelState(0, time.Millisecond))
+	require.NoError(t, err)
+	require.Equal(t, 500*time.Millisecond, pm.state.leaseTTL, "lease TTL below 500ms must be raised to 500ms")
+	require.NoError(t, pm.Close(t.Context()))
+	_, err = newManager(channelState(0, -time.Millisecond))
+	require.Error(t, err, "negative lease TTL must be refused")
 }
 
 func TestRedisPresenceManagerStateOffNoWorker(t *testing.T) {
