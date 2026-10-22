@@ -122,7 +122,7 @@ func (c *Client) validateAndCreateTagsFilter(req *protocol.SubscribeRequest, all
 		}))
 		return nil, ErrorBadRequest
 	}
-	if err := filter.Validate(req.Tf); err != nil {
+	if err := filter.ValidateClient(req.Tf); err != nil {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "invalid tags filter for map channel", map[string]any{
 			"channel": channel, "user": c.UserID(), "client": c.uid,
 		}))
