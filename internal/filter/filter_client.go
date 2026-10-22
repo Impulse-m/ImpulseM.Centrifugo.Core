@@ -14,7 +14,8 @@ const (
 )
 
 // ValidateClient is Validate with the limits of MaxClientNodes and MaxClientValues. It checks the filters that
-// clients send. The filters the application sets on the server are checked by Validate only.
+// clients send. The filters the application sets on the server are checked by Validate only. The count is a second
+// walk of the tree, after Validate has checked it.
 func ValidateClient(f *protocol.FilterNode) error {
 	if err := Validate(f); err != nil {
 		return err
