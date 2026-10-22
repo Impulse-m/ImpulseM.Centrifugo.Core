@@ -107,9 +107,9 @@ type Node struct {
 	presenceGroup      singleflight.Group
 	presenceStatsGroup singleflight.Group
 	historyGroup       singleflight.Group
-	mapStateGroup      singleflight.Group
-	mapStreamGroup     singleflight.Group
-	mapStatsGroup      singleflight.Group
+	mapStateGroup      singleflightGroup
+	mapStreamGroup     singleflightGroup
+	mapStatsGroup      singleflightGroup
 }
 
 const (

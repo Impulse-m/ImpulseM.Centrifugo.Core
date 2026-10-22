@@ -214,7 +214,7 @@ func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
 	broker := &singleFlightBlockingMapBroker{release: make(chan struct{})}
 	node.SetMapBroker(broker)
 	const ch = "singleflight-map-leader"
-	mapStateReads := node.metrics.actionCount.WithLabelValues("map_state_read", node.metrics.getChannelNamespaceLabel(ch))
+	key := node.mapStateKey(ch, MapReadStateOptions{})
 
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	defer cancelLeader()
@@ -232,10 +232,9 @@ func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
 		_, err := node.MapStateRead(context.Background(), ch, MapReadStateOptions{})
 		followerErr <- err
 	}()
-	// A read counts its action before it joins the shared read, so the count of two only shows that the follower
-	// has started its read. It does not show that the follower has joined the shared read.
+	// The follower has joined the shared read once the group counts two waiters for its key.
 	require.Eventually(t, func() bool {
-		return metricValue(t, mapStateReads) == 2
+		return singleflightWaiters(&node.mapStateGroup, key) == 2
 	}, 5*time.Second, time.Millisecond)
 
 	cancelLeader()
@@ -251,6 +250,82 @@ func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the follower did not get the shared read")
+	}
+	// A second read of the broker would mean the follower did not share the read of the leader.
+	require.Equal(t, int32(1), broker.calls.Load())
+}
+
+// singleflightWaiters returns the number of callers that wait for the shared call of key in group, or zero when
+// no call of key is in flight.
+func singleflightWaiters(group *singleflightGroup, key string) int {
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if call, ok := group.calls[key]; ok {
+		return call.waiters
+	}
+	return 0
+}
+
+// singleFlightEndingMapBroker is a MapBroker whose ReadState blocks until its context is done, and reports how the
+// read ended.
+type singleFlightEndingMapBroker struct {
+	MapBroker
+	ended chan error
+}
+
+func (b *singleFlightEndingMapBroker) ReadState(ctx context.Context, _ string, _ MapReadStateOptions) (MapStateResult, error) {
+	<-ctx.Done()
+	b.ended <- ctx.Err()
+	return MapStateResult{}, ctx.Err()
+}
+
+// TestSingleflightCancelsSharedReadWhenLastCallerLeaves checks that the shared read of a map broker keeps running
+// while one caller still waits for it, and is cancelled when the last caller leaves.
+func TestSingleflightCancelsSharedReadWhenLastCallerLeaves(t *testing.T) {
+	node := newSingleFlightTestNode(t)
+	broker := &singleFlightEndingMapBroker{ended: make(chan error, 1)}
+	node.SetMapBroker(broker)
+	const ch = "singleflight-map-last-caller"
+	key := node.mapStateKey(ch, MapReadStateOptions{})
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := node.MapStateRead(firstCtx, ch, MapReadStateOptions{})
+		firstErr <- err
+	}()
+	require.Eventually(t, func() bool {
+		return singleflightWaiters(&node.mapStateGroup, key) == 1
+	}, 5*time.Second, time.Millisecond)
+	secondErr := make(chan error, 1)
+	go func() {
+		_, err := node.MapStateRead(secondCtx, ch, MapReadStateOptions{})
+		secondErr <- err
+	}()
+	require.Eventually(t, func() bool {
+		return singleflightWaiters(&node.mapStateGroup, key) == 2
+	}, 5*time.Second, time.Millisecond)
+
+	// One caller leaves and the other still waits, so the shared read must keep running.
+	cancelFirst()
+	require.ErrorIs(t, <-firstErr, context.Canceled)
+	select {
+	case err := <-broker.ended:
+		t.Fatalf("the shared read ended while a caller waited for it: %v", err)
+	default:
+	}
+
+	// The last caller leaves. The shared read ends with cancellation, well before its bound of 10 seconds.
+	cancelSecond()
+	require.ErrorIs(t, <-secondErr, context.Canceled)
+	select {
+	case err := <-broker.ended:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the shared read was not cancelled when its last caller left")
 	}
 }
 
