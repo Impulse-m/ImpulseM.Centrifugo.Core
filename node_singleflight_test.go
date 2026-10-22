@@ -3,6 +3,8 @@ package centrifuge
 import (
 	"context"
 	"errors"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -226,13 +228,20 @@ func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
 		return broker.calls.Load() == 1
 	}, 5*time.Second, 5*time.Millisecond)
 
+	// The group does not count its waiters, so count the callers that wait in singleflightDoContext: the leader is one,
+	// and the follower has joined the shared read once there is one more.
+	require.Eventually(t, func() bool {
+		return singleflightWaiters() >= 1
+	}, 5*time.Second, 5*time.Millisecond)
+	waitersBefore := singleflightWaiters()
 	followerErr := make(chan error, 1)
 	go func() {
 		_, err := node.MapStateRead(context.Background(), ch, MapReadStateOptions{})
 		followerErr <- err
 	}()
-	// The group does not count its waiters, so give the follower time to join the shared read.
-	time.Sleep(100 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return singleflightWaiters() > waitersBefore
+	}, 5*time.Second, 5*time.Millisecond)
 
 	cancelLeader()
 	select {
@@ -263,9 +272,22 @@ type singleFlightRecordingMapBroker struct {
 
 func (b *singleFlightRecordingMapBroker) ReadState(ctx context.Context, _ string, _ MapReadStateOptions) (MapStateResult, error) {
 	b.calls.Add(1)
-	<-b.release
+	select {
+	case <-b.release:
+	case <-time.After(5 * time.Second):
+		return MapStateResult{}, errors.New("the broker was not released")
+	}
 	b.ctxErr <- ctx.Err()
 	return MapStateResult{}, nil
+}
+
+// singleflightWaiters counts the callers that wait in singleflightDoContext, which is where a caller joins a shared
+// call. The frame of the shared call itself is a closure, and it is not counted. The stacks of all goroutines of the
+// test binary are read, so the count can include callers of other tests that wait at the same time.
+func singleflightWaiters() int {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	return strings.Count(string(buf[:n]), "singleflightDoContext[...](")
 }
 
 // TestSingleflightSharedReadOutlivesLeader checks that the shared read of a map broker is not cancelled when its only
