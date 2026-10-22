@@ -3,6 +3,7 @@ package centrifuge
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -319,6 +320,35 @@ func TestSingleflightSharedReadOutlivesLeader(t *testing.T) {
 		require.NoError(t, err, "the shared read was cancelled when its last caller left")
 	case <-time.After(5 * time.Second):
 		t.Fatal("the shared read did not end")
+	}
+}
+
+// singleFlightGoexitMapBroker is a MapBroker whose ReadState ends its goroutine with runtime.Goexit, as t.FailNow does.
+type singleFlightGoexitMapBroker struct {
+	MapBroker
+}
+
+func (b *singleFlightGoexitMapBroker) ReadState(_ context.Context, _ string, _ MapReadStateOptions) (MapStateResult, error) {
+	runtime.Goexit()
+	return MapStateResult{}, nil
+}
+
+// TestSingleFlightGoexitDoesNotHangCallers checks that a shared map read whose broker call ends its goroutine answers
+// its caller with an error. The caller has a context that never ends, so only the answer can end its wait.
+func TestSingleFlightGoexitDoesNotHangCallers(t *testing.T) {
+	node := newSingleFlightTestNode(t)
+	node.SetMapBroker(&singleFlightGoexitMapBroker{})
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := node.MapStateRead(context.Background(), "singleflight-map-goexit", MapReadStateOptions{})
+		readErr <- err
+	}()
+	select {
+	case err := <-readErr:
+		require.ErrorIs(t, err, errSingleflightGoexit)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller of a shared read whose broker call ended with runtime.Goexit did not return")
 	}
 }
 

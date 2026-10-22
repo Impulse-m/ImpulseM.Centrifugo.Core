@@ -44,11 +44,11 @@ Config.UseSingleFlight shares a call between the callers that ask for the same k
 - A shared map read has a bound of 10 seconds. The bound ends the read only for brokers that honour the context of the
   call. The memory broker ignores the context, so its shared read runs until it returns.
 - A shared read is not cancelled when its callers leave. A caller that leaves returns its own context error at once.
-- Each caller that starts a shared call pays for a goroutine and a 10 second context timer. Callers that join a shared
+- Each caller that starts a shared call pays for two goroutines and a 10 second context timer. Callers that join a shared
   call pay for neither.
 - A panic in the broker call is raised again on the goroutine of each caller, so a caller can recover it.
-- A broker call that ends its goroutine with runtime.Goexit gives its callers no result. They wait until their own
-  contexts end.
+- A broker call that ends its goroutine with runtime.Goexit gives its callers the error "singleflight: shared call ended
+  without a result", so no caller waits for a result that never comes.
 
 ## Backlog
 
@@ -59,8 +59,6 @@ The items below are deferred. Each one needs a measurement or a design before a 
 - Owned partitions are swept on idle ticks. This is polling and needs an event-driven design under the no-polling rule.
 - A failing event blocks its partition. The sweep already runs outside the delivery retry loop. A dead-letter design
   is still open, and no dead-letter stream exists.
-- A broker call that ends its goroutine with runtime.Goexit leaves its callers waiting for their own contexts. A fix
-  needs a goroutine per shared call or a bound on the caller side.
 - The minimum LeaseTTL is 5ms, which gives a lease tick of 1ms. A floor that gives a tick of 100ms, a LeaseTTL of
   500ms, is not set, because the owner has not chosen the minimum and the tests use short leases. Below 500ms the
   lease loop runs more often than every 100ms, with the Redis calls of each renewal and heartbeat, so the
