@@ -2212,8 +2212,8 @@ func (n *Node) MapStateRead(ctx context.Context, ch string, opts MapReadStateOpt
 	n.metrics.incActionCount("map_state_read", ch)
 	if n.config.UseSingleFlight {
 		key := n.mapStateKey(ch, opts)
-		result, err := singleflightDo(&n.mapStateGroup, n.metrics.singleflightMergedMapState, key, func() (MapStateResult, error) {
-			return mapBroker.ReadState(ctx, ch, opts)
+		result, err := singleflightDoContext(ctx, &n.mapStateGroup, n.metrics.singleflightMergedMapState, key, func(callCtx context.Context) (MapStateResult, error) {
+			return mapBroker.ReadState(callCtx, ch, opts)
 		})
 		if err != nil {
 			return MapStateResult{}, err
@@ -2261,8 +2261,8 @@ func (n *Node) MapStreamRead(ctx context.Context, ch string, opts MapReadStreamO
 	var err error
 	if n.config.UseSingleFlight {
 		key := n.mapStreamKey(ch, opts)
-		r, e := singleflightDo(&n.mapStreamGroup, n.metrics.singleflightMergedMapStream, key, func() (MapStreamResult, error) {
-			return mapBroker.ReadStream(ctx, ch, opts)
+		r, e := singleflightDoContext(ctx, &n.mapStreamGroup, n.metrics.singleflightMergedMapStream, key, func(callCtx context.Context) (MapStreamResult, error) {
+			return mapBroker.ReadStream(callCtx, ch, opts)
 		})
 		if e != nil {
 			return MapStreamResult{}, e
@@ -2341,8 +2341,8 @@ func (n *Node) MapStats(ctx context.Context, ch string) (MapStatsResult, error) 
 
 	n.metrics.incActionCount("map_stats", ch)
 	if n.config.UseSingleFlight {
-		result, err := singleflightDo(&n.mapStatsGroup, n.metrics.singleflightMergedMapStats, ch, func() (MapStatsResult, error) {
-			stats, err := mapBroker.Stats(ctx, ch)
+		result, err := singleflightDoContext(ctx, &n.mapStatsGroup, n.metrics.singleflightMergedMapStats, ch, func(callCtx context.Context) (MapStatsResult, error) {
+			stats, err := mapBroker.Stats(callCtx, ch)
 			if err != nil {
 				return MapStatsResult{}, err
 			}

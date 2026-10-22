@@ -1,6 +1,7 @@
 package centrifuge
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -186,6 +187,56 @@ func TestSingleFlightPresenceStatsMergesConcurrentCalls(t *testing.T) {
 		require.Equal(t, 1, results[i].NumClients)
 	}
 	require.Greater(t, metricValue(t, node.metrics.singleflightMergedCount.WithLabelValues("presence_stats")), float64(0))
+}
+
+// singleFlightBlockingMapBroker is a MapBroker whose ReadState blocks until its context is done or release is closed.
+type singleFlightBlockingMapBroker struct {
+	MapBroker
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (b *singleFlightBlockingMapBroker) ReadState(ctx context.Context, _ string, _ MapReadStateOptions) (MapStateResult, error) {
+	b.calls.Add(1)
+	select {
+	case <-ctx.Done():
+		return MapStateResult{}, ctx.Err()
+	case <-b.release:
+		return MapStateResult{}, nil
+	}
+}
+
+// TestSingleflightLeaderCancelDoesNotFailFollowers cancels the caller that started a shared map read while a second
+// caller waits for the same read. The shared read must not end with the context of the leader: the second caller
+// still gets its result.
+func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
+	node := newSingleFlightTestNode(t)
+	broker := &singleFlightBlockingMapBroker{release: make(chan struct{})}
+	node.SetMapBroker(broker)
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := node.MapStateRead(leaderCtx, "singleflight-map-leader", MapReadStateOptions{})
+		leaderErr <- err
+	}()
+	require.Eventually(t, func() bool {
+		return broker.calls.Load() == 1
+	}, 5*time.Second, 5*time.Millisecond)
+
+	followerErr := make(chan error, 1)
+	go func() {
+		_, err := node.MapStateRead(context.Background(), "singleflight-map-leader", MapReadStateOptions{})
+		followerErr <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	cancelLeader()
+	require.ErrorIs(t, <-leaderErr, context.Canceled)
+	close(broker.release)
+	require.NoError(t, <-followerErr)
+	require.Equal(t, int32(1), broker.calls.Load())
 }
 
 func TestSingleFlightNotSharedBetweenNodes(t *testing.T) {
