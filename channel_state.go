@@ -800,8 +800,8 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 
 // sweep moves the channels that are due in the partition to their next state: a
 // vacated event when the delay has passed, or an armed delay when the presence expired.
-// A vacated event kept pending by a full stream is moved one sweep interval ahead by its check, so it leaves
-// the due set and the pages behind it are swept in the same step. The pages are bounded by channelStateSweepMaxPages.
+// A vacated event kept pending by a full stream is moved ahead by its check, so it leaves the due set and the
+// pages behind it are swept in the same step. The pages are bounded by channelStateSweepMaxPages.
 func (w *channelStateWorker) sweep(ctx context.Context, sh *RedisShard, p int) error {
 	nowMs := time.Now().UnixMilli()
 	for page := 0; page < channelStateSweepMaxPages; page++ {

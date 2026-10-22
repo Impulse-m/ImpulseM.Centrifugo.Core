@@ -818,7 +818,8 @@ func TestRedisChannelStateCheckRearmsFullBatchAfterSweep(t *testing.T) {
 	}
 
 	nowMs := int64(100000)
-	keys := []string{presenceSet, presenceHash, stream, pending, expire}
+	kept := getUniqueStatePrefix() + ".kept"
+	keys := []string{presenceSet, presenceHash, stream, pending, expire, kept}
 	args := []string{
 		channel,
 		strconv.FormatInt(nowMs, 10),

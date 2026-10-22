@@ -285,7 +285,8 @@ func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 	checkArgs := func(now int64) []string {
 		return []string{channel, strconv.FormatInt(now, 10), strconv.FormatInt(now/1000, 10), strconv.FormatInt(now, 10), "0", "3", "0", strconv.Itoa(channelStateExpiredBatch), strconv.Itoa(sweepIntervalMs)}
 	}
-	keys := []string{set, hash, stream, pending, expire}
+	keptKey := getUniqueStatePrefix() + ".kept"
+	keys := []string{set, hash, stream, pending, expire, keptKey}
 	kept, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs(nowMs)).AsInt64()
 	require.NoError(t, err)
 	require.Equal(t, int64(channelStateKeptPending), kept)
@@ -301,6 +302,62 @@ func TestRedisChannelStateVacatedSurvivesStreamCap(t *testing.T) {
 	length, err := client.Do(ctx, client.B().Xlen().Key(stream).Build()).AsInt64()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), length)
+}
+
+// TestRedisChannelStateKeptVacatedBacksOff holds the stream of a partition at its cap and sweeps one kept vacated
+// channel over 64 sweep intervals. Each keep doubles the delay of the next check, up to 16 intervals, so the checks
+// grow logarithmically and not once per interval. Once the stream has room, the next due check sends the event and
+// drops the attempt count of the channel.
+func TestRedisChannelStateKeptVacatedBacksOff(t *testing.T) {
+	t.Parallel()
+	node := testStateNode(t)
+	pm := newTestRedisPresenceStateManager(t, node, getUniqueStatePrefix(), testChannelStateConfig(&testChannelStateCollector{}), 0, false, 6379)
+	client := pm.shards[0].client
+	ctx := context.Background()
+
+	stream := getUniqueStatePrefix() + ".stream"
+	pending := getUniqueStatePrefix() + ".pending"
+	expire := getUniqueStatePrefix() + ".expire"
+	set := getUniqueStatePrefix() + ".set"
+	hash := getUniqueStatePrefix() + ".hash"
+	kept := getUniqueStatePrefix() + ".kept"
+	const channel = "vac-backoff"
+	for range 3 {
+		require.NoError(t, client.Do(ctx, client.B().Xadd().Key(stream).Id("*").FieldValue().FieldValue("c", "occupied").FieldValue("t", "occupied").FieldValue("ms", "1").Build()).Error())
+	}
+	const sweepIntervalMs = 1000
+	const intervals = 64
+	startMs := time.Now().UnixMilli()
+	require.NoError(t, client.Do(ctx, client.B().Zadd().Key(pending).ScoreMember().ScoreMember(float64(startMs-1), channel).Build()).Error())
+
+	checkArgs := func(now int64) []string {
+		return []string{channel, strconv.FormatInt(now, 10), strconv.FormatInt(now/1000, 10), strconv.FormatInt(now, 10), "0", "3", "0", strconv.Itoa(channelStateExpiredBatch), strconv.Itoa(sweepIntervalMs)}
+	}
+	keys := []string{set, hash, stream, pending, expire, kept}
+	checks := 0
+	for i := range intervals {
+		now := startMs + int64(i)*sweepIntervalMs
+		score, err := client.Do(ctx, client.B().Zscore().Key(pending).Member(channel).Build()).AsFloat64()
+		require.NoError(t, err)
+		if score > float64(now) {
+			continue
+		}
+		result, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs(now)).AsInt64()
+		require.NoError(t, err)
+		require.Equal(t, int64(channelStateKeptPending), result)
+		checks++
+	}
+	require.LessOrEqual(t, checks, 10, "a kept vacated channel must be checked logarithmically, not once per interval")
+
+	require.NoError(t, client.Do(ctx, client.B().Xtrim().Key(stream).Maxlen().Threshold("0").Build()).Error())
+	score, err := client.Do(ctx, client.B().Zscore().Key(pending).Member(channel).Build()).AsFloat64()
+	require.NoError(t, err)
+	sent, err := pm.state.checkScript.Exec(ctx, client, keys, checkArgs(int64(score))).AsInt64()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), sent)
+	attempts, err := client.Do(ctx, client.B().Hexists().Key(kept).Field(channel).Build()).AsBool()
+	require.NoError(t, err)
+	require.False(t, attempts, "the attempt count of a delivered vacated event must be dropped")
 }
 
 // TestRedisChannelStateSweepStopsAtFullStream leaves 150 due vacated channels pending in one partition whose stream

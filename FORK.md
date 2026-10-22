@@ -34,12 +34,15 @@ RedisChannelStateConfig.SweepInterval below 100ms is raised to 100ms when the ma
 Every partition of a node sweeps on this interval, so the Redis load grows with 1/SweepInterval.
 
 A vacated event kept pending at the stream cap is retried after one SweepInterval, so the channels due behind it are
-swept in the same step. The partition logs "channel state vacated event kept pending" at most once a minute while a
-stream stays full. A dropped occupied event is counted in the events_dropped_count metric and logged at the same rate.
+swept in the same step. Each further keep doubles the delay, up to 16 SweepIntervals. The attempt count of a channel
+is kept in the per-partition hash "kept", and the hash entry is dropped when the event is delivered or cancelled. The
+partition logs "channel state vacated event kept pending" at most once a minute while a stream stays full. A dropped
+occupied event is counted in the events_dropped_count metric and logged at the same rate.
 
-Cost of a full stream: while the stream of a partition stays at the cap, every kept vacated event is checked once per
-SweepInterval, with one check script and one write. A sweep reads up to 10 pages of 100 due channels per partition, so
-a partition with many kept channels spends its sweep on them. There is no backoff per channel yet (see Backlog).
+Cost of a full stream: while the stream of a partition stays at the cap, a kept vacated event is checked on a delay that
+doubles from one SweepInterval up to 16 SweepIntervals, so one channel costs about log2 of the time the stream stays
+full in checks, each with one check script and one write. A sweep reads up to 10 pages of 100 due channels per
+partition, so a partition with many kept channels still spends its sweep on them, but only once per delay of each.
 
 Cost of a failing delivery: the sweep runs once per backoff step, not once per SweepInterval. A batch that keeps failing
 is delivered again after a delay that doubles up to 20 seconds, and the partition is swept once per delay. So under a
@@ -83,5 +86,3 @@ The items below are deferred. Each one needs a measurement or a design before a 
   RedisChannelStateConfig.LeaseTTL note says to use values below 500ms only in tests.
 - Open, owner decision: the 100ms floor of SweepInterval. An explicit value below it is raised to 100ms with a warning.
   The owner has not confirmed that floor, or refusing such values at config time instead.
-- A kept vacated event is checked once per SweepInterval while its stream stays at the cap. A backoff per channel needs
-  an attempt count, and no measurement of the cost exists yet.

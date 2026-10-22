@@ -135,8 +135,8 @@ type RedisChannelStateConfig struct {
 	// A dropped occupied event is not sent again, and later subscribes of the channel send none
 	// either while the channel stays occupied, so the application must reconcile the state from presence. A vacated event at the
 	// cap is not dropped: it stays pending, and a later sweep sends it once the stream has room. While the stream stays at
-	// the cap, each kept vacated event is checked once per SweepInterval, so a sweep of a partition with many kept channels
-	// runs up to 10 pages of 100 checks, each with a write. See FORK.md, Channel state.
+	// the cap, a kept vacated event is checked again after one SweepInterval, and the delay doubles with each keep up to
+	// 16 SweepIntervals, so a long full stream costs a few checks per channel. See FORK.md, Channel state.
 	// Dropped occupied events are counted in the events_dropped_count metric.
 	MaxStreamLength int
 	// SweepInterval is how often a partition is swept and its events are read. A value below 100ms is raised to
@@ -346,6 +346,7 @@ func (s *presenceState) addPresence(sh *RedisShard, channel string, uid string, 
 		string(s.partitionKey(p, "stream")),
 		string(s.partitionKey(p, "pending")),
 		string(s.partitionKey(p, "expire")),
+		string(s.partitionKey(p, "kept")),
 	)
 	args = append(
 		args,
@@ -387,12 +388,13 @@ func (s *presenceState) removePresence(sh *RedisShard, channel string, clientID 
 
 // checkChannels runs the sweep check of the channels of one partition, in batches of
 // channelStateSweepPageSize pipelined commands. A vacated event kept pending by a full stream is not an error:
-// the script moves its pending entry one sweep interval ahead, so the next sweep retries it, and the channels due
-// behind it are checked in the batches that follow.
+// the script moves its pending entry ahead, so a later sweep retries it, and the channels due behind it are
+// checked in the batches that follow.
 func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int, channels []string, nowMs int64) error {
 	stream := string(s.partitionKey(p, "stream"))
 	pending := string(s.partitionKey(p, "pending"))
 	expire := string(s.partitionKey(p, "expire"))
+	kept := string(s.partitionKey(p, "kept"))
 	nowStr := strconv.FormatInt(nowMs, 10)
 	nowSecStr := strconv.FormatInt(nowMs/1000, 10)
 	fireStr := strconv.FormatInt(nowMs+s.vacatedEventDelay.Milliseconds(), 10)
@@ -406,7 +408,7 @@ func (s *presenceState) checkChannels(ctx context.Context, sh *RedisShard, p int
 		execs := make([]rueidis.LuaExec, 0, end-start)
 		for _, channel := range channels[start:end] {
 			execs = append(execs, rueidis.LuaExec{
-				Keys: []string{string(s.stateSetKey(channel)), string(s.stateHashKey(channel)), stream, pending, expire},
+				Keys: []string{string(s.stateSetKey(channel)), string(s.stateHashKey(channel)), stream, pending, expire, kept},
 				Args: []string{channel, nowStr, nowSecStr, fireStr, useHashFieldTTL, maxLenStr, ttlStr, s.expiredBatch, sweepIntervalStr},
 			})
 		}
@@ -450,7 +452,7 @@ func (s *presenceState) logDropped(eventType ChannelStateEventType) {
 }
 
 // logKeptPending logs a vacated event kept pending at the stream cap at most once per minute. The event is retried
-// after one sweep interval, so the log names the full stream as the cause.
+// after a delay of one to 16 sweep intervals, so the log names the full stream as the cause.
 func (s *presenceState) logKeptPending() {
 	if !s.allowLog(&s.keptLoggedAt) {
 		return

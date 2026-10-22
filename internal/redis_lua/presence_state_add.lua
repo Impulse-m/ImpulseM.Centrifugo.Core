@@ -7,6 +7,7 @@
 -- KEYS[5] - channel state stream key
 -- KEYS[6] - channel state pending zset key
 -- KEYS[7] - channel state expire zset key
+-- KEYS[8] - channel state kept hash key, see presence_state_check.lua
 -- ARGV[1] - key expire seconds
 -- ARGV[2] - expire at for set member
 -- ARGV[3] - client ID
@@ -57,6 +58,9 @@ end
 -- The presence of the channel can be gone at expire at; any add cancels a pending vacated event.
 redis.call("zadd", KEYS[7], ARGV[10], ARGV[8])
 local cancelled = redis.call("zrem", KEYS[6], ARGV[8])
+if cancelled == 1 then
+    redis.call("hdel", KEYS[8], ARGV[8])
+end
 if occupied or cancelled == 1 then
     return 0
 end
