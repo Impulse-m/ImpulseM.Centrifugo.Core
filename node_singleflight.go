@@ -2,6 +2,7 @@ package centrifuge
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -36,6 +37,11 @@ type singleflightPanic struct {
 	value any
 }
 
+// singleflightJoinHook is a test seam. When it is set, singleflightDoContext calls it with the key of each caller
+// once the caller is registered in the group, so a test knows when a follower has joined a shared call. It stays nil
+// in production.
+var singleflightJoinHook atomic.Pointer[func(key string)]
+
 // singleflightDoContext is singleflightDo for a call that takes a context. The shared call runs with the values of
 // ctx of the caller that started it, but without its cancellation, and is bounded by singleflightSharedCallTimeout.
 // So the cancellation of one caller does not fail the others, and a call that all its callers left still runs until
@@ -48,6 +54,9 @@ func singleflightDoContext[T any](ctx context.Context, group *singleflight.Group
 		defer cancel()
 		return singleflightRecover(callCtx, fn)
 	})
+	if hook := singleflightJoinHook.Load(); hook != nil {
+		(*hook)(key)
+	}
 	select {
 	case res := <-resultCh:
 		recordShared(merged, res.Shared)

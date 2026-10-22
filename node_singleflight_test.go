@@ -3,8 +3,6 @@ package centrifuge
 import (
 	"context"
 	"errors"
-	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -216,6 +214,17 @@ func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
 	broker := &singleFlightBlockingMapBroker{release: make(chan struct{})}
 	node.SetMapBroker(broker)
 	const ch = "singleflight-map-leader"
+	key := node.mapStateKey(ch, MapReadStateOptions{})
+
+	// The hook counts the callers that register for the key, so the follower is known to have joined the shared read.
+	var joins atomic.Int32
+	joinHook := func(joinedKey string) {
+		if joinedKey == key {
+			joins.Add(1)
+		}
+	}
+	singleflightJoinHook.Store(&joinHook)
+	t.Cleanup(func() { singleflightJoinHook.Store(nil) })
 
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	defer cancelLeader()
@@ -227,20 +236,17 @@ func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return broker.calls.Load() == 1
 	}, 5*time.Second, 5*time.Millisecond)
-
-	// The group does not count its waiters, so count the callers that wait in singleflightDoContext: the leader is one,
-	// and the follower has joined the shared read once there is one more.
 	require.Eventually(t, func() bool {
-		return singleflightWaiters() >= 1
+		return joins.Load() == 1
 	}, 5*time.Second, 5*time.Millisecond)
-	waitersBefore := singleflightWaiters()
+
 	followerErr := make(chan error, 1)
 	go func() {
 		_, err := node.MapStateRead(context.Background(), ch, MapReadStateOptions{})
 		followerErr <- err
 	}()
 	require.Eventually(t, func() bool {
-		return singleflightWaiters() > waitersBefore
+		return joins.Load() == 2
 	}, 5*time.Second, 5*time.Millisecond)
 
 	cancelLeader()
@@ -279,15 +285,6 @@ func (b *singleFlightRecordingMapBroker) ReadState(ctx context.Context, _ string
 	}
 	b.ctxErr <- ctx.Err()
 	return MapStateResult{}, nil
-}
-
-// singleflightWaiters counts the callers that wait in singleflightDoContext, which is where a caller joins a shared
-// call. The frame of the shared call itself is a closure, and it is not counted. The stacks of all goroutines of the
-// test binary are read, so the count can include callers of other tests that wait at the same time.
-func singleflightWaiters() int {
-	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
-	return strings.Count(string(buf[:n]), "singleflightDoContext[...](")
 }
 
 // TestSingleflightSharedReadOutlivesLeader checks that the shared read of a map broker is not cancelled when its only
