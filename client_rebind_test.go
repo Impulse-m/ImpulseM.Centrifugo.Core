@@ -652,3 +652,13 @@ func TestClientRebindUnsubscribeInsideAddPresence(t *testing.T) {
 	require.False(t, client.isSubscribed("test"))
 	requireNoPresence(t, node, "test")
 }
+
+func TestStoreUserSameUserNoAlloc(t *testing.T) {
+	client := &Client{}
+	client.storeUser("user-42")
+	allocs := testing.AllocsPerRun(100, func() {
+		client.storeUser("user-42")
+	})
+	require.Zero(t, allocs)
+	require.Equal(t, "user-42", client.UserID())
+}
