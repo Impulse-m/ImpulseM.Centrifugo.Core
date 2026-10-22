@@ -25,8 +25,6 @@ type ChannelMediumOptions struct {
 	// the load on broker in cases when channel has many subscribers. When message loss is detected medium layer
 	// tells caller about this and also marks all channel subscribers with insufficient state flag. By default,
 	// medium is not used for sync – in that case each individual connection syncs position independently.
-	// Without enableQueue, a large channel pays one full fan-out per publication and per insufficient state
-	// marker, under the broadcast lock of the channel, so enable the queue for large channels.
 	SharedPositionSync bool
 
 	// EnableQueue for incoming publications. This can be useful to reduce PUB/SUB message processing time
@@ -52,6 +50,7 @@ type ChannelMediumOptions struct {
 func (o ChannelMediumOptions) isMediumEnabled() bool {
 	return o.SharedPositionSync || o.KeepLatestPublication || o.enableQueue || o.broadcastDelay > 0
 }
+
 
 // channelMedium is initialized when first subscriber comes into channel, and dropped as soon as last
 // subscriber leaves the channel on the Node.

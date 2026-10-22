@@ -150,8 +150,6 @@ type Config struct {
 	// ClientChannelPositionCheckDelay defines minimal time from previous
 	// client position check in channel. If client does not pass check it
 	// will be disconnected with DisconnectInsufficientState.
-	// Without SharedPositionSync on the channel medium, each subscriber with positioning reads the stream
-	// top of its channel once per this delay, so a large channel with recovery should enable it.
 	// Zero value means 40 * time.Second.
 	ClientChannelPositionCheckDelay time.Duration
 	// Maximum allowed time lag for publications for subscribers with positioning on.
@@ -203,9 +201,6 @@ type Config struct {
 	// UseSingleFlight allows turning on mode where singleflight will be automatically used
 	// for Node.History (including recovery), Node.Presence/Node.PresenceStats,
 	// and Node.MapStateRead/Node.MapStreamRead/Node.MapStats calls.
-	// A shared map read call runs on a goroutine and under a 10 second timer of its own. Only the caller that starts
-	// a shared call pays for them. The call is not cancelled when its callers leave, it runs until the timer ends it.
-	// A panic in the broker call is raised again on the goroutine of the caller.
 	UseSingleFlight bool
 	// HistoryMetaTTL sets a time of stream meta key expiration in Redis. Stream
 	// meta key is a Redis HASH that contains top offset in channel and epoch value.
