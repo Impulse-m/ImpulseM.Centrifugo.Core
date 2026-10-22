@@ -84,8 +84,8 @@ type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) e
 // RedisPresenceManager. Zero values select the defaults.
 //
 // The partitions are divided among the nodes that run channel state, the workers of the prefix.
-// A worker publishes itself in a set on the first Redis shard on every lease cycle, and an entry
-// expires after LeaseTTL unless it is renewed. Nodes without channel state are not counted, so
+// A worker publishes itself in a set on the first Redis shard, at most once every LeaseTTL/3 on the lease
+// cycles, and an entry expires after LeaseTTL unless it is renewed. Nodes without channel state are not counted, so
 // a rolling enable on some nodes keeps every partition consumed while one worker runs. When a
 // worker crashes, its partitions move to the survivors after about LeaseTTL, and a worker that
 // shuts down hands its partitions over at once. While the first shard cannot be reached the count
@@ -136,7 +136,8 @@ type RedisChannelStateConfig struct {
 	// cap is not dropped: it stays pending, and a later sweep sends it once the stream has room.
 	// Dropped occupied events are counted in the events_dropped_count metric.
 	MaxStreamLength int
-	// SweepInterval is how often a partition is swept and its events are read. Must be at least 10ms. Default 1s.
+	// SweepInterval is how often a partition is swept and its events are read. Must be at least 10ms, so values from
+	// 1ms to 9ms are refused when the manager is created. Default 1s.
 	// Every partition of a node sweeps on this interval, so Redis load grows with 1/SweepInterval. Values
 	// below 100ms add that load for each partition and are only useful in tests.
 	SweepInterval time.Duration
