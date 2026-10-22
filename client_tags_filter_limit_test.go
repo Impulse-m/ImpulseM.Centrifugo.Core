@@ -79,12 +79,18 @@ func TestClientTagsFilterLimitsRefuseLargeFilter(t *testing.T) {
 	require.Error(t, subscribeWithTagsFilter(t, node, tagsFilterNotChain(3)))
 }
 
-// TestClientTagsFilterNoLimitByDefault checks that a node without the limits accepts a client filter of any size that
-// the filter validation accepts, as it did before the limits existed.
-func TestClientTagsFilterNoLimitByDefault(t *testing.T) {
+// TestClientTagsFilterDefaultLimits checks that a node without the limits refuses a client filter over the default
+// limits, and that a negative limit accepts a client filter of any size that the filter validation accepts.
+func TestClientTagsFilterDefaultLimits(t *testing.T) {
 	t.Parallel()
 	node := newTagsFilterLimitNode(t, Config{})
 
-	require.NoError(t, subscribeWithTagsFilter(t, node, tagsFilterInValues(1000)))
-	require.NoError(t, subscribeWithTagsFilter(t, node, tagsFilterNotChain(200)))
+	require.NoError(t, subscribeWithTagsFilter(t, node, tagsFilterInValues(filter.DefaultClientMaxValues)))
+	require.Error(t, subscribeWithTagsFilter(t, node, tagsFilterInValues(filter.DefaultClientMaxValues+1)))
+	require.NoError(t, subscribeWithTagsFilter(t, node, tagsFilterNotChain(filter.DefaultClientMaxNodes-1)))
+	require.Error(t, subscribeWithTagsFilter(t, node, tagsFilterNotChain(filter.DefaultClientMaxNodes)))
+
+	unlimited := newTagsFilterLimitNode(t, Config{ClientTagsFilterMaxNodes: -1, ClientTagsFilterMaxValues: -1})
+	require.NoError(t, subscribeWithTagsFilter(t, unlimited, tagsFilterInValues(2000)))
+	require.NoError(t, subscribeWithTagsFilter(t, unlimited, tagsFilterNotChain(1000)))
 }
