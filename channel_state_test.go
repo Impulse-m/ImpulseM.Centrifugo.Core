@@ -75,6 +75,53 @@ func newTestChannelStateNodeWithConfs(tb testing.TB, prefix string, state RedisC
 	return node, pm, shards
 }
 
+// countingShardClient counts the commands that the channel state worker sends to its shard: the GETs of the lease
+// keys, which are the probes for a free partition, and the ZADDs of the workers set, which are the heartbeats. A test
+// reads the counts instead of sampling Redis.
+type countingShardClient struct {
+	rueidis.Client
+	leaseGets   atomic.Int64
+	workerZadds atomic.Int64
+}
+
+// DoMulti counts the commands of the pipeline and sends them on.
+func (c *countingShardClient) DoMulti(ctx context.Context, multi ...rueidis.Completed) []rueidis.RedisResult {
+	for i := range multi {
+		words := multi[i].Commands()
+		if len(words) < 2 {
+			continue
+		}
+		switch {
+		case words[0] == "GET" && strings.HasSuffix(words[1], ".lease"):
+			c.leaseGets.Add(1)
+		case words[0] == "ZADD" && strings.HasSuffix(words[1], ".channel_state.workers"):
+			c.workerZadds.Add(1)
+		}
+	}
+	return c.Client.DoMulti(ctx, multi...)
+}
+
+// newCountingChannelStateNode creates a node with one Redis shard whose client is a countingShardClient, and a
+// channel state presence manager on the shard. The client is set before the broker and the manager are created, so
+// the workers never read the client of the shard while it is replaced.
+func newCountingChannelStateNode(tb testing.TB, prefix string, state RedisChannelStateConfig) (*RedisPresenceManager, *countingShardClient) {
+	tb.Helper()
+	node := testStateNode(tb)
+	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
+	require.NoError(tb, err)
+	counting := &countingShardClient{Client: shard.client}
+	shard.client = counting
+	broker, err := NewRedisBroker(node, RedisBrokerConfig{
+		Prefix:   prefix,
+		UseLists: true,
+		Shards:   []*RedisShard{shard},
+	})
+	require.NoError(tb, err)
+	node.SetBroker(broker)
+	pm := newTestRedisPresenceStateManagerWithShards(tb, node, prefix, state, 0, false, []*RedisShard{shard})
+	return pm, counting
+}
+
 // testStatePrefixes numbers the prefixes of the channel state tests.
 var testStatePrefixes atomic.Uint64
 
@@ -299,10 +346,11 @@ func TestRedisChannelStateTwoNodes(t *testing.T) {
 	}, 3*time.Second, 10*time.Millisecond)
 
 	node2, pm2 := newTestChannelStateNode(t, prefix, state)
-	// Each node owns 4 partitions within 3 lease intervals.
+	// Each node owns 4 partitions within 4 lease intervals. A node with no free partition waits up to one LeaseTTL
+	// between its probes, so the bound leaves room for that delay plus the renewals under race detector load.
 	require.Eventually(t, func() bool {
 		return testOwnedPartitions(t, pm1) == 4 && testOwnedPartitions(t, pm2) == 4
-	}, 3*testChannelStateLeaseTTL, 10*time.Millisecond)
+	}, 4*testChannelStateLeaseTTL, 10*time.Millisecond)
 
 	const numChannels = 50
 	for i := 0; i < numChannels; i++ {
@@ -762,19 +810,20 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 	state := testChannelStateConfig(&testChannelStateCollector{})
 	state.NumPartitions = 1
 	state.LeaseTTL = 2 * time.Second
-	_, pm := newTestChannelStateNode(t, prefix, state)
+	pm, counting := newCountingChannelStateNode(t, prefix, state)
 
 	client := pm.shards[0].client
 	held, err := client.Do(context.Background(), client.B().Set().Key(string(pm.state.partitionKey(0, "lease"))).Value("other-owner").Nx().PxMilliseconds(60000).Build()).ToString()
 	require.NoError(t, err)
 	require.Equal(t, "OK", held)
 
-	// Ten lease ticks: a tick is a fifth of LeaseTTL. The backoff probes at about 0.4, 0.8, 1.6 and 3.2 seconds, so four
-	// probes fall in the window. The count is the probes of this worker, so no other client adds to it. Without the
-	// backoff the node probes about ten times, which the bound refuses.
-	before := pm.state.worker.probes.Load()
+	// Ten lease ticks: a tick is a fifth of LeaseTTL. The delay between probes doubles from 0.4 seconds and is capped at
+	// LeaseTTL, which is 2 seconds here, so the probes fall at about 0.4, 0.8, 1.6 and 3.2 seconds, and four of them
+	// fall in the window of 2 * LeaseTTL = 4 seconds. The sleep is that window, and the counter belongs to the shard client
+	// of this test, so no other test adds to it. Without the backoff the node probes about ten times, which the bound refuses.
+	before := counting.leaseGets.Load()
 	time.Sleep(2 * state.LeaseTTL)
-	probes := pm.state.worker.probes.Load() - before
+	probes := counting.leaseGets.Load() - before
 	require.LessOrEqual(t, probes, int64(5))
 	require.Equal(t, 0, testOwnedPartitions(t, pm))
 }
@@ -786,43 +835,18 @@ func TestRedisChannelStateHeartbeatRate(t *testing.T) {
 	state := testChannelStateConfig(&testChannelStateCollector{})
 	state.NumPartitions = 1
 	state.LeaseTTL = 2 * time.Second
-	_, pm := newTestChannelStateNode(t, prefix, state)
+	pm, counting := newCountingChannelStateNode(t, prefix, state)
 	waitForChannelStatePartitions(t, pm, 1)
 
-	// Ten lease ticks, which is two LeaseTTL: one heartbeat per tick would write ten times.
-	heartbeats := testHeartbeatWrites(t, pm, 2*state.LeaseTTL)
-	require.GreaterOrEqual(t, heartbeats, 1)
-	require.LessOrEqual(t, heartbeats, 7)
+	// The sleep is the window of two LeaseTTL, which is ten lease ticks: one heartbeat per tick would write ten times.
+	// Two heartbeats are at least LeaseTTL/3 apart, so the window holds at most seven of them. The counter belongs to
+	// the shard client of this test, so no other test adds to it.
+	before := counting.workerZadds.Load()
+	time.Sleep(2 * state.LeaseTTL)
+	heartbeats := counting.workerZadds.Load() - before
+	require.GreaterOrEqual(t, heartbeats, int64(1))
+	require.LessOrEqual(t, heartbeats, int64(7))
 	require.Equal(t, 1, testOwnedPartitions(t, pm))
-}
-
-// testHeartbeatWrites samples the score of the node's own entry in the workers set for the window and returns how
-// many times the score changed. A heartbeat sets the score to the time of the write plus LeaseTTL, and two heartbeats
-// are at least a heartbeat interval apart, so each change is one heartbeat. The entry is per node, so the writes of
-// other tests on the shared server do not count.
-func testHeartbeatWrites(tb testing.TB, pm *RedisPresenceManager, window time.Duration) int {
-	tb.Helper()
-	client := pm.state.workersShard.client
-	member := pm.state.worker.node.uid
-	ctx := context.Background()
-	score := func() (float64, bool) {
-		value, err := client.Do(ctx, client.B().Zscore().Key(pm.state.workersKey).Member(member).Build()).AsFloat64()
-		if rueidis.IsRedisNil(err) {
-			return 0, false
-		}
-		require.NoError(tb, err)
-		return value, true
-	}
-	last, _ := score()
-	writes := 0
-	for deadline := time.Now().Add(window); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		value, ok := score()
-		if ok && value != last {
-			writes++
-			last = value
-		}
-	}
-	return writes
 }
 
 // countChannelStateGoroutines counts the goroutines that run the channel state worker.

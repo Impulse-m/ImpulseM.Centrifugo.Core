@@ -18,11 +18,10 @@ const (
 	channelStateMaxBackoff = 20 * time.Second
 	// channelStateLeaseRenewals is how many times a lease is renewed within its TTL.
 	channelStateLeaseRenewals = 5
-	// channelStateCallDivisor sets the timeout of a Redis call of the lease loop: a third of LeaseTTL.
+	// channelStateCallDivisor sets the timeout of a Redis call of the lease loop, and the minimum interval between two
+	// heartbeats: a third of LeaseTTL each. A heartbeat is written on the first lease tick after the interval, see
+	// leaseCycle.
 	channelStateCallDivisor = 3
-	// channelStateHeartbeatDivisor sets the minimum interval between two heartbeats: a third of LeaseTTL. A heartbeat
-	// is written on the first lease tick after the interval, see leaseCycle.
-	channelStateHeartbeatDivisor = 3
 )
 
 // channelStateWorker holds the leases of the channel state partitions of a node and
@@ -54,8 +53,6 @@ type channelStateWorker struct {
 	probeUntil time.Time
 	// probeShare is the share the probe delay was set for. A change of the share resets the delay.
 	probeShare int
-	// probes counts the lease keys the worker read to find a free partition. The tests read it.
-	probes atomic.Int64
 	// lastHeartbeat is when the last heartbeat was written, and workers is the count it returned. The lease loop
 	// goroutine only accesses them. A cycle within heartbeatInterval of the last heartbeat uses the count again.
 	lastHeartbeat time.Time
@@ -154,8 +151,8 @@ func (w *channelStateWorker) run() {
 // leaseCycle renews the owned leases, publishes this worker, and rebalances the partitions by the number of
 // workers the heartbeat counts. The worker writes its heartbeat at most once per heartbeatInterval, on the first
 // lease tick after the interval has passed, so with the default ticks the heartbeat comes up to about 0.4 * LeaseTTL
-// apart. A cycle in between uses the count of the last one. The renewals and the heartbeat run together, and the cycle waits for
-// their replies for at most callTimeout. A shard that does not answer in time is given up, so it cannot delay the
+// apart. A cycle in between uses the count of the last one. The heartbeat runs only when it is due, beside the
+// renewals, and the cycle waits for their replies for at most callTimeout. A shard that does not answer in time is given up, so it cannot delay the
 // renewals of the others. The acquisitions wait for at most callTimeout too: a cycle lasts at most two call
 // timeouts, two thirds of LeaseTTL at the most, however long a shard takes to answer.
 func (w *channelStateWorker) leaseCycle() {
@@ -192,10 +189,10 @@ func (w *channelStateWorker) leaseCycle() {
 	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
-// heartbeatInterval is how often the worker writes its heartbeat: a third of LeaseTTL, so an entry is renewed
-// well before it expires.
+// heartbeatInterval is the minimum time between two heartbeats of the worker: a third of LeaseTTL, the same
+// divisor as callTimeout, so an entry is renewed well before it expires.
 func (w *channelStateWorker) heartbeatInterval() time.Duration {
-	return w.state.leaseTTL / channelStateHeartbeatDivisor
+	return w.state.leaseTTL / channelStateCallDivisor
 }
 
 // startHeartbeat writes the heartbeat on its own goroutine and returns the channel of its outcome.
@@ -656,7 +653,6 @@ func (w *channelStateWorker) freePartitions(ctx context.Context, sh *RedisShard,
 	for _, p := range partitions {
 		cmds = append(cmds, sh.client.B().Get().Key(w.leaseKey(p)).Build())
 	}
-	w.probes.Add(int64(len(cmds)))
 	free := make([]int, 0, len(partitions))
 	for i, res := range sh.client.DoMulti(ctx, cmds...) {
 		err := res.Error()
