@@ -58,7 +58,8 @@ type RedisPresenceManagerConfig struct {
 	// UseHashFieldTTL allows using HEXPIRE command to set TTL for hash field. It's only available
 	// since Redis 7.4.0 thus disabled by default. Using hash field TTL can be useful to avoid
 	// maintaining expiration index in ZSET – so both useful from the throughput and memory usage
-	// perspective.
+	// perspective. Without it, removing the expired entries of a large channel runs in one script call
+	// that can block Redis for a while. See FORK.md, Hash field TTL in Redis presence.
 	UseHashFieldTTL bool
 
 	// ReadFromReplica enables reading presence information from replica Redis servers.

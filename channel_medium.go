@@ -25,6 +25,8 @@ type ChannelMediumOptions struct {
 	// the load on broker in cases when channel has many subscribers. When message loss is detected medium layer
 	// tells caller about this and also marks all channel subscribers with insufficient state flag. By default,
 	// medium is not used for sync – in that case each individual connection syncs position independently.
+	// On a large channel the marker fans out to all subscribers under the broadcast lock, so enable EnableQueue too.
+	// See FORK.md, Shared position sync.
 	SharedPositionSync bool
 
 	// EnableQueue for incoming publications. This can be useful to reduce PUB/SUB message processing time
