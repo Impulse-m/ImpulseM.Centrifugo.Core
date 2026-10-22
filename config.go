@@ -150,6 +150,8 @@ type Config struct {
 	// ClientChannelPositionCheckDelay defines minimal time from previous
 	// client position check in channel. If client does not pass check it
 	// will be disconnected with DisconnectInsufficientState.
+	// Without SharedPositionSync on the channel medium, each subscriber with positioning reads the stream
+	// top of its channel once per this delay, so a large channel with recovery should enable it.
 	// Zero value means 40 * time.Second.
 	ClientChannelPositionCheckDelay time.Duration
 	// Maximum allowed time lag for publications for subscribers with positioning on.
