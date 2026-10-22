@@ -407,11 +407,12 @@ func TestRedisChannelStateSweepStopsAtFullStream(t *testing.T) {
 	require.Equal(t, 0.0, metricValue(t, pm.state.metrics.eventsDropped.WithLabelValues(string(ChannelStateVacated))), "a vacated event kept pending is not a drop")
 }
 
-// TestRedisChannelStateKeptChannelDoesNotStopSweep leaves 100 due vacated channels in one partition whose stream is
-// full, so their events are kept, and one channel behind them whose presence expired. The sweep checks the channels in
-// batches of 100, and the channel behind the kept ones is in the second batch, so it is resolved only if a kept event
-// does not end the sweep.
-func TestRedisChannelStateKeptChannelDoesNotStopSweep(t *testing.T) {
+// TestRedisChannelStateKeptPageKeepsExpireWork leaves 100 due vacated channels in one partition whose stream is full,
+// so their events are kept, and one channel whose presence expired. The sweep reads the pending and the expire sets in
+// the same page, so the expired channel is checked in the step with the kept events, and its presence is resolved there.
+// The channel is on the first page of the expire set, so this test does not reach a later page. The sweep past kept
+// events is covered by TestRedisChannelStateSweepStopsAtFullStream.
+func TestRedisChannelStateKeptPageKeepsExpireWork(t *testing.T) {
 	t.Parallel()
 	state := testChannelStateConfig(&testChannelStateCollector{})
 	state.Handler = func(_ context.Context, _ []ChannelStateEvent) error {
