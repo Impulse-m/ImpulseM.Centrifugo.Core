@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	testChannelStateSweepInterval = 50 * time.Millisecond
+	testChannelStateSweepInterval = 100 * time.Millisecond
 	testChannelStateVacatedDelay  = 200 * time.Millisecond
 	testChannelStateLeaseTTL      = 500 * time.Millisecond
 )
@@ -751,7 +751,6 @@ func TestPresenceStateRemBoundsExpiredCleanup(t *testing.T) {
 	expire := prefix + ".expire"
 	const channel = "expired-batch"
 	const expiredCount = 2500
-	const expiredBatch = 1000
 
 	cmds := make([]rueidis.Completed, 0, 2*expiredCount)
 	for i := range expiredCount {
@@ -765,7 +764,7 @@ func TestPresenceStateRemBoundsExpiredCleanup(t *testing.T) {
 
 	nowSec := int64(100)
 	keys := []string{presenceSet, presenceHash, userSet, userHash, pending, expire}
-	args := []string{"client-x", "", "0", "0", channel, strconv.FormatInt(nowSec, 10), strconv.FormatInt(nowSec*1000+5000, 10), strconv.Itoa(expiredBatch)}
+	args := []string{"client-x", "", "0", "0", channel, strconv.FormatInt(nowSec, 10), strconv.FormatInt(nowSec*1000+5000, 10), strconv.Itoa(channelStateExpiredBatch)}
 	remove := func() {
 		require.NoError(t, pm.state.remScript.Exec(ctx, client, keys, args).Error())
 	}
@@ -776,7 +775,7 @@ func TestPresenceStateRemBoundsExpiredCleanup(t *testing.T) {
 	}
 
 	remove()
-	require.Equal(t, int64(expiredCount-expiredBatch), hashLen(), "one call must remove one batch of expired entries")
+	require.Equal(t, int64(expiredCount-channelStateExpiredBatch), hashLen(), "one call must remove one batch of expired entries")
 	_, err := client.Do(ctx, client.B().Zscore().Key(expire).Member(channel).Build()).AsFloat64()
 	require.NoError(t, err, "a full batch must arm the channel to be checked again")
 
@@ -789,9 +788,9 @@ func TestPresenceStateRemBoundsExpiredCleanup(t *testing.T) {
 	require.Equal(t, int64(0), hashLen())
 }
 
-// TestNewPresenceStateRejectsTinyIntervals checks that the channel state config refuses a sweep interval and a lease
-// TTL so small that the lease loop would spin.
-func TestNewPresenceStateRejectsTinyIntervals(t *testing.T) {
+// TestNewPresenceStateRejectsIntervalsBelowFloors checks that the channel state config refuses a sweep interval below
+// 100ms and a lease TTL below 5ms, and accepts a sweep interval of 100ms.
+func TestNewPresenceStateRejectsIntervalsBelowFloors(t *testing.T) {
 	node := testStateNode(t)
 	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
 	require.NoError(t, err)
@@ -809,38 +808,6 @@ func TestNewPresenceStateRejectsTinyIntervals(t *testing.T) {
 			LeaseTTL:      leaseTTL,
 		}
 	}
-	for _, state := range []RedisChannelStateConfig{
-		channelState(time.Millisecond, 0),
-		channelState(0, time.Millisecond),
-	} {
-		_, err := NewRedisPresenceManager(node, RedisPresenceManagerConfig{
-			Prefix:       getUniqueStatePrefix(),
-			Shards:       []*RedisShard{shard},
-			ChannelState: &state,
-		})
-		require.Error(t, err, "sweep interval %s, lease TTL %s", state.SweepInterval, state.LeaseTTL)
-	}
-}
-
-// TestNewPresenceStateRejectsTinySweepInterval checks that the channel state refuses a sweep interval below 10ms, and
-// accepts 10ms.
-func TestNewPresenceStateRejectsTinySweepInterval(t *testing.T) {
-	node := testStateNode(t)
-	shard, err := NewRedisShard(node, testSingleRedisConf(6379))
-	require.NoError(t, err)
-	defer shard.Close()
-
-	channelState := func(sweepInterval time.Duration) RedisChannelStateConfig {
-		return RedisChannelStateConfig{
-			Enabled: func(_ string) bool {
-				return true
-			},
-			Handler: func(_ context.Context, _ []ChannelStateEvent) error {
-				return nil
-			},
-			SweepInterval: sweepInterval,
-		}
-	}
 	newManager := func(state RedisChannelStateConfig) (*RedisPresenceManager, error) {
 		return NewRedisPresenceManager(node, RedisPresenceManagerConfig{
 			Prefix:       getUniqueStatePrefix(),
@@ -848,11 +815,15 @@ func TestNewPresenceStateRejectsTinySweepInterval(t *testing.T) {
 			ChannelState: &state,
 		})
 	}
-	for _, sweepInterval := range []time.Duration{time.Millisecond, 9 * time.Millisecond} {
-		_, err := newManager(channelState(sweepInterval))
-		require.Error(t, err, "sweep interval %s", sweepInterval)
+	for _, state := range []RedisChannelStateConfig{
+		channelState(time.Millisecond, 0),
+		channelState(99*time.Millisecond, 0),
+		channelState(0, time.Millisecond),
+	} {
+		_, err := newManager(state)
+		require.Error(t, err, "sweep interval %s, lease TTL %s", state.SweepInterval, state.LeaseTTL)
 	}
-	pm, err := newManager(channelState(10 * time.Millisecond))
+	pm, err := newManager(channelState(100*time.Millisecond, 0))
 	require.NoError(t, err)
 	require.NoError(t, pm.Close(t.Context()))
 }

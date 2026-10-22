@@ -20,7 +20,7 @@ const (
 	channelStateDefaultLeaseTTL          = 5 * time.Second
 	channelStateDefaultBatchSize         = 100
 	channelStateMinLeaseTTL              = 5 * time.Millisecond
-	channelStateMinSweepInterval         = 10 * time.Millisecond
+	channelStateMinSweepInterval         = 100 * time.Millisecond
 	channelStateSweepPageSize            = 100
 	channelStateSweepMaxPages            = 10
 	// channelStateExpiredBatch bounds the expired entries that one state script removes from the presence set.
@@ -136,10 +136,9 @@ type RedisChannelStateConfig struct {
 	// cap is not dropped: it stays pending, and a later sweep sends it once the stream has room.
 	// Dropped occupied events are counted in the events_dropped_count metric.
 	MaxStreamLength int
-	// SweepInterval is how often a partition is swept and its events are read. Must be at least 10ms, so values from
-	// 1ms to 9ms are refused when the manager is created. Default 1s.
-	// Every partition of a node sweeps on this interval, so Redis load grows with 1/SweepInterval. Values
-	// below 100ms add that load for each partition and are only useful in tests.
+	// SweepInterval is how often a partition is swept and its events are read. Must be at least 100ms, so values
+	// below it are refused when the manager is created. Default 1s.
+	// Every partition of a node sweeps on this interval, so Redis load grows with 1/SweepInterval.
 	SweepInterval time.Duration
 	// LeaseTTL is how long a partition lease lasts without renewal. A lease is renewed every LeaseTTL/5,
 	// and a Redis call of the lease loop gives up after LeaseTTL/3, so a reply that is slower than that
@@ -215,7 +214,7 @@ func newPresenceState(m *RedisPresenceManager, config RedisChannelStateConfig) (
 	if sweepInterval <= 0 {
 		sweepInterval = channelStateDefaultSweepInterval
 	} else if sweepInterval < channelStateMinSweepInterval {
-		return nil, errors.New("presence: channel state SweepInterval must be at least 10ms")
+		return nil, errors.New("presence: channel state SweepInterval must be at least 100ms")
 	}
 
 	leaseTTL := config.LeaseTTL
