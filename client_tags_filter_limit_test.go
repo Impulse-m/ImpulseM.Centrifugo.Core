@@ -81,7 +81,8 @@ func TestClientTagsFilterLimitsRefuseLargeFilter(t *testing.T) {
 
 // TestClientTagsFilterZeroLimitsUseDefaults checks that zero limits are the defaults, not unlimited: a node without
 // the limits accepts a filter of up to 128 nodes in total and up to 128 values in each comparison, refuses a
-// comparison of 129 values, and still refuses a NOT chain of 1000 nodes, because the depth limit always applies.
+// comparison of 129 values, and refuses a NOT chain of 1000 nodes, because the node cap refuses the whole chain.
+// The depth limit is not reached at the defaults here; TestClientTagsFilterNegativeLimitsDisableCaps covers it.
 func TestClientTagsFilterZeroLimitsUseDefaults(t *testing.T) {
 	t.Parallel()
 	node := newTagsFilterLimitNode(t, Config{})
