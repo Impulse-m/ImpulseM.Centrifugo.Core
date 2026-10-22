@@ -75,16 +75,18 @@ func newTestChannelStateNodeWithConfs(tb testing.TB, prefix string, state RedisC
 	return node, pm, shards
 }
 
-// countingShardClient counts the commands that the channel state worker sends to its shard: the GETs of the lease
-// keys, which are the probes for a free partition, and the ZADDs of the workers set, which are the heartbeats. A test
-// reads the counts instead of sampling Redis.
+// countingShardClient records the time of each command that the channel state worker sends to its shard: the GETs of
+// the lease keys, which are the probes for a free partition, and the ZADDs of the workers set, which are the
+// heartbeats. A test counts the events of a window by their times, so a late read of the counts cannot add an event
+// that happened after the window.
 type countingShardClient struct {
 	rueidis.Client
-	leaseGets   atomic.Int64
-	workerZadds atomic.Int64
+	mu          sync.Mutex
+	leaseGets   []time.Time
+	workerZadds []time.Time
 }
 
-// DoMulti counts the commands of the pipeline and sends them on.
+// DoMulti records the commands of the pipeline and sends them on.
 func (c *countingShardClient) DoMulti(ctx context.Context, multi ...rueidis.Completed) []rueidis.RedisResult {
 	for i := range multi {
 		words := multi[i].Commands()
@@ -93,12 +95,32 @@ func (c *countingShardClient) DoMulti(ctx context.Context, multi ...rueidis.Comp
 		}
 		switch {
 		case words[0] == "GET" && strings.HasSuffix(words[1], ".lease"):
-			c.leaseGets.Add(1)
+			c.record(&c.leaseGets)
 		case words[0] == "ZADD" && strings.HasSuffix(words[1], ".channel_state.workers"):
-			c.workerZadds.Add(1)
+			c.record(&c.workerZadds)
 		}
 	}
 	return c.Client.DoMulti(ctx, multi...)
+}
+
+// record appends the current time to the events.
+func (c *countingShardClient) record(events *[]time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	*events = append(*events, time.Now())
+}
+
+// countBetween returns how many of the events happened at or after start and before end.
+func (c *countingShardClient) countBetween(events *[]time.Time, start time.Time, end time.Time) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	for _, at := range *events {
+		if !at.Before(start) && at.Before(end) {
+			count++
+		}
+	}
+	return count
 }
 
 // newCountingChannelStateNode creates a node with one Redis shard whose client is a countingShardClient, and a
@@ -406,10 +428,12 @@ func TestRedisChannelStateCrashedWorkerPartitionsMove(t *testing.T) {
 		return testOwnedPartitions(t, pm1) == 4 && testOwnedPartitions(t, pm2) == 4
 	}, 3*testChannelStateLeaseTTL, 10*time.Millisecond)
 
+	// The survivor takes the partitions once the lease of the crashed worker has expired. Its probe of a held
+	// partition backs off up to LeaseTTL, so the takeover can take about 1.5 LeaseTTL after the crash.
 	shards2[0].Close()
 	require.Eventually(t, func() bool {
 		return testOwnedPartitions(t, pm1) == 8
-	}, 2*testChannelStateLeaseTTL+time.Second, 10*time.Millisecond)
+	}, 3*testChannelStateLeaseTTL+time.Second, 10*time.Millisecond)
 
 	const numChannels = 16
 	for i := 0; i < numChannels; i++ {
@@ -808,6 +832,7 @@ func TestRedisChannelStateCloseReleasesWhileConsumerHangs(t *testing.T) {
 // The node owns nothing and wants its share, so it probes the lease key on each tick. Over ten ticks it must not
 // probe on every tick: the probes back off while every probe finds the partition held.
 func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
+	t.Parallel()
 	prefix := getUniqueStatePrefix()
 	state := testChannelStateConfig(&testChannelStateCollector{})
 	state.NumPartitions = 1
@@ -821,24 +846,27 @@ func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
 
 	// Ten lease ticks: a tick is a fifth of LeaseTTL, which is 0.4 seconds here. The delay between probes doubles from one
 	// tick and is capped at LeaseTTL, and the probes land on the ticks, so the spacing is quantized and not exactly the
-	// doubling. The window is 2 * LeaseTTL = 4 seconds and is measured from before the first probe. The upper bound is
-	// checked at the end of the window. Without the backoff the node probes about ten times, which the bound refuses.
-	// The lower bound waits for the first probe, so a counter that stops counting fails the test, and a window that is
-	// starved by the scheduler does not. The counter belongs to the shard client of this test, so no other test adds to it.
-	before := counting.leaseGets.Load()
-	deadline := time.Now().Add(2 * state.LeaseTTL)
+	// doubling. The window is 2 * LeaseTTL = 4 seconds and is measured from the start of the test. The probes are counted
+	// by their send times inside the window, so the bound does not depend on when the test reads the count. Without the
+	// backoff the node probes about ten times, which the bound refuses. The lower bound waits for the first probe, so a
+	// counter that stops counting fails the test. The counter belongs to the shard client of this test, so no other test
+	// adds to it.
+	start := time.Now()
+	end := start.Add(2 * state.LeaseTTL)
 	require.Eventually(t, func() bool {
-		return counting.leaseGets.Load() > before
+		return counting.countBetween(&counting.leaseGets, start, time.Now().Add(time.Hour)) > 0
 	}, 2*state.LeaseTTL, 10*time.Millisecond)
-	time.Sleep(time.Until(deadline))
-	probes := counting.leaseGets.Load() - before
-	require.LessOrEqual(t, probes, int64(5))
+	require.Never(t, func() bool {
+		return counting.countBetween(&counting.leaseGets, start, end) > 5
+	}, time.Until(end), 10*time.Millisecond)
+	require.LessOrEqual(t, counting.countBetween(&counting.leaseGets, start, end), 5)
 	require.Equal(t, 0, testOwnedPartitions(t, pm))
 }
 
 // TestRedisChannelStateHeartbeatRate checks that a worker writes its heartbeat to the workers set of the shard
 // less often than on every lease tick. The set is only a count for the share, and LeaseTTL keeps the entries alive.
 func TestRedisChannelStateHeartbeatRate(t *testing.T) {
+	t.Parallel()
 	prefix := getUniqueStatePrefix()
 	state := testChannelStateConfig(&testChannelStateCollector{})
 	state.NumPartitions = 1
@@ -847,17 +875,19 @@ func TestRedisChannelStateHeartbeatRate(t *testing.T) {
 	waitForChannelStatePartitions(t, pm, 1)
 
 	// The window is two LeaseTTL, which is ten lease ticks: one heartbeat per tick would write ten times. Two heartbeats
-	// are at least LeaseTTL/3 apart, so the window holds at most seven of them. The upper bound is checked at the end
-	// of the window, and the lower bound waits for the first heartbeat of the window. The counter belongs to the shard
-	// client of this test, so no other test adds to it.
-	before := counting.workerZadds.Load()
-	deadline := time.Now().Add(2 * state.LeaseTTL)
+	// are at least LeaseTTL/3 apart, so the window holds at most seven of them. The heartbeats are counted by their send
+	// times inside the window, so the upper bound does not depend on when the test reads the count. The lower bound waits
+	// for the first heartbeat of the window. The counter belongs to the shard client of this test, so no other test adds
+	// to it.
+	start := time.Now()
+	end := start.Add(2 * state.LeaseTTL)
 	require.Eventually(t, func() bool {
-		return counting.workerZadds.Load() > before
+		return counting.countBetween(&counting.workerZadds, start, time.Now().Add(time.Hour)) > 0
 	}, 2*state.LeaseTTL, 10*time.Millisecond)
-	time.Sleep(time.Until(deadline))
-	heartbeats := counting.workerZadds.Load() - before
-	require.LessOrEqual(t, heartbeats, int64(7))
+	require.Never(t, func() bool {
+		return counting.countBetween(&counting.workerZadds, start, end) > 7
+	}, time.Until(end), 10*time.Millisecond)
+	require.LessOrEqual(t, counting.countBetween(&counting.workerZadds, start, end), 7)
 	require.Equal(t, 1, testOwnedPartitions(t, pm))
 }
 
