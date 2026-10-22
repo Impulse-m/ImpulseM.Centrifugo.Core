@@ -20,6 +20,8 @@ const (
 	channelStateLeaseRenewals = 5
 	// channelStateCallDivisor sets the timeout of a Redis call of the lease loop: a third of LeaseTTL.
 	channelStateCallDivisor = 3
+	// channelStateHeartbeatDivisor sets how often the worker writes its heartbeat: a third of LeaseTTL.
+	channelStateHeartbeatDivisor = 3
 )
 
 // channelStateWorker holds the leases of the channel state partitions of a node and
@@ -44,6 +46,17 @@ type channelStateWorker struct {
 	// consumers have stopped, so two consumers never run one partition. Only the lease loop goroutine
 	// accesses it.
 	retiring map[int]*channelStatePartition
+	// probeDelay is the delay after a probe that found no free partition. It is only accessed by the lease loop
+	// goroutine, and it doubles from one lease tick up to LeaseTTL.
+	probeDelay time.Duration
+	// probeUntil is the time before which the lease loop does not probe for partitions.
+	probeUntil time.Time
+	// probeShare is the share the probe delay was set for. A change of the share resets the delay.
+	probeShare int
+	// lastHeartbeat is when the last heartbeat was written, and workers is the count it returned. The lease loop
+	// goroutine only accesses them. A cycle within heartbeatInterval of the last heartbeat uses the count again.
+	lastHeartbeat time.Time
+	workers       int
 }
 
 // channelStatePartition is a partition the node holds a lease on, and the consumer of the partition.
@@ -129,15 +142,55 @@ func (w *channelStateWorker) run() {
 }
 
 // leaseCycle renews the owned leases, publishes this worker, and rebalances the partitions by the number of
-// workers the heartbeat counts. The renewals and the heartbeat run together, and the cycle waits for their
-// replies for at most callTimeout. A shard that does not answer in time is given up, so it cannot delay the
+// workers the heartbeat counts. The worker publishes its heartbeat once per heartbeatInterval, and a cycle in
+// between uses the count of the last one. The renewals and the heartbeat run together, and the cycle waits for
+// their replies for at most callTimeout. A shard that does not answer in time is given up, so it cannot delay the
 // renewals of the others. The acquisitions wait for at most callTimeout too: a cycle lasts at most two call
 // timeouts, two thirds of LeaseTTL at the most, however long a shard takes to answer.
 func (w *channelStateWorker) leaseCycle() {
 	ctx, cancel := w.callContext()
 	defer cancel()
+
+	start := time.Now()
+	due := start.Sub(w.lastHeartbeat) >= w.heartbeatInterval()
+	var heartbeat <-chan callResult[int]
+	if due {
+		heartbeat = w.startHeartbeat()
+	}
+
+	w.renewOwned(ctx.Done())
+	hb := callResult[int]{value: w.workers}
+	if due {
+		hb, _ = awaitCall(heartbeat, ctx.Done())
+	}
+
+	if hb.err != nil {
+		// Without the count the share is unknown. The worker keeps the partitions it owns and takes the free
+		// ones, so the partitions of a crashed worker are still consumed on the healthy shards. The leases keep
+		// one consumer per partition. The worker may hold more than its share until the count is known again.
+		w.state.metrics.incSweepErrors()
+		w.node.logger.log(newErrorLogEntry(hb.err, "channel state worker heartbeat failed", nil))
+		w.rebalance(w.state.numPartitions)
+	} else {
+		if due {
+			w.lastHeartbeat = start
+		}
+		w.workers = hb.value
+		w.rebalance(w.share(hb.value))
+	}
+	w.state.metrics.setPartitionsOwned(len(w.owned))
+}
+
+// heartbeatInterval is how often the worker writes its heartbeat: a third of LeaseTTL, so an entry is renewed
+// well before it expires.
+func (w *channelStateWorker) heartbeatInterval() time.Duration {
+	return w.state.leaseTTL / channelStateHeartbeatDivisor
+}
+
+// startHeartbeat writes the heartbeat on its own goroutine and returns the channel of its outcome.
+func (w *channelStateWorker) startHeartbeat() <-chan callResult[int] {
 	w.heartbeats.Add(1)
-	heartbeat := startCall(func() (int, error) {
+	return startCall(func() (int, error) {
 		defer w.heartbeats.Done()
 		count, err := w.heartbeat()
 		select {
@@ -149,21 +202,6 @@ func (w *channelStateWorker) leaseCycle() {
 		}
 		return count, err
 	})
-
-	w.renewOwned(ctx.Done())
-	hb, _ := awaitCall(heartbeat, ctx.Done())
-
-	if hb.err != nil {
-		// Without the count the share is unknown. The worker keeps the partitions it owns and takes the free
-		// ones, so the partitions of a crashed worker are still consumed on the healthy shards. The leases keep
-		// one consumer per partition. The worker may hold more than its share until the count is known again.
-		w.state.metrics.incSweepErrors()
-		w.node.logger.log(newErrorLogEntry(hb.err, "channel state worker heartbeat failed", nil))
-		w.rebalance(w.state.numPartitions)
-	} else {
-		w.rebalance(w.share(hb.value))
-	}
-	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
 // callTimeout is how long one Redis call of the lease loop may take: a third of LeaseTTL. A shard that does not
@@ -238,7 +276,7 @@ func waitWithin(wg *sync.WaitGroup, d time.Duration) {
 }
 
 // rebalance gives up one partition when the node owns more than its share, and takes free partitions
-// while it owns less.
+// while it owns less. A probe that finds no free partition delays the next probe, see backOffProbe.
 func (w *channelStateWorker) rebalance(share int) {
 	if len(w.owned) > share {
 		for _, part := range w.owned {
@@ -246,8 +284,33 @@ func (w *channelStateWorker) rebalance(share int) {
 			break
 		}
 	} else if len(w.owned) < share {
-		w.acquire(share - len(w.owned))
+		if share != w.probeShare {
+			w.probeShare = share
+			w.resetProbe()
+		}
+		if time.Now().Before(w.probeUntil) {
+			return
+		}
+		if w.acquire(share - len(w.owned)) {
+			w.backOffProbe()
+		} else {
+			w.resetProbe()
+		}
 	}
+}
+
+// backOffProbe delays the next probe, after a probe that found every partition leased. The delay doubles from one
+// lease tick up to LeaseTTL, so a node that owns less than its share probes a few times per LeaseTTL instead of on
+// every tick. A partition whose lease expires is taken at most LeaseTTL later than without the delay.
+func (w *channelStateWorker) backOffProbe() {
+	w.probeDelay = min(max(2*w.probeDelay, w.leaseTick), w.state.leaseTTL)
+	w.probeUntil = time.Now().Add(w.probeDelay)
+}
+
+// resetProbe removes the delay of the probes, so the next rebalance probes at once.
+func (w *channelStateWorker) resetProbe() {
+	w.probeDelay = 0
+	w.probeUntil = time.Time{}
 }
 
 // renewResult is the outcome of the renewals of one shard.
@@ -471,8 +534,9 @@ func (w *channelStateWorker) leave() {
 // free and not to a random pick that another worker holds. The shards run in parallel, and each shard attempts at
 // most the slots left of need. The loop waits for each shard for at most callTimeout: a shard that is given up
 // releases the leases it takes when it returns. A node whose worker count is unknown takes every free partition it
-// can (see leaseCycle), so it may exceed its share until the count is back.
-func (w *channelStateWorker) acquire(need int) {
+// can (see leaseCycle), so it may exceed its share until the count is back. It returns true when it took no
+// partition and every probe got an answer, which means that no partition was free: the caller backs off.
+func (w *channelStateWorker) acquire(need int) bool {
 	w.forgetStopped()
 	candidates := make([]int, 0, w.state.numPartitions-len(w.owned))
 	for _, p := range rand.Perm(w.state.numPartitions) { //nolint:gosec // Partition order is only a fairness hint; not security-sensitive.
@@ -487,22 +551,36 @@ func (w *channelStateWorker) acquire(need int) {
 	var remaining atomic.Int64
 	remaining.Store(int64(need))
 	byShard := groupByShard(candidates, w.state.shardOf)
-	attempts := make([]<-chan callResult[[]*channelStatePartition], 0, len(byShard))
+	attempts := make([]<-chan callResult[acquireResult], 0, len(byShard))
 	for sh, partitions := range byShard {
-		attempts = append(attempts, startCall(func() ([]*channelStatePartition, error) {
+		attempts = append(attempts, startCall(func() (acquireResult, error) {
 			return w.acquireShard(sh, partitions, &remaining), nil
 		}))
 	}
+	idle := true
 	for _, ch := range attempts {
 		res, ok := awaitCall(ch, ctx.Done())
 		if !ok {
 			w.releaseWhenReturned(ch)
+			idle = false
 			continue
 		}
-		for _, part := range res.value {
+		if res.value.failed || len(res.value.taken) > 0 {
+			idle = false
+		}
+		for _, part := range res.value.taken {
 			w.startPartition(part)
 		}
 	}
+	return idle
+}
+
+// acquireResult is the outcome of the acquisition of one shard.
+type acquireResult struct {
+	// taken are the leases the acquisition took.
+	taken []*channelStatePartition
+	// failed says whether a probe or an attempt failed, so the partitions are unknown.
+	failed bool
 }
 
 // forgetStopped removes the partitions whose consumers have stopped from the retiring set.
@@ -518,12 +596,12 @@ func (w *channelStateWorker) forgetStopped() {
 
 // releaseWhenReturned releases the leases that an acquisition takes when it returns, for an acquisition that the
 // lease loop has given up. The release runs on a goroutine of its own.
-func (w *channelStateWorker) releaseWhenReturned(ch <-chan callResult[[]*channelStatePartition]) {
+func (w *channelStateWorker) releaseWhenReturned(ch <-chan callResult[acquireResult]) {
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
 		res := <-ch
-		w.releaseParts(res.value)
+		w.releaseParts(res.value.taken)
 	}()
 }
 
@@ -532,7 +610,7 @@ func (w *channelStateWorker) releaseWhenReturned(ch <-chan callResult[[]*channel
 // remaining, which holds the partitions the node still needs in total. Every attempt writes its own token. It
 // releases the leases of the attempts whose reply failed, since they may have been taken, and returns the leases it
 // took. It starts no consumer: the caller does, on the lease loop goroutine.
-func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int, remaining *atomic.Int64) []*channelStatePartition {
+func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int, remaining *atomic.Int64) acquireResult {
 	ctx, cancel := w.callContext()
 	defer cancel()
 
@@ -566,7 +644,7 @@ func (w *channelStateWorker) acquireShard(sh *RedisShard, partitions []int, rema
 	}
 	w.releaseParts(failed)
 	w.reportCallErrors("channel state lease acquire failed", errs)
-	return taken
+	return acquireResult{taken: taken, failed: errs.failed > 0}
 }
 
 // freePartitions returns the partitions of one shard whose lease key is not held, in the order given. The keys are

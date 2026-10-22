@@ -616,6 +616,69 @@ func TestRedisChannelStateCloseReleasesWhileConsumerHangs(t *testing.T) {
 	require.Equal(t, int64(0), members)
 }
 
+// testCommandCalls returns how many calls of the command the Redis server of the shard has served, from INFO
+// commandstats. The tests that use it do not run in parallel, so no other test adds to the count.
+func testCommandCalls(tb testing.TB, sh *RedisShard, command string) int64 {
+	tb.Helper()
+	info, err := sh.client.Do(context.Background(), sh.client.B().Info().Section("commandstats").Build()).ToString()
+	require.NoError(tb, err)
+	for _, line := range strings.Split(info, "\n") {
+		name, stats, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok || name != "cmdstat_"+command {
+			continue
+		}
+		for _, field := range strings.Split(stats, ",") {
+			if value, found := strings.CutPrefix(field, "calls="); found {
+				calls, err := strconv.ParseInt(value, 10, 64)
+				require.NoError(tb, err)
+				return calls
+			}
+		}
+	}
+	return 0
+}
+
+// TestRedisChannelStateIdleWorkerProbeBackoff holds the only partition of the prefix with a lease of another owner.
+// The node owns nothing and wants its share, so it probes the lease key on each tick. Over ten ticks it must not
+// probe on every tick: the probes back off while every probe finds the partition held.
+func TestRedisChannelStateIdleWorkerProbeBackoff(t *testing.T) {
+	prefix := getUniqueStatePrefix()
+	state := testChannelStateConfig(&testChannelStateCollector{})
+	state.NumPartitions = 1
+	state.LeaseTTL = 2 * time.Second
+	_, pm := newTestChannelStateNode(t, prefix, state)
+
+	client := pm.shards[0].client
+	held, err := client.Do(context.Background(), client.B().Set().Key(string(pm.state.partitionKey(0, "lease"))).Value("other-owner").Nx().PxMilliseconds(60000).Build()).ToString()
+	require.NoError(t, err)
+	require.Equal(t, "OK", held)
+
+	// Ten lease ticks: a tick is a fifth of LeaseTTL.
+	before := testCommandCalls(t, pm.shards[0], "get")
+	time.Sleep(2 * state.LeaseTTL)
+	probes := testCommandCalls(t, pm.shards[0], "get") - before
+	require.LessOrEqual(t, probes, int64(5))
+	require.Equal(t, 0, testOwnedPartitions(t, pm))
+}
+
+// TestRedisChannelStateHeartbeatRate checks that a worker writes its heartbeat to the workers set of the shard
+// less often than on every lease tick. The set is only a count for the share, and LeaseTTL keeps the entries alive.
+func TestRedisChannelStateHeartbeatRate(t *testing.T) {
+	prefix := getUniqueStatePrefix()
+	state := testChannelStateConfig(&testChannelStateCollector{})
+	state.NumPartitions = 1
+	state.LeaseTTL = 2 * time.Second
+	_, pm := newTestChannelStateNode(t, prefix, state)
+	waitForChannelStatePartitions(t, pm, 1)
+
+	// Ten lease ticks, which is two LeaseTTL: one heartbeat per tick would write ten times.
+	before := testCommandCalls(t, pm.shards[0], "zadd")
+	time.Sleep(2 * state.LeaseTTL)
+	heartbeats := testCommandCalls(t, pm.shards[0], "zadd") - before
+	require.LessOrEqual(t, heartbeats, int64(7))
+	require.Equal(t, 1, testOwnedPartitions(t, pm))
+}
+
 // countChannelStateGoroutines counts the goroutines that run the channel state worker.
 func countChannelStateGoroutines() int {
 	buf := make([]byte, 1<<16)
