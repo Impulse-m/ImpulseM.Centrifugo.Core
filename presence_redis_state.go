@@ -84,12 +84,12 @@ type ChannelStateHandler func(ctx context.Context, events []ChannelStateEvent) e
 // RedisPresenceManager. Zero values select the defaults.
 //
 // The partitions are divided among the nodes that run channel state, the workers of the prefix.
-// A worker publishes itself in a set on the first Redis shard, at most once every LeaseTTL/3 on the lease
-// cycles, and an entry expires after LeaseTTL unless it is renewed. Nodes without channel state are not counted, so
-// a rolling enable on some nodes keeps every partition consumed while one worker runs. When a
-// worker crashes, its partitions move to the survivors after about LeaseTTL, and a worker that
-// shuts down hands its partitions over at once. While the first shard cannot be reached the count
-// is unknown: a worker keeps its partitions and takes the free ones until the count is back.
+// A worker publishes itself in a set on the first Redis shard, and an entry expires after LeaseTTL unless it is
+// renewed. Nodes without channel state are not counted, so a rolling enable on some nodes keeps every partition
+// consumed while one worker runs. When a worker crashes, its partitions move to the survivors after about LeaseTTL.
+// A worker that shuts down releases its partitions at once, but a survivor takes them at its next probe, up to
+// LeaseTTL later. While the first shard cannot be reached the count is unknown: a worker keeps its partitions and
+// takes the free ones until the count is back. The timing of the lease loop is in FORK.md, Channel state.
 //
 // Presence is not split across the partitions. The presence of an enabled channel is kept in its own
 // keys, which a node without channel state does not read. Deploy the configuration to every node of
@@ -117,9 +117,10 @@ type RedisChannelStateConfig struct {
 	// Handler receives the events. Required. An error keeps the batch in the stream, and the batch is
 	// delivered again after a delay that grows. The redelivery comes at the first sweep tick after the
 	// delay, so the gap is the delay plus up to one SweepInterval. So an event that always fails blocks
-	// the delivery of its partition, while the sweeps of the partition keep running. A full stream does not stop
-	// the sweeps either: a vacated event kept pending at the cap is retried after SweepInterval, so the channels
-	// due behind it are swept too. There is no dead-letter stream.
+	// the delivery of its partition. The sweeps keep running between the attempts, but a failing batch runs one
+	// sweep per delay, so under a persistent failure a sweep comes up to every 20 seconds, not every SweepInterval.
+	// A full stream does not stop the sweeps either: a vacated event kept pending at the cap is retried by the next
+	// sweep, so under a persistent failure that retry can wait as long as the delay. There is no dead-letter stream.
 	Handler ChannelStateHandler
 	// NumPartitions is the number of partitions that serialize channel state in Redis.
 	// It must not change while channels are occupied. Default 128.
@@ -133,7 +134,9 @@ type RedisChannelStateConfig struct {
 	// are dropped when the cap is reached. Negative removes the cap. Default 8192.
 	// A dropped occupied event is not sent again, and later subscribes of the channel send none
 	// either while the channel stays occupied, so the application must reconcile the state from presence. A vacated event at the
-	// cap is not dropped: it stays pending, and a later sweep sends it once the stream has room.
+	// cap is not dropped: it stays pending, and a later sweep sends it once the stream has room. While the stream stays at
+	// the cap, each kept vacated event is checked once per SweepInterval, so a sweep of a partition with many kept channels
+	// runs up to 10 pages of 100 checks, each with a write. See FORK.md, Channel state.
 	// Dropped occupied events are counted in the events_dropped_count metric.
 	MaxStreamLength int
 	// SweepInterval is how often a partition is swept and its events are read. A value below 100ms is raised to

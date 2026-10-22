@@ -20,8 +20,7 @@ const (
 	channelStateLeaseRenewals = 5
 	// channelStateCallDivisor sets the timeout of a Redis call of the lease loop: a third of LeaseTTL each.
 	channelStateCallDivisor = 3
-	// channelStateHeartbeatDivisor sets the minimum interval between two heartbeats: a third of LeaseTTL. A heartbeat
-	// is written on the first lease tick after the interval, see leaseCycle.
+	// channelStateHeartbeatDivisor sets the minimum interval between two heartbeats: a third of LeaseTTL, see FORK.md.
 	channelStateHeartbeatDivisor = 3
 )
 
@@ -150,18 +149,8 @@ func (w *channelStateWorker) run() {
 	}
 }
 
-// leaseCycle renews the owned leases, publishes this worker, and rebalances the partitions by the number of
-// workers the heartbeat counts. The worker writes its heartbeat at most once per heartbeatInterval, on the first
-// lease tick after the interval has passed, so with the default ticks the heartbeat comes up to about 0.4 * LeaseTTL
-// apart. Under a slow shard the gap can reach about one LeaseTTL: a cycle can start up to two call timeouts after the
-// one before it, and its heartbeat can land up to one call timeout after its start. Master has the same worst case,
-// since it heartbeats in every cycle. A worker that is counted out for that long is left out of the share of the
-// other workers for about one cycle, so they take a few more partitions meanwhile. The lease is the guard: it keeps
-// one consumer per partition. A cycle in between uses the count of the last one. The heartbeat runs only when it is
-// due, beside the renewals, and the cycle waits for their
-// replies for at most callTimeout. A shard that does not answer in time is given up, so it cannot delay the renewals
-// of the others. The acquisitions wait for at most callTimeout too: a cycle lasts at most two call timeouts, two
-// thirds of LeaseTTL at the most, however long a shard takes to answer.
+// leaseCycle renews the owned leases, writes the heartbeat when it is due, and rebalances the partitions. The timing
+// of these calls is in FORK.md, Channel state.
 func (w *channelStateWorker) leaseCycle() {
 	ctx, cancel := w.callContext()
 	defer cancel()
@@ -196,8 +185,7 @@ func (w *channelStateWorker) leaseCycle() {
 	w.state.metrics.setPartitionsOwned(len(w.owned))
 }
 
-// heartbeatInterval is the minimum time between two heartbeats of the worker: a third of LeaseTTL, so an entry is
-// renewed well before it expires.
+// heartbeatInterval is the minimum time between two heartbeats of the worker, see FORK.md, Channel state.
 func (w *channelStateWorker) heartbeatInterval() time.Duration {
 	return w.state.leaseTTL / channelStateHeartbeatDivisor
 }
@@ -784,8 +772,8 @@ func (w *channelStateWorker) consumeOnce(ctx context.Context, sh *RedisShard, p 
 					return false
 				}
 				// The events stay in the stream, so the same batch is delivered again. The step returns after the
-				// delay, so the consumer runs the sweep of the partition before it delivers the batch again: the
-				// sweeps keep running while a failing event blocks the delivery, also when the stream is full (see sweep).
+				// delay, so the consumer runs the sweep of the partition before it delivers the batch again. The sweep
+				// runs once per step, so a batch that keeps failing is swept once per delay.
 				w.state.metrics.incDeliveryErrors()
 				w.logError(err, "channel state delivery failed", p)
 				return w.wait(ctx, backoff)
