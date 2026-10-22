@@ -19,11 +19,16 @@ func singleflightDo[T any](group *singleflight.Group, merged prometheus.Counter,
 	v, err, shared := group.Do(key, func() (any, error) {
 		return fn()
 	})
+	recordShared(merged, shared)
+	result, _ := v.(T)
+	return result, err
+}
+
+// recordShared counts a call that received the result of another in-flight call.
+func recordShared(merged prometheus.Counter, shared bool) {
 	if shared {
 		merged.Inc()
 	}
-	result, _ := v.(T)
-	return result, err
 }
 
 // singleflightDoContext is singleflightDo for a call that takes a context. The shared call runs with the values of
@@ -38,9 +43,7 @@ func singleflightDoContext[T any](ctx context.Context, group *singleflight.Group
 	})
 	select {
 	case res := <-ch:
-		if res.Shared {
-			merged.Inc()
-		}
+		recordShared(merged, res.Shared)
 		result, _ := res.Val.(T)
 		return result, res.Err
 	case <-ctx.Done():
