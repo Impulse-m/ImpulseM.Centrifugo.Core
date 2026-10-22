@@ -1602,10 +1602,7 @@ func (c *Client) Info() []byte {
 func (c *Client) TokenIdentity() TokenIdentity {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if e := c.ext.Load(); e != nil {
-		return e.tokenIdentity
-	}
-	return TokenIdentity{}
+	return c.tokenIdentityValue()
 }
 
 // ConnectedAtMS returns timestamp in milliseconds when client connected.

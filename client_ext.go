@@ -34,6 +34,15 @@ func (c *Client) setTokenIdentity(identity TokenIdentity) {
 	c.extension().tokenIdentity = identity
 }
 
+// tokenIdentityValue returns the token identity of the connection, which is zero when no state is allocated. Lock must
+// be held outside.
+func (c *Client) tokenIdentityValue() TokenIdentity {
+	if e := c.ext.Load(); e != nil {
+		return e.tokenIdentity
+	}
+	return TokenIdentity{}
+}
+
 // extStateBox wraps the value stored with SetExtState, so that it can be swapped
 // atomically regardless of the dynamic type of the value.
 type extStateBox struct {
