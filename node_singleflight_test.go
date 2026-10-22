@@ -346,7 +346,7 @@ func TestSingleFlightGoexitDoesNotHangCallers(t *testing.T) {
 	}()
 	select {
 	case err := <-readErr:
-		require.ErrorIs(t, err, errSingleflightGoexit)
+		require.ErrorIs(t, err, errCallGoexit)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the caller of a shared read whose broker call ended with runtime.Goexit did not return")
 	}

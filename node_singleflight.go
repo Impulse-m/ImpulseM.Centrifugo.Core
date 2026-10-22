@@ -2,7 +2,6 @@ package centrifuge
 
 import (
 	"context"
-	"errors"
 	"sync/atomic"
 	"time"
 
@@ -13,10 +12,6 @@ import (
 // singleflightSharedCallTimeout bounds a call that singleflightDoContext shares between its callers. The call does
 // not end with the context of the caller that started it, so it needs a bound of its own.
 const singleflightSharedCallTimeout = 10 * time.Second
-
-// errSingleflightGoexit is the error of a shared call whose function ended its goroutine with runtime.Goexit. Such a
-// call returns no result, so each of its callers gets this error.
-var errSingleflightGoexit = errors.New("singleflight: shared call ended without a result")
 
 // singleflightDo runs fn once for concurrent callers of group with the same key and returns its result to
 // all of them. A call that received the result of another in-flight call increments merged. The result is
@@ -76,22 +71,12 @@ func singleflightDoContext[T any](ctx context.Context, group *singleflight.Group
 }
 
 // singleflightRun runs fn on a goroutine of its own and returns its outcome. A runtime.Goexit in fn ends that
-// goroutine without an outcome, so the goroutine reports errSingleflightGoexit instead. Without this, the group would
-// never answer its callers, which wait for their own contexts to end.
+// goroutine without an outcome, so startCall reports errCallGoexit instead. Without this, the group would never
+// answer its callers, which wait for their own contexts to end.
 func singleflightRun[T any](ctx context.Context, fn func(context.Context) (T, error)) (any, error) {
-	outcome := make(chan callResult[any], 1)
-	go func() {
-		exited := true
-		defer func() {
-			if exited {
-				outcome <- callResult[any]{err: errSingleflightGoexit}
-			}
-		}()
-		result, err := singleflightRecover(ctx, fn)
-		exited = false
-		outcome <- callResult[any]{value: result, err: err}
-	}()
-	res := <-outcome
+	res := <-startCall(func() (any, error) {
+		return singleflightRecover(ctx, fn)
+	})
 	return res.value, res.err
 }
 

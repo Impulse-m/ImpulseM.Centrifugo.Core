@@ -2,7 +2,6 @@ package centrifuge
 
 import (
 	"context"
-	"errors"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -216,49 +215,6 @@ func (w *channelStateWorker) callTimeout() time.Duration {
 // callContext returns the context of one Redis call of the lease loop, which gives up after callTimeout.
 func (w *channelStateWorker) callContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), w.callTimeout())
-}
-
-// errCallTimeout is the outcome of a call of the lease loop that did not return in time.
-var errCallTimeout = errors.New("channel state call did not return in time")
-
-// callResult is the outcome of a call of the lease loop that runs on its own goroutine.
-type callResult[T any] struct {
-	value T
-	err   error
-}
-
-// startCall runs fn on its own goroutine and returns the channel of its outcome. The channel is buffered, so
-// a call that returns after the lease loop stopped waiting for it does not block.
-func startCall[T any](fn func() (T, error)) <-chan callResult[T] {
-	ch := make(chan callResult[T], 1)
-	go func() {
-		value, err := fn()
-		ch <- callResult[T]{value: value, err: err}
-	}()
-	return ch
-}
-
-// awaitCall waits for the outcome of a call until expired is closed. A result that is already there wins over
-// the expiry. ok is false when the call did not return in time: rueidis queues a call behind a connection that
-// is being dialed, and that wait does not end with the context of the call, so the lease loop does not wait for
-// a call without a bound of its own.
-func awaitCall[T any](ch <-chan callResult[T], expired <-chan struct{}) (res callResult[T], ok bool) {
-	select {
-	case res = <-ch:
-		return res, true
-	default:
-	}
-	select {
-	case res = <-ch:
-		return res, true
-	case <-expired:
-		select {
-		case res = <-ch:
-			return res, true
-		default:
-			return callResult[T]{err: errCallTimeout}, false
-		}
-	}
 }
 
 // waitWithin waits until the goroutines of wg are done or d has passed. A call whose connection is being dialed
