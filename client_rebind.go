@@ -96,7 +96,7 @@ func (c *Client) Rebind(opts RebindOptions) error {
 	}
 	oldUser := c.user
 	c.storeUser(opts.UserID)
-	c.tokenIdentity = opts.TokenIdentity
+	c.setTokenIdentity(opts.TokenIdentity)
 	c.info = bytes.Clone(opts.Info)
 	c.exp = min(opts.ExpireAt, nowUnix+maxTTLSeconds)
 	if c.exp == 0 {
@@ -148,14 +148,19 @@ func (c *Client) connInfo() []byte {
 func (c *Client) storeRefreshIdentity(identity TokenIdentity) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.tokenIdentity = identity
+	c.setTokenIdentity(identity)
 }
 
 // storeUser sets the user and its lock-free mirror read by UserID. Lock must be
-// held outside.
+// held outside. The mirror is allocated only when the user changes, so a store of
+// the user the connection already has allocates nothing.
 func (c *Client) storeUser(user string) {
 	c.user = user
-	c.userAtomic.Store(&user)
+	if mirror := c.userAtomic.Load(); mirror != nil && *mirror == user {
+		return
+	}
+	mirrored := user
+	c.userAtomic.Store(&mirrored)
 }
 
 // rewritePresence moves the presence of one channel from oldUser to the user

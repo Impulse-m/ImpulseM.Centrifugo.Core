@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/centrifugal/centrifuge/internal/queue"
@@ -95,6 +96,36 @@ type extStateBox struct {
 	v any
 }
 
+// clientExt holds the state of the fork features that most connections do not set: the token identity and the
+// extension state. It is allocated when one of them is set first, so a connection without them holds one pointer.
+// The token identity is guarded by Client.mu, and the extension state is atomic.
+type clientExt struct {
+	tokenIdentity TokenIdentity
+	extState      atomic.Pointer[extStateBox]
+}
+
+// extension returns the state of the fork features of the connection, allocating it when create is set. Setting
+// the state twice at once keeps one of the two allocations.
+func (c *Client) extension(create bool) *clientExt {
+	if e := c.ext.Load(); e != nil || !create {
+		return e
+	}
+	e := &clientExt{}
+	if c.ext.CompareAndSwap(nil, e) {
+		return e
+	}
+	return c.ext.Load()
+}
+
+// setTokenIdentity replaces the token identity of the connection. Lock must be held outside. A zero identity on a
+// connection without the state allocates nothing.
+func (c *Client) setTokenIdentity(identity TokenIdentity) {
+	if identity == (TokenIdentity{}) && c.ext.Load() == nil {
+		return
+	}
+	c.extension(true).tokenIdentity = identity
+}
+
 // ExtState returns the value previously set with SetExtState, or nil if no value
 // has been set. It is a single atomic load and is safe to call from any goroutine.
 // Intended for applications to attach cheap per-connection state (16 bytes per
@@ -103,7 +134,11 @@ type extStateBox struct {
 // for the connect command, and read it later from any goroutine.
 // This API is EXPERIMENTAL and may be changed/removed.
 func (c *Client) ExtState() any {
-	box := c.extState.Load()
+	e := c.ext.Load()
+	if e == nil {
+		return nil
+	}
+	box := e.extState.Load()
 	if box == nil {
 		return nil
 	}
@@ -115,7 +150,7 @@ func (c *Client) ExtState() any {
 // Setting is safe from any goroutine; the last Set wins.
 // This API is EXPERIMENTAL and may be changed/removed.
 func (c *Client) SetExtState(v any) {
-	c.extState.Store(&extStateBox{v: v})
+	c.extension(true).extState.Store(&extStateBox{v: v})
 }
 
 // OnStateSnapshot allows settings StateSnapshotHandler.

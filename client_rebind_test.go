@@ -129,14 +129,10 @@ func TestClientRebindTokenIdentity(t *testing.T) {
 		UserID:        "new",
 		TokenIdentity: TokenIdentity{Generation: 7},
 	}))
-	client.mu.RLock()
-	require.Equal(t, uint64(7), client.tokenIdentity.Generation)
-	client.mu.RUnlock()
+	require.Equal(t, uint64(7), client.TokenIdentity().Generation)
 
 	require.NoError(t, client.Rebind(RebindOptions{UserID: "new"}))
-	client.mu.RLock()
-	require.Equal(t, uint64(0), client.tokenIdentity.Generation)
-	client.mu.RUnlock()
+	require.Equal(t, uint64(0), client.TokenIdentity().Generation)
 }
 
 func TestClientRebindUserLimit(t *testing.T) {

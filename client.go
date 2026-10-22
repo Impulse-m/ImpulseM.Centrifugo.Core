@@ -311,14 +311,13 @@ type Client struct {
 	user             string
 	userAtomic       atomic.Pointer[string] // mirrors user for lock-free reads, because Rebind may change the user of a live client
 	info             []byte
-	tokenIdentity    TokenIdentity
+	ext              atomic.Pointer[clientExt] // token identity and extension state, allocated when first set
 	storage          map[string]any
 	// profile is the application context this connection belongs to, resolved at
 	// connect: what an OnConnecting handler set, or failing that what the client
 	// declared. Empty means unclassified.
 	profile                string
 	storageMu              sync.Mutex
-	extState               atomic.Pointer[extStateBox]
 	metricName             string // Make a unique.Handle.
 	metricVersion          string // Make a unique.Handle.
 	labels                 map[string]string
@@ -1603,7 +1602,10 @@ func (c *Client) Info() []byte {
 func (c *Client) TokenIdentity() TokenIdentity {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.tokenIdentity
+	if e := c.ext.Load(); e != nil {
+		return e.tokenIdentity
+	}
+	return TokenIdentity{}
 }
 
 // ConnectedAtMS returns timestamp in milliseconds when client connected.
@@ -2317,7 +2319,7 @@ func (c *Client) expire() {
 					c.info = reply.Info
 				}
 				if reply.TokenIdentity != nil && expireAt > nowUnix {
-					c.tokenIdentity = *reply.TokenIdentity
+					c.setTokenIdentity(*reply.TokenIdentity)
 				}
 				c.mu.Unlock()
 			}
@@ -2525,7 +2527,7 @@ func (c *Client) handleRefresh(req *protocol.RefreshRequest, cmd *protocol.Comma
 					c.info = info
 				}
 				if reply.TokenIdentity != nil {
-					c.tokenIdentity = *reply.TokenIdentity
+					c.setTokenIdentity(*reply.TokenIdentity)
 				}
 				duration := time.Duration(ttl)*time.Second + c.node.config.ClientExpiredCloseDelay
 				c.addExpireUpdate(duration, true)
@@ -4019,7 +4021,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	c.mu.Lock()
 	c.storeUser(credentials.UserID)
 	c.info = credentials.Info
-	c.tokenIdentity = credentials.TokenIdentity
+	c.setTokenIdentity(credentials.TokenIdentity)
 	c.exp = min(credentials.ExpireAt, time.Now().Unix()+maxTTLSeconds)
 
 	user := c.user
