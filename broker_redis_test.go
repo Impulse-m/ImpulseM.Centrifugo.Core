@@ -40,6 +40,9 @@ func testNode(tb testing.TB) *Node {
 		LogHandler: func(entry LogEntry) {},
 	})
 	require.NoError(tb, err)
+	tb.Cleanup(func() {
+		_ = node.Shutdown(context.Background())
+	})
 	return node
 }
 
@@ -49,6 +52,9 @@ func benchNode(tb testing.TB) *Node {
 		LogHandler: func(entry LogEntry) {},
 	})
 	require.NoError(tb, err)
+	tb.Cleanup(func() {
+		_ = node.Shutdown(context.Background())
+	})
 	return node
 }
 
@@ -81,6 +87,9 @@ func NewTestRedisBroker(tb testing.TB, n *Node, prefix string, useStreams bool, 
 	n.SetBroker(e)
 	err = n.Run()
 	require.NoError(tb, err)
+	tb.Cleanup(func() {
+		_ = n.Shutdown(context.Background())
+	})
 	return e
 }
 
@@ -128,6 +137,9 @@ func NewTestRedisBrokerCluster(tb testing.TB, n *Node, prefix string, useStreams
 	n.SetBroker(e)
 	err = n.Run()
 	require.NoError(tb, err)
+	tb.Cleanup(func() {
+		_ = n.Shutdown(context.Background())
+	})
 	return e
 }
 
@@ -163,6 +175,9 @@ func NewTestRedisBrokerSentinel(tb testing.TB) *RedisBroker {
 	n.SetBroker(e)
 	err = n.Run()
 	require.NoError(tb, err)
+	tb.Cleanup(func() {
+		_ = n.Shutdown(context.Background())
+	})
 	return e
 }
 
@@ -176,6 +191,7 @@ func stopRedisBroker(b *RedisBroker) {
 func TestRedisBroker_NoShards(t *testing.T) {
 	t.Parallel()
 	n, _ := New(Config{})
+	defer func() { _ = n.Shutdown(context.Background()) }()
 	_, err := NewRedisBroker(n, RedisBrokerConfig{})
 	require.Error(t, err)
 }
@@ -352,6 +368,7 @@ func TestRedisBrokerPublishNoPubSub(t *testing.T) {
 	redisConf := testSingleRedisConf(6379)
 	s, err := NewRedisShard(node, redisConf)
 	require.NoError(t, err)
+	t.Cleanup(s.Close)
 	b, err := NewRedisBroker(node, RedisBrokerConfig{
 		Prefix:     uuid.NewString(),
 		Shards:     []*RedisShard{s},
@@ -1776,6 +1793,9 @@ func nodeWithRedisBroker(tb testing.TB, useStreams bool, useCluster bool, port i
 		tb.Fatal(err)
 	}
 	newTestRedisBroker(tb, n, useStreams, useCluster, port)
+	tb.Cleanup(func() {
+		_ = n.Shutdown(context.Background())
+	})
 	n.OnConnect(func(client *Client) {
 		client.OnSubscribe(func(e SubscribeEvent, cb SubscribeCallback) {
 			cb(SubscribeReply{}, nil)
@@ -2729,6 +2749,7 @@ func TestRedisBroker_UsePrecomputedPartitionTags_Validation(t *testing.T) {
 	t.Parallel()
 	n, err := New(Config{LogHandler: func(LogEntry) {}})
 	require.NoError(t, err)
+	defer func() { _ = n.Shutdown(context.Background()) }()
 
 	t.Run("rejects zero partition count", func(t *testing.T) {
 		_, err := NewRedisBroker(n, RedisBrokerConfig{

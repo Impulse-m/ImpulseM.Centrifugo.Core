@@ -121,6 +121,7 @@ func newTestRedisPresenceStateManager(
 	tb.Helper()
 	s, err := NewRedisShard(n, testSingleRedisConf(port))
 	require.NoError(tb, err)
+	tb.Cleanup(s.Close)
 	pm := newTestRedisPresenceStateManagerWithShards(tb, n, prefix, state, presenceTTL, hashFieldTTL, []*RedisShard{s})
 	waitForChannelStatePartitions(tb, pm, state.NumPartitions)
 	return pm
@@ -477,6 +478,7 @@ func TestRedisChannelStateOverlappingSweepKeepsOccupied(t *testing.T) {
 	state.SweepInterval = time.Hour
 	s, err := NewRedisShard(node, testSingleRedisConf(6379))
 	require.NoError(t, err)
+	t.Cleanup(s.Close)
 	pm := newTestRedisPresenceStateManagerWithShards(t, node, getUniqueStatePrefix(), state, 0, false, []*RedisShard{s})
 
 	const ch = "overlapping-sweep"
@@ -606,6 +608,9 @@ func TestRedisChannelStateSharedRegistry(t *testing.T) {
 			},
 		})
 		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = node.Shutdown(context.Background())
+		})
 		return node
 	}
 	collector := &testChannelStateCollector{}
@@ -615,11 +620,13 @@ func TestRedisChannelStateSharedRegistry(t *testing.T) {
 	node1 := newNode()
 	s1, err := NewRedisShard(node1, testSingleRedisConf(6379))
 	require.NoError(t, err)
+	t.Cleanup(s1.Close)
 	pm1 := newTestRedisPresenceStateManagerWithShards(t, node1, prefix, state, 0, false, []*RedisShard{s1})
 
 	node2 := newNode()
 	s2, err := NewRedisShard(node2, testSingleRedisConf(6379))
 	require.NoError(t, err)
+	t.Cleanup(s2.Close)
 	pm2 := newTestRedisPresenceStateManagerWithShards(t, node2, prefix, state, 0, false, []*RedisShard{s2})
 
 	require.Same(t, pm1.state.metrics.eventsEmitted, pm2.state.metrics.eventsEmitted)
@@ -740,6 +747,7 @@ func TestRedisChannelStateCluster(t *testing.T) {
 		IOTimeout:        10 * time.Second,
 	})
 	require.NoError(t, err)
+	t.Cleanup(s.Close)
 	pm := newTestRedisPresenceStateManagerWithShards(t, node, getUniqueStatePrefix(), testChannelStateConfig(collector), 0, false, []*RedisShard{s})
 	waitForChannelStatePartitions(t, pm, 0)
 

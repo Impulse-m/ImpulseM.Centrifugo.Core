@@ -148,6 +148,7 @@ func TestSetCredentials(t *testing.T) {
 func TestNewClient(t *testing.T) {
 	t.Parallel()
 	node := defaultTestNode()
+	defer func() { _ = node.Shutdown(context.Background()) }()
 	transport := newTestTransport(func() {})
 	client, err := newClient(context.Background(), node, transport)
 	require.NoError(t, err)

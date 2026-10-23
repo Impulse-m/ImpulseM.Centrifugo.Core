@@ -170,7 +170,9 @@ func TestHub(t *testing.T) {
 	require.NoError(t, err)
 
 	h := newHub(nil, m, 0)
-	c, err := newClient(context.Background(), defaultTestNode(), newTestTransport(func() {}))
+	clientNode := defaultTestNode()
+	defer func() { _ = clientNode.Shutdown(context.Background()) }()
+	c, err := newClient(context.Background(), clientNode, newTestTransport(func() {}))
 	require.NoError(t, err)
 	c.storeUser("test")
 	removed := h.remove(c)
@@ -1076,7 +1078,9 @@ func TestHubShutdown(t *testing.T) {
 	err = h.shutdown(context.Background())
 	require.NoError(t, err)
 	h = newHub(nil, m, 0)
-	c, err := newClient(context.Background(), defaultTestNode(), newTestTransport(func() {}))
+	clientNode := defaultTestNode()
+	defer func() { _ = clientNode.Shutdown(context.Background()) }()
+	c, err := newClient(context.Background(), clientNode, newTestTransport(func() {}))
 	require.NoError(t, err)
 	h.add(c)
 
@@ -1096,7 +1100,9 @@ func TestHubSubscriptions(t *testing.T) {
 	})
 	require.NoError(t, err)
 	h := newHub(nil, m, 0)
-	c, err := newClient(context.Background(), defaultTestNode(), newTestTransport(func() {}))
+	clientNode := defaultTestNode()
+	defer func() { _ = clientNode.Shutdown(context.Background()) }()
+	c, err := newClient(context.Background(), clientNode, newTestTransport(func() {}))
 	require.NoError(t, err)
 
 	_, _, _ = h.addSub("test1", subInfo{client: c, deltaType: ""})
@@ -1142,7 +1148,9 @@ func TestUserConnections(t *testing.T) {
 	})
 	require.NoError(t, err)
 	h := newHub(nil, m, 0)
-	c, err := newClient(context.Background(), defaultTestNode(), newTestTransport(func() {}))
+	clientNode := defaultTestNode()
+	defer func() { _ = clientNode.Shutdown(context.Background()) }()
+	c, err := newClient(context.Background(), clientNode, newTestTransport(func() {}))
 	require.NoError(t, err)
 	h.add(c)
 
@@ -1200,6 +1208,7 @@ func TestHubSharding(t *testing.T) {
 func BenchmarkHubDisconnect_LabelFilter(b *testing.B) {
 	const numClients = 1000
 	n := defaultTestNodeBenchmark(b)
+	defer func() { _ = n.Shutdown(context.Background()) }()
 
 	for i := 0; i < numClients; i++ {
 		c := newTestConnectedClientWithTransport(b, context.Background(), n, newTestTransport(func() {}), "u-bench")
@@ -1219,6 +1228,7 @@ func BenchmarkHub_Contention(b *testing.B) {
 	numChannels := 128
 
 	n := defaultTestNodeBenchmark(b)
+	defer func() { _ = n.Shutdown(context.Background()) }()
 
 	var clients []*Client
 	var channels []string
@@ -1288,6 +1298,7 @@ func BenchmarkHub_MassiveBroadcast(b *testing.B) {
 		b.Run(fmt.Sprintf("subscribers_%d", numSubscribers), func(b *testing.B) {
 			b.ReportAllocs()
 			n := defaultTestNodeBenchmark(b)
+			defer func() { _ = n.Shutdown(context.Background()) }()
 
 			channel := "broadcast"
 
@@ -1593,9 +1604,11 @@ func TestSubIDUniquenessAcrossShards(t *testing.T) {
 	h := newHub(nil, m, 0)
 
 	// Create test clients for different shards
+	clientNode := defaultTestNode()
+	defer func() { _ = clientNode.Shutdown(context.Background()) }()
 	clients := make([]*Client, 0)
 	for i := 0; i < 10; i++ {
-		c, err := newClient(context.Background(), defaultTestNode(), newTestTransport(func() {}))
+		c, err := newClient(context.Background(), clientNode, newTestTransport(func() {}))
 		require.NoError(t, err)
 		clients = append(clients, c)
 	}
@@ -1679,7 +1692,9 @@ func TestSubIDShardDistribution(t *testing.T) {
 	// We'll create enough channels to test multiple IDs per shard
 	channelsPerShard := 3
 
-	client, err := newClient(context.Background(), defaultTestNode(), newTestTransport(func() {}))
+	clientNode := defaultTestNode()
+	defer func() { _ = clientNode.Shutdown(context.Background()) }()
+	client, err := newClient(context.Background(), clientNode, newTestTransport(func() {}))
 	require.NoError(t, err)
 
 	// Track IDs by shard index

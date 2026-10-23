@@ -345,6 +345,7 @@ func TestNodeLogHandler(t *testing.T) {
 			close(doneCh)
 		},
 	})
+	defer func() { _ = n.Shutdown(context.Background()) }()
 	// Debug should not be logged.
 	n.logger.log(newLogEntry(LogLevelDebug, "test1", nil))
 	n.logger.log(newLogEntry(LogLevelInfo, "test2", nil))
@@ -358,7 +359,9 @@ func TestNodeLogHandler(t *testing.T) {
 func TestNode_SetBroker(t *testing.T) {
 	t.Parallel()
 	n, _ := New(Config{})
+	defer func() { _ = n.Shutdown(context.Background()) }()
 	broker := testMemoryBroker()
+	defer func() { _ = broker.node.Shutdown(context.Background()) }()
 	n.SetBroker(broker)
 	require.Equal(t, n.broker, broker)
 }
@@ -366,6 +369,7 @@ func TestNode_SetBroker(t *testing.T) {
 func TestNode_SetPresenceManager_NilPresenceManager(t *testing.T) {
 	t.Parallel()
 	n, _ := New(Config{})
+	defer func() { _ = n.Shutdown(context.Background()) }()
 	n.SetPresenceManager(nil)
 	require.NoError(t, n.addPresence("test", "uid", &ClientInfo{}))
 	require.NoError(t, n.removePresence("test", "uid", ""))
@@ -381,6 +385,7 @@ func TestNode_LogEnabled(t *testing.T) {
 		LogLevel:   LogLevelInfo,
 		LogHandler: func(entry LogEntry) {},
 	})
+	defer func() { _ = n.Shutdown(context.Background()) }()
 	require.False(t, n.logEnabled(LogLevelDebug))
 	require.True(t, n.logEnabled(LogLevelInfo))
 }
@@ -410,6 +415,7 @@ func TestNode_RunPubControlError(t *testing.T) {
 func TestNode_SetPresenceManager(t *testing.T) {
 	t.Parallel()
 	n, _ := New(Config{})
+	defer func() { _ = n.Shutdown(context.Background()) }()
 	presenceManager := testMemoryPresenceManager(t)
 	n.SetPresenceManager(presenceManager)
 	require.Equal(t, n.presenceManager, presenceManager)
@@ -743,6 +749,7 @@ func BenchmarkBroadcastMemory(b *testing.B) {
 
 func BenchmarkHistory(b *testing.B) {
 	broker := testMemoryBroker()
+	defer func() { _ = broker.node.Shutdown(context.Background()) }()
 	numMessages := 100
 
 	channel := "test"
@@ -1872,6 +1879,7 @@ func TestNode_MapMetricMethods_NilMetrics(t *testing.T) {
 	t.Parallel()
 	n, err := New(Config{})
 	require.NoError(t, err)
+	defer func() { _ = n.Shutdown(context.Background()) }()
 	// Before Run(), metrics may be nil — should not panic.
 	n.IncMapBrokerCleanupErrors("test")
 	n.AddMapBrokerCleanupRemoved("test", 5)
@@ -2225,6 +2233,7 @@ func TestNode_SetBroker_PreservesController(t *testing.T) {
 	t.Parallel()
 	n, err := New(Config{})
 	require.NoError(t, err)
+	defer func() { _ = n.Shutdown(context.Background()) }()
 
 	c := NewTestController()
 	n.SetController(c)
