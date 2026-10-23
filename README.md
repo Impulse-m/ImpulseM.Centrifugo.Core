@@ -1,4 +1,4 @@
-# Centrifuge (ImpulseM fork)
+# Centrifuge (fork)
 
 This is a fork of [centrifugal/centrifuge](https://github.com/centrifugal/centrifuge) (MIT), the upstream Go library described below. The Go module path is unchanged, so imports stay `github.com/centrifugal/centrifuge`.
 
@@ -33,7 +33,7 @@ replace github.com/centrifugal/protocol => github.com/Impulse-m/ImpulseM.Centrif
 
 ### License
 
-MIT, see [LICENSE](LICENSE). Third-party code in this repository is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT, see [LICENSE](LICENSE). The fork's changes are under the same license, and the upstream copyright notice in LICENSE is kept as it is. Third-party code in this repository is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 

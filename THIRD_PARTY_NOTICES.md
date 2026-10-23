@@ -55,8 +55,8 @@ The text below applies to the centrifuge-js build and to the EventEmitter module
 ```
 MIT License
 
-Copyright (c) 2023 Centrifugal Labs LTD (centrifuge-js build)
-Copyright Joyent, Inc. and other Node contributors (EventEmitter module)
+Copyright (c) 2023 Centrifugal Labs LTD
+Copyright Joyent, Inc. and other Node contributors.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
