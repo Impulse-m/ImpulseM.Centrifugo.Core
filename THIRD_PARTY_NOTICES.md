@@ -46,7 +46,7 @@ THIS SOFTWARE.
 * Source: https://github.com/centrifugal/centrifuge-js (fork: https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.JS)
 * Copyright (c) 2023 Centrifugal Labs LTD
 * License: MIT. The license text is in the MIT section below.
-* The build also contains an EventEmitter module with the Node.js `events` API. The notice for it is in the MIT section below, under Joyent, Inc. and other Node contributors.
+* The build also contains an EventEmitter module with the Node.js `events` API. Source: https://github.com/nodejs/node (`lib/events.js`). The notice for it is in the MIT section below, under Joyent, Inc. and other Node contributors.
 
 ## MIT License text
 

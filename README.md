@@ -24,12 +24,12 @@ replace github.com/centrifugal/protocol => github.com/Impulse-m/ImpulseM.Centrif
 
 ### Sibling repositories
 
-* [ImpulseM.Centrifugo](https://github.com/Impulse-m/ImpulseM.Centrifugo): the server built on this library, a fork of the [upstream server](https://github.com/centrifugal/centrifugo). Release images are `ghcr.io/impulse-m/impulsem.centrifugo`.
-* [ImpulseM.Centrifugo.Core](https://github.com/Impulse-m/ImpulseM.Centrifugo.Core): this repository.
-* [ImpulseM.Centrifugo.Protocol](https://github.com/Impulse-m/ImpulseM.Centrifugo.Protocol): a fork of [centrifugal/protocol](https://github.com/centrifugal/protocol) with the fork fields of `client.proto` used by the SDKs and this library.
-* [ImpulseM.Centrifugo.Client.JS](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.JS): a fork of [centrifuge-js](https://github.com/centrifugal/centrifuge-js), npm package `@impulsem/centrifuge` (latest 1.6.0).
-* [ImpulseM.Centrifugo.Client.Java](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java): a fork of [centrifuge-java](https://github.com/centrifugal/centrifuge-java), Maven `com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:1.7.0` from the [Maven repository](https://impulse-m.github.io/ImpulseM.Centrifugo.Client.Java/).
-* [ImpulseM.Centrifugo.Client.Swift](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Swift): a fork of [centrifuge-swift](https://github.com/centrifugal/centrifuge-swift), Swift Package Manager from its tags, latest 2.0.0 (see its `MIGRATION.md` for the breaking changes).
+* [Server](https://github.com/Impulse-m/ImpulseM.Centrifugo): the server built on this library, a fork of the [upstream server](https://github.com/centrifugal/centrifugo). Release images are `ghcr.io/impulse-m/impulsem.centrifugo`.
+* [Core (this repository)](https://github.com/Impulse-m/ImpulseM.Centrifugo.Core).
+* [Protocol fork](https://github.com/Impulse-m/ImpulseM.Centrifugo.Protocol): a fork of [centrifugal/protocol](https://github.com/centrifugal/protocol) with the fork fields of `client.proto` used by the SDKs and this library.
+* [JavaScript client fork](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.JS): a fork of [centrifuge-js](https://github.com/centrifugal/centrifuge-js), npm package `@impulsem/centrifuge` (latest 1.6.0).
+* [Java client fork](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java): a fork of [centrifuge-java](https://github.com/centrifugal/centrifuge-java), Maven `com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:1.7.0` from the [Maven repository](https://impulse-m.github.io/ImpulseM.Centrifugo.Client.Java/).
+* [Swift client fork](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Swift): a fork of [centrifuge-swift](https://github.com/centrifugal/centrifuge-swift), Swift Package Manager from its tags, latest 2.0.0 (see its `MIGRATION.md` for the breaking changes).
 
 ### License
 
