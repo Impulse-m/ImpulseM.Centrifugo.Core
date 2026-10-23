@@ -3,7 +3,7 @@
  * Source: https://github.com/centrifugal/centrifuge-js
  * Fork: https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.JS
  * The EventEmitter module with the Node.js events API is from
- * https://github.com/nodejs/node (lib/events.js).
+ * https://github.com/browserify/events (npm package events 3.x).
  *
  * Copyright (c) 2023 Centrifugal Labs LTD
  * Copyright Joyent, Inc. and other Node contributors.
