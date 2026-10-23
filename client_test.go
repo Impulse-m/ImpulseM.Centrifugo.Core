@@ -8242,9 +8242,12 @@ func testRecoveryConnectContinuity(t *testing.T, lagging bool) {
 				sink := make(chan []byte, 4096)
 				transport.sink = sink
 				closeSink := sync.OnceFunc(func() { close(sink) })
+				kept := false // The last connection stays open for the final check.
 				defer func() {
-					_ = transport.Close(DisconnectForceNoReconnect)
-					closeSink()
+					if !kept {
+						_ = transport.Close(DisconnectForceNoReconnect)
+						closeSink()
+					}
 				}()
 				read := make(chan struct{})
 				go func() {
@@ -8290,6 +8293,11 @@ func testRecoveryConnectContinuity(t *testing.T, lagging bool) {
 				}
 				if time.Now().After(deadline) {
 					finals[i] = transport
+					kept = true
+					t.Cleanup(func() {
+						_ = transport.Close(DisconnectForceNoReconnect)
+						closeSink()
+					})
 					return // Stay connected till the end.
 				}
 				time.Sleep(time.Duration(rnd.Intn(3000)) * time.Microsecond)
