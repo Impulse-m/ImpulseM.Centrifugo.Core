@@ -33,6 +33,7 @@ func NewTestRedisPresenceManagerWithPrefix(tb testing.TB, n *Node, prefix string
 	redisConf := testSingleRedisConf(port)
 	s, err := NewRedisShard(n, redisConf)
 	require.NoError(tb, err)
+	tb.Cleanup(s.Close)
 	pm, err := NewRedisPresenceManager(n, RedisPresenceManagerConfig{
 		Prefix: prefix,
 		Shards: []*RedisShard{s},
@@ -49,6 +50,9 @@ func NewTestRedisPresenceManagerWithPrefix(tb testing.TB, n *Node, prefix string
 	if err != nil {
 		tb.Fatal(err)
 	}
+	tb.Cleanup(func() {
+		_ = n.Shutdown(context.Background())
+	})
 	return pm
 }
 
@@ -59,6 +63,7 @@ func NewTestRedisPresenceManagerClusterWithPrefix(tb testing.TB, n *Node, prefix
 	}
 	s, err := NewRedisShard(n, redisConf)
 	require.NoError(tb, err)
+	tb.Cleanup(s.Close)
 	pm, err := NewRedisPresenceManager(n, RedisPresenceManagerConfig{
 		Prefix: prefix,
 		Shards: []*RedisShard{s},
@@ -74,6 +79,9 @@ func NewTestRedisPresenceManagerClusterWithPrefix(tb testing.TB, n *Node, prefix
 	if err != nil {
 		tb.Fatal(err)
 	}
+	tb.Cleanup(func() {
+		_ = n.Shutdown(context.Background())
+	})
 	return pm
 }
 

@@ -31,6 +31,9 @@ func testStateNode(tb testing.TB) *Node {
 		},
 	})
 	require.NoError(tb, err)
+	tb.Cleanup(func() {
+		_ = node.Shutdown(context.Background())
+	})
 	return node
 }
 
@@ -62,6 +65,7 @@ func newTestChannelStateNodeWithConfs(tb testing.TB, prefix string, state RedisC
 	for _, conf := range confs {
 		s, err := NewRedisShard(node, conf)
 		require.NoError(tb, err)
+		tb.Cleanup(s.Close)
 		shards = append(shards, s)
 	}
 	broker, err := NewRedisBroker(node, RedisBrokerConfig{

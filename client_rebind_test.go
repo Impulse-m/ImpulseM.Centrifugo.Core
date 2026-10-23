@@ -220,6 +220,9 @@ func newRebindInfoNode(t *testing.T, presenceManager PresenceManager) (*Node, *r
 	node.SetBroker(broker)
 	node.SetPresenceManager(presenceManager)
 	require.NoError(t, node.Run())
+	t.Cleanup(func() {
+		_ = node.Shutdown(context.Background())
+	})
 	return node, broker
 }
 
@@ -514,6 +517,9 @@ func newMemoryPresenceNode(t *testing.T) *Node {
 	require.NoError(t, err)
 	node.SetPresenceManager(pm)
 	require.NoError(t, node.Run())
+	t.Cleanup(func() {
+		_ = node.Shutdown(context.Background())
+	})
 	return node
 }
 

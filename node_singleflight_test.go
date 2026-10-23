@@ -46,6 +46,9 @@ func newSingleFlightTestNode(t *testing.T) *Node {
 	})
 	require.NoError(t, err)
 	require.NoError(t, node.Run())
+	t.Cleanup(func() {
+		_ = node.Shutdown(context.Background())
+	})
 	return node
 }
 
