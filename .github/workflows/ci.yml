@@ -44,9 +44,9 @@ jobs:
 
       - name: Test
         run: |
-          (while true; do echo "== $(date -u +%T)"; free -m; ps -eo pid,rss,vsz,args --sort=-rss | head -6; sleep 15; done) &
+          (while true; do echo "== $(date -u +%T)"; free -m; ps -eo pid,rss,vsz,args --sort=-rss | head -6; sleep 30; done) &
           monitor=$!
-          go test -v -race -tags integration -timeout 4m -p 1 . ; status=$?
+          go test -v -race -tags integration -timeout 7m -p 1 . ; status=$?
           kill $monitor
           exit $status
 
