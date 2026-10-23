@@ -768,6 +768,9 @@ func newPositionTestNode(t *testing.T) (*Node, *countingBroker) {
 	cb := &countingBroker{Broker: node.broker}
 	node.SetBroker(cb)
 	require.NoError(t, node.Run())
+	t.Cleanup(func() {
+		_ = node.Shutdown(context.Background())
+	})
 	return node, cb
 }
 
@@ -926,6 +929,9 @@ func newSlowPresenceNode(t *testing.T, pm PresenceManager, presenceIvl time.Dura
 		})
 	})
 	require.NoError(t, node.Run())
+	t.Cleanup(func() {
+		_ = node.Shutdown(context.Background())
+	})
 	return node
 }
 

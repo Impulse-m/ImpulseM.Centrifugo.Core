@@ -148,6 +148,7 @@ func TestSetCredentials(t *testing.T) {
 func TestNewClient(t *testing.T) {
 	t.Parallel()
 	node := defaultTestNode()
+	defer func() { _ = node.Shutdown(context.Background()) }()
 	transport := newTestTransport(func() {})
 	client, err := newClient(context.Background(), node, transport)
 	require.NoError(t, err)
@@ -6814,6 +6815,10 @@ func testRecoveryOrdering(t *testing.T, tc recoveryOrderingCase) {
 			framesMu.Unlock()
 		}
 	}()
+	t.Cleanup(func() {
+		_ = transport.Close(DisconnectForceNoReconnect)
+		close(sink)
+	})
 	client := newTestClientCustomTransport(t, context.Background(), node, transport, "42")
 
 	// At the sync point a burst of publications is queued for sure, whatever the
@@ -8236,6 +8241,14 @@ func testRecoveryConnectContinuity(t *testing.T, lagging bool) {
 				transport := newTestTransport(func() {})
 				sink := make(chan []byte, 4096)
 				transport.sink = sink
+				closeSink := sync.OnceFunc(func() { close(sink) })
+				kept := false // The last connection stays open for the final check.
+				defer func() {
+					if !kept {
+						_ = transport.Close(DisconnectForceNoReconnect)
+						closeSink()
+					}
+				}()
 				read := make(chan struct{})
 				go func() {
 					defer close(read)
@@ -8280,6 +8293,11 @@ func testRecoveryConnectContinuity(t *testing.T, lagging bool) {
 				}
 				if time.Now().After(deadline) {
 					finals[i] = transport
+					kept = true
+					t.Cleanup(func() {
+						_ = transport.Close(DisconnectForceNoReconnect)
+						closeSink()
+					})
 					return // Stay connected till the end.
 				}
 				time.Sleep(time.Duration(rnd.Intn(3000)) * time.Microsecond)
@@ -8300,7 +8318,7 @@ func testRecoveryConnectContinuity(t *testing.T, lagging bool) {
 				// Once closed, the connection writes nothing more: what the client
 				// got before is all it has to recover from.
 				_ = client.close(DisconnectForceNoReconnect)
-				close(sink)
+				closeSink()
 				<-read
 				// The server must not have closed it first (insufficient state).
 				if code := transport.disconnect.Code; code != DisconnectForceNoReconnect.Code {
@@ -8461,6 +8479,10 @@ func testRecoveryContinuity(t *testing.T, mapMode bool, lagging bool) {
 				reader.add(frame)
 			}
 		}()
+		t.Cleanup(func() {
+			_ = transport.Close(DisconnectForceNoReconnect)
+			close(sink)
+		})
 		client := newTestConnectedClientWithTransport(t, context.Background(), node, transport, "user"+strconv.Itoa(i))
 		run := &clientRun{reader: reader, client: client}
 		runs[i] = run

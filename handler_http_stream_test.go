@@ -421,6 +421,7 @@ func TestStreamingHandlers_WrappedResponseWriterValidation(t *testing.T) {
 	t.Parallel()
 	n, err := New(Config{})
 	require.NoError(t, err)
+	defer func() { _ = n.Shutdown(context.Background()) }()
 	for _, transport := range []struct {
 		name    string
 		method  string

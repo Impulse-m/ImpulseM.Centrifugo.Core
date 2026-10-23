@@ -1181,6 +1181,7 @@ func TestSharedPollNode_MissingOnSharedPoll(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
+	defer func() { _ = node.Shutdown(context.Background()) }()
 	// Don't register OnSharedPoll.
 	err = node.Run()
 	require.Error(t, err)
