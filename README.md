@@ -1,3 +1,42 @@
+# Centrifuge (ImpulseM fork)
+
+This is a fork of [centrifugal/centrifuge](https://github.com/centrifugal/centrifuge) (MIT), the upstream Go library described below. The Go module path is unchanged, so imports stay `github.com/centrifugal/centrifuge`.
+
+**Version.** The fork has no releases of its own. Upstream master is merged in regularly. The fork's own changes are listed in [changelog.md](changelog.md) under "Unreleased fork changes", and the fork notes are in [FORK.md](FORK.md). The server built on this library pins a commit of this repository in its `go.mod`.
+
+**Install.** Run `go get github.com/centrifugal/centrifuge`, then add the replace lines below to your `go.mod` and run `go mod tidy`. The pseudo-version is the commit to use (this is the current master commit, e3fec94):
+
+```
+replace github.com/centrifugal/centrifuge => github.com/Impulse-m/ImpulseM.Centrifugo.Core v0.0.0-20261023112712-e3fec94ccdb4
+
+replace github.com/centrifugal/protocol => github.com/Impulse-m/ImpulseM.Centrifugo.Protocol v0.23.2-0.20261013130323-70f37c2667eb
+```
+
+**What the fork adds.**
+
+* [Shared position sync](FORK.md#shared-position-sync) in the channel medium (`ChannelMediumOptions.SharedPositionSync`)
+* [Client channel position check](FORK.md#client-channel-position-check) delay (`Config.ClientChannelPositionCheckDelay`)
+* [Hash field TTL](FORK.md#hash-field-ttl-in-redis-presence) for Redis presence (`RedisPresenceManagerConfig.UseHashFieldTTL`)
+* [Client tags filter limits](FORK.md#client-tags-filter-limits) (`Config.ClientTagsFilterMaxNodes`, `Config.ClientTagsFilterMaxValues`)
+* [Channel state events](FORK.md#channel-state) `occupied` and `vacated` for Redis presence (`RedisPresenceManagerConfig.ChannelState`)
+* [Single flight](FORK.md#single-flight) for history and presence reads (`Config.UseSingleFlight`)
+* `Client.OnDisconnectIfConnected`, `Client.BeginDisconnect` and `Client.Closing`, and history refused with permission denied while a subscription changes, both in [changelog.md](changelog.md)
+
+### Sibling repositories
+
+* [ImpulseM.Centrifugo](https://github.com/Impulse-m/ImpulseM.Centrifugo): the server built on this library, a fork of the [upstream server](https://github.com/centrifugal/centrifugo). Release images are `ghcr.io/impulse-m/impulsem.centrifugo`.
+* [ImpulseM.Centrifugo.Core](https://github.com/Impulse-m/ImpulseM.Centrifugo.Core): this repository.
+* [ImpulseM.Centrifugo.Protocol](https://github.com/Impulse-m/ImpulseM.Centrifugo.Protocol): a fork of [centrifugal/protocol](https://github.com/centrifugal/protocol) with the fork fields of `client.proto` used by the SDKs and this library.
+* [ImpulseM.Centrifugo.Client.JS](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.JS): a fork of [centrifuge-js](https://github.com/centrifugal/centrifuge-js), npm package `@impulsem/centrifuge` (latest 1.6.0).
+* [ImpulseM.Centrifugo.Client.Java](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java): a fork of [centrifuge-java](https://github.com/centrifugal/centrifuge-java), Maven `com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:1.7.0` from the [Maven repository](https://impulse-m.github.io/ImpulseM.Centrifugo.Client.Java/).
+* [ImpulseM.Centrifugo.Client.Swift](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Swift): a fork of [centrifuge-swift](https://github.com/centrifugal/centrifuge-swift), Swift Package Manager from its tags, latest 2.0.0 (see its `MIGRATION.md` for the breaking changes).
+
+### License
+
+MIT, see [LICENSE](LICENSE). Third-party code in this repository is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+---
+
 [![Join the chat at https://t.me/joinchat/ABFVWBE0AhkyyhREoaboXQ](https://img.shields.io/badge/Telegram-Group-blue.svg)](https://t.me/joinchat/ABFVWBE0AhkyyhREoaboXQ)
 [![codecov.io](https://codecov.io/gh/centrifugal/centrifuge/branch/master/graphs/badge.svg)](https://codecov.io/github/centrifugal/centrifuge?branch=master)
 [![GoDoc](https://pkg.go.dev/badge/centrifugal/centrifuge)](https://pkg.go.dev/github.com/centrifugal/centrifuge)
@@ -36,7 +75,7 @@ Centrifuge library provides a lot of top of raw WebSocket transport. Important l
 * Message recovery mechanism for channels to survive PUB/SUB delivery problems, short network disconnects or node restart
 * Cache channels – a way to quickly deliver latest publication from channel history to the client upon subscription
 * Delta compression using [Fossil](https://fossil-scm.org/home/doc/tip/www/delta_format.wiki) algorithm for publications inside a channel to reduce bandwidth usage
-* Support for client-supplied publication filters to drop unnecessary channel publications on the server side (see [the example](https://github.com/centrifugal/centrifuge/tree/master/_examples/tags_filter)) 
+* Support for client-supplied publication filters to drop unnecessary channel publications on the server side (see [the example](https://github.com/centrifugal/centrifuge/tree/master/_examples/tags_filter)). The fork limits the size of a client filter, see [FORK.md](FORK.md#client-tags-filter-limits)
 * Per-client and per-channel batching controls for reduced system calls and better CPU utilization
 * Out-of-the-box observability using Prometheus instrumentation
 * Client SDKs for main application environments all following [single behaviour spec](https://centrifugal.dev/docs/transports/client_api) (see list of SDKs below).
@@ -70,6 +109,8 @@ If you opt for a **unidirectional** communication then you may leverage Centrifu
 ```bash
 go get github.com/centrifugal/centrifuge
 ```
+
+This installs upstream. To use this fork, follow the install steps at the top of this file.
 
 ### Tutorial
 

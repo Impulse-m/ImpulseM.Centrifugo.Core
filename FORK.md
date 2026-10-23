@@ -5,8 +5,9 @@ their upstream text.
 
 ## Shared position sync
 
-Without enableQueue, a large channel pays one full fan-out per publication and per insufficient state marker, under the
-broadcast lock of the channel. Enable the queue for large channels.
+A large channel pays one full fan-out per publication and per insufficient state marker, under the broadcast lock of the
+channel. The channel medium queue, which would move that work off the lock, is set only inside the package
+(`ChannelMediumOptions.enableQueue`), so a consumer cannot enable it yet.
 
 ## Client channel position check
 
