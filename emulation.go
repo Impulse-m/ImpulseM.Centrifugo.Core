@@ -69,14 +69,18 @@ func (s *EmulationHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	var req protocol.EmulationRequest
+	protocolName := "json"
 	if r.Header.Get("Content-Type") == "application/octet-stream" {
+		protocolName = "protobuf"
 		err = req.UnmarshalCF(data)
 	} else {
 		err = cfjson.Unmarshal(data, &req, 0)
 	}
+	// The body and the decoded request may carry a connection token or application data, and the endpoint needs no
+	// session, so only metadata is logged. A request the client got wrong is logged at debug level: anyone can send one.
 	if err != nil {
-		if s.node.logEnabled(LogLevelInfo) {
-			s.node.logger.log(newLogEntry(LogLevelInfo, "can't unmarshal emulation request", map[string]any{"error": err.Error(), "data": string(data)}))
+		if s.node.logEnabled(LogLevelDebug) {
+			s.node.logger.log(newLogEntry(LogLevelDebug, "can't unmarshal emulation request", emulationLogFields(err, "", len(data), protocolName)))
 		}
 		rw.WriteHeader(http.StatusBadRequest)
 		return
@@ -84,10 +88,13 @@ func (s *EmulationHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	err = s.emuLayer.Emulate(&req)
 	if err != nil {
-		s.node.logger.log(newErrorLogEntry(err, "error processing emulation request", map[string]any{"req": &req, "error": err.Error()}))
 		if errors.Is(err, errNodeNotFound) {
+			if s.node.logEnabled(LogLevelDebug) {
+				s.node.logger.log(newLogEntry(LogLevelDebug, "emulation request for unknown node", emulationLogFields(err, req.Node, len(data), protocolName)))
+			}
 			rw.WriteHeader(http.StatusNotFound)
 		} else {
+			s.node.logger.log(newErrorLogEntry(err, "error processing emulation request", emulationLogFields(err, req.Node, len(data), protocolName)))
 			rw.WriteHeader(http.StatusInternalServerError)
 		}
 		return
@@ -141,7 +148,7 @@ func (h *emulationSurveyHandler) HandleEmulation(e SurveyEvent, cb SurveyCallbac
 	var req protocol.EmulationRequest
 	err := req.UnmarshalCF(e.Data)
 	if err != nil {
-		h.node.logger.log(newErrorLogEntry(err, "error unmarshal emulation request", map[string]any{"data": string(e.Data), "error": err.Error()}))
+		h.node.logger.log(newErrorLogEntry(err, "error unmarshal emulation request", emulationLogFields(err, "", len(e.Data), "protobuf")))
 		cb(SurveyReply{Code: emulationErrorCodeBadRequest})
 		return
 	}
@@ -155,7 +162,10 @@ func (h *emulationSurveyHandler) HandleEmulation(e SurveyEvent, cb SurveyCallbac
 		var d string
 		d, err = cfjson.UnmarshalString(req.Data)
 		if err != nil {
-			h.node.logger.log(newErrorLogEntry(err, "error unmarshal emulation request data", map[string]any{"data": string(req.Data), "error": err.Error()}))
+			// The data came from the client that sent the emulation request, so this is a client error.
+			if h.node.logEnabled(LogLevelDebug) {
+				h.node.logger.log(newLogEntry(LogLevelDebug, "error unmarshal emulation request data", emulationLogFields(err, req.Node, len(req.Data), "json")))
+			}
 			cb(SurveyReply{Code: emulationErrorCodeBadRequest})
 			return
 		}
