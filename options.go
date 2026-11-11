@@ -198,10 +198,19 @@ type SubscribeOptions struct {
 	// HistoryMetaTTL allows to override default (set in Config.HistoryMetaTTL) history
 	// meta information expiration time.
 	HistoryMetaTTL time.Duration
+	// RecoveryMaxPublicationLimit allows to override Config.RecoveryMaxPublicationLimit
+	// for this subscription: the maximum number of publications recovered on subscribe.
+	// A subscription which missed more is not recovered. Useful for channels whose
+	// history holds many small publications, a streamed response say, without raising
+	// the limit for every channel. Zero value means using Config.RecoveryMaxPublicationLimit.
+	RecoveryMaxPublicationLimit int
 
 	// AllowedDeltaTypes is a whitelist of DeltaType subscribers can negotiate. At this point Centrifuge
 	// only supports DeltaTypeFossil. If zero value – clients won't be able to negotiate delta encoding
 	// within a channel and will receive full data in publications.
+	// With positioning or recovery, all publications to the channel must be published with
+	// history: a subscriber fails to apply the delta of a publication following one published
+	// without history. Delta is not used for subscriptions with a tags filter.
 	// Delta encoding is an EXPERIMENTAL feature and may be changed.
 	AllowedDeltaTypes []DeltaType
 	// Source is a way to mark the source of Subscription - i.e. where it comes from. May be useful
@@ -381,6 +390,14 @@ func WithSubscribeSource(source uint8) SubscribeOption {
 func WithSubscribeHistoryMetaTTL(metaTTL time.Duration) SubscribeOption {
 	return func(opts *SubscribeOptions) {
 		opts.HistoryMetaTTL = metaTTL
+	}
+}
+
+// WithSubscribeRecoveryMaxPublicationLimit allows setting
+// SubscribeOptions.RecoveryMaxPublicationLimit.
+func WithSubscribeRecoveryMaxPublicationLimit(limit int) SubscribeOption {
+	return func(opts *SubscribeOptions) {
+		opts.RecoveryMaxPublicationLimit = limit
 	}
 }
 

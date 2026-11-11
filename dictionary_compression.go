@@ -60,6 +60,18 @@ type DictionaryConnectionParams struct {
 	// both sides hold the same bytes and the dictionary can be named rather than
 	// sent. An unrecognised id is simply ignored.
 	HeldDictionaryID string
+
+	// ClientName and ClientVersion are what the client reported in its connect
+	// command - an SDK sends its own name unless the application sets one. They
+	// let an implementation choose by client: try the feature on one platform
+	// first, or leave out a release that turns out to decode badly, without a
+	// change where connections are authenticated. Like a declared profile they
+	// are unverified, so they are fine for deciding who is offered a dictionary
+	// and must not gate anything a client should not be able to opt into.
+	//
+	// They are passed here because Client does not keep them.
+	ClientName    string
+	ClientVersion string
 }
 
 // DictionaryConnection compresses one connection's outgoing frames against a
@@ -67,8 +79,9 @@ type DictionaryConnectionParams struct {
 // general: a connection may also be using permessage-deflate, delta compression
 // or channel compaction, and none of those go through here.
 type DictionaryConnection interface {
-	// Dictionary returns what to put in ConnectResult.dict, or nil to send
-	// nothing.
+	// Dictionary returns what to put in ConnectResult.dict. Nil, like an id the
+	// client did not advertise without bytes, leaves the connection
+	// uncompressed: Close is called and nothing is encoded.
 	//
 	// It is called once, before the connect reply is written.
 	//
@@ -110,12 +123,13 @@ type DictionaryConnection interface {
 	// an engine holds, so it can only reject an id the client never mentioned.
 	Dictionary() *protocol.Dictionary
 
-	// Encode is called for every frame this connection compresses, on the
-	// connection's write goroutine - including the connect reply when the
-	// client already held the dictionary.
+	// Encode is called for every frame this connection writes after the
+	// connect reply, on the connection's write goroutine.
 	//
 	// It returns the bytes to write and whether they must go out as a binary
-	// message, which compressed payloads need even on a JSON connection.
+	// message, which compressed payloads need even on a JSON connection. frame
+	// is only valid during the call: an implementation which keeps it, as a
+	// cache key say, must copy it.
 	//
 	// One publication reaches every subscriber of a channel as the same bytes,
 	// so implementations are called with an identical frame once per

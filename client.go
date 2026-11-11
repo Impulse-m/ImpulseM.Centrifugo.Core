@@ -326,6 +326,7 @@ type Client struct {
 	clientSideRefresh      bool
 	status                 status
 	timerOp                timerOp
+	connectDone            atomic.Bool // See waitConnectReply. Fills padding after timerOp.
 	nextPresence           int64
 	nextExpire             int64
 	nextPing               int64
@@ -1681,6 +1682,7 @@ func (c *Client) Send(data []byte) error {
 	if hasFlag(c.transport.DisabledPushFlags(), PushFlagMessage) {
 		return nil
 	}
+	c.waitConnectReply()
 	replyData, err := c.getSendPushReply(data)
 	if err != nil {
 		return err
@@ -1821,6 +1823,8 @@ func (c *Client) close(disconnect Disconnect) error {
 	authenticated := c.authenticated
 	c.status = statusClosed
 	c.closeDisconnect = &disconnect
+	// Wakes waitConnectReply.
+	c.signalLocked()
 
 	c.stopTimer()
 
@@ -2338,6 +2342,38 @@ func (c *Client) handleConnect(req *protocol.ConnectRequest, cmd *protocol.Comma
 	return nil
 }
 
+// waitConnectReply waits until the connect reply is written, or connectCmd
+// failed. The client is in the hub from before its connect reply is written, so
+// Send, Refresh and Subscribe of another goroutine (Node.Refresh,
+// Node.Subscribe) can come before it, but nothing may go to the client before
+// its connect reply. It also returns once the client is closed.
+func (c *Client) waitConnectReply() {
+	if c.connectDone.Load() {
+		return
+	}
+	c.mu.RLock()
+	done := !c.authenticated || c.connectDone.Load() || c.status == statusClosed
+	c.mu.RUnlock()
+	if done {
+		return
+	}
+	c.waitUntil(func() bool {
+		return c.connectDone.Load() || c.status == statusClosed
+	}, math.MaxInt64)
+}
+
+// finishConnectLocked releases waitConnectReply. Must be called with c.mu held.
+func (c *Client) finishConnectLocked() {
+	c.connectDone.Store(true)
+	c.signalLocked()
+}
+
+func (c *Client) finishConnect() {
+	c.mu.Lock()
+	c.finishConnectLocked()
+	c.mu.Unlock()
+}
+
 func (c *Client) triggerConnect() {
 	pending := c.connect()
 	// After ConnectHandler, outside connectMu: see Unsubscribe.
@@ -2405,6 +2441,8 @@ func (c *Client) Refresh(opts ...RefreshOption) error {
 		go func() { _ = c.close(DisconnectExpired) }()
 		return nil
 	}
+	// After connectCmd, which also sets the expiration.
+	c.waitConnectReply()
 
 	nowUnix := time.Now().Unix()
 	expireAt := min(refreshOptions.ExpireAt, nowUnix+maxTTLSeconds)
@@ -3650,12 +3688,7 @@ func (c *Client) handleHistory(req *protocol.HistoryRequest, cmd *protocol.Comma
 			Epoch:  req.Since.Epoch,
 		}
 	}
-	historyFilter.Limit = int(req.Limit)
-
-	maxPublicationLimit := c.node.config.HistoryMaxPublicationLimit
-	if maxPublicationLimit > 0 && (historyFilter.Limit < 0 || historyFilter.Limit > maxPublicationLimit) {
-		historyFilter.Limit = maxPublicationLimit
-	}
+	historyFilter.Limit = capHistoryLimit(int(req.Limit), c.node.config.HistoryMaxPublicationLimit)
 
 	historyFilter.Reverse = req.Reverse
 
@@ -3678,8 +3711,12 @@ func (c *Client) handleHistory(req *protocol.HistoryRequest, cmd *protocol.Comma
 		var offset uint64
 		var epoch string
 		if reply.Result == nil {
+			filter := event.Filter
+			if reply.MaxPublicationLimit > 0 {
+				filter.Limit = capHistoryLimit(int(req.Limit), reply.MaxPublicationLimit)
+			}
 			result, err := c.node.History(event.Channel,
-				WithHistoryFilter(event.Filter),
+				WithHistoryFilter(filter),
 			)
 			if err != nil {
 				c.logWriteInternalErrorFlush(channel, protocol.FrameTypeHistory, cmd, err, "error getting history", started, rw)
@@ -3716,6 +3753,16 @@ func (c *Client) handleHistory(req *protocol.HistoryRequest, cmd *protocol.Comma
 
 	c.eventHub.historyHandler(event, cb)
 	return nil
+}
+
+// capHistoryLimit returns the limit a client asked history for, capped by
+// maxPublications when that is set: a client asking for all publications (a
+// negative limit) gets maxPublications of them.
+func capHistoryLimit(limit, maxPublications int) int {
+	if maxPublications > 0 && (limit < 0 || limit > maxPublications) {
+		return maxPublications
+	}
+	return limit
 }
 
 func (c *Client) releaseHistoryCommandReply(reply *protocol.Reply) {
@@ -3872,6 +3919,10 @@ func testSyncPoint(channel string) {
 // connectCmd handles connect command from client - client must send connect
 // command immediately after establishing connection with server.
 func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command, started time.Time, rw *replyWriter) error {
+	// Releases waitConnectReply if the connect fails. Once it succeeds, that is
+	// done after writing the reply: the deferred CommandProcessedHandler may
+	// call Send.
+	defer c.finishConnect()
 	// Client name/version metric labels use fixed sentinels to keep metric
 	// cardinality bounded: a reported value is only used verbatim when it's
 	// explicitly registered, otherwise it collapses to "unregistered". A client
@@ -4070,17 +4121,19 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 				// identifies content, so if the engine recognises it the dictionary
 				// can be named rather than sent again.
 				HeldDictionaryID: req.GetDict(),
+				ClientName:       req.Name,
+				ClientVersion:    req.Version,
 			})
 			if cc != nil {
 				dict = cc.Dictionary()
-				if dict != nil && len(dict.Data) == 0 && dict.DataB64 == "" && dict.Id != req.GetDict() {
-					// An engine named a dictionary by id that this client never
-					// advertised, so the client does not have those bytes and no
-					// frame compressed against them could be decoded. The
-					// contract says only to name what the client presented; this
-					// is the backstop for an engine that gets it wrong, because
-					// the alternative is a connection that receives nothing it
-					// can read and cannot say why.
+				if dict == nil || (len(dict.Data) == 0 && dict.DataB64 == "" && dict.Id != req.GetDict()) {
+					// No dictionary, or an engine named a dictionary by id that
+					// this client never advertised: either way the client does
+					// not know the bytes, and no frame compressed against them
+					// could be decoded. The contract says only to name what the
+					// client presented; this is the backstop for an engine that
+					// gets it wrong, because the alternative is a connection that
+					// receives nothing it can read and cannot say why.
 					cc.Close()
 					dict = nil
 				} else {
@@ -4289,6 +4342,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	}
 
 	c.mu.Lock()
+	c.finishConnectLocked()
 	closedDuringConnect := c.status == statusClosed
 	var reservedSubChs []chan struct{}
 	var lostReservations map[string]bool
@@ -4533,6 +4587,7 @@ func (c *Client) Subscribe(channel string, opts ...SubscribeOption) error {
 	if channel == "" {
 		return fmt.Errorf("channel is empty")
 	}
+	c.waitConnectReply()
 	channelLimit := c.node.config.ClientChannelLimit
 
 	// Reserve the channel before doing any subscribe work. This mirrors the
@@ -4616,7 +4671,7 @@ func (c *Client) Subscribe(channel string, opts ...SubscribeOption) error {
 	// The subscribe push and the recovered publications go before the commit, as
 	// the reply of a client-side subscribe does: an unsubscribe waits for the
 	// subscribe until the commit, so its push can't come before them. A write
-	// error means the client is closing, the commit rolls back then.
+	// error means the client is closing, but the close may run after the commit.
 	subscribePushDisabled := hasFlag(c.transport.DisabledPushFlags(), PushFlagSubscribe)
 	writeErr := c.writeSubscribePush(channel, subCtx.result, subscribePushDisabled)
 	// Commit the reservation into c.channels, or roll back the hub entry if the
@@ -4632,6 +4687,11 @@ func (c *Client) Subscribe(channel string, opts ...SubscribeOption) error {
 		if subscribingCh != nil {
 			close(subscribingCh)
 		}
+		// The committed subscription publishes its leave when it ends, so it
+		// publishes its join too.
+		if subCtx.clientInfo != nil {
+			c.publishJoinAndPresence(channel, subCtx.channelContext, subCtx.clientInfo)
+		}
 		return writeErr
 	}
 	// Publications which came since the sync point follow the recovered ones.
@@ -4642,9 +4702,6 @@ func (c *Client) Subscribe(channel string, opts ...SubscribeOption) error {
 	// not come before the publications queued since the sync point.
 	if subscribingCh != nil {
 		close(subscribingCh)
-	}
-	if subscribePushDisabled {
-		return nil
 	}
 	if subCtx.clientInfo != nil {
 		if isInTest.Load() && channel == testChannelSubscribeJoinRecovery { // Only for tests.
@@ -5334,7 +5391,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 				var latestPub *Publication
 				var recoveredPub *Publication
 				var currentSP StreamPosition
-				latestPub, recoveredPub, currentSP, err = c.node.recoverCache(channel, reply.Options.HistoryMetaTTL, sub.tagsFilter, sub.serverTagsFilter)
+				latestPub, recoveredPub, currentSP, err = c.node.recoverCache(channel, reply.Options.HistoryMetaTTL, reply.Options.RecoveryMaxPublicationLimit, sub.tagsFilter, sub.serverTagsFilter)
 				if err != nil {
 					c.node.logger.log(newErrorLogEntry(err, "error on cache recover", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 					return handleErr(err)
@@ -5352,7 +5409,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 					}
 					if cacheReply.Populated && !recovered {
 						// One more chance to recover in case we know cache was populated.
-						latestPub, recoveredPub, currentSP, err = c.node.recoverCache(channel, reply.Options.HistoryMetaTTL, sub.tagsFilter, sub.serverTagsFilter)
+						latestPub, recoveredPub, currentSP, err = c.node.recoverCache(channel, reply.Options.HistoryMetaTTL, reply.Options.RecoveryMaxPublicationLimit, sub.tagsFilter, sub.serverTagsFilter)
 						if err != nil {
 							c.node.logger.log(newErrorLogEntry(err, "error on populated cache recover", map[string]any{"channel": channel, "user": c.UserID(), "client": c.uid, "error": err.Error()}))
 							return handleErr(err)
@@ -5378,7 +5435,7 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 					}
 				}
 			} else {
-				historyResult, err := c.node.recoverHistory(channel, StreamPosition{Offset: cmdOffset, Epoch: cmdEpoch}, reply.Options.HistoryMetaTTL)
+				historyResult, err := c.node.recoverHistory(channel, StreamPosition{Offset: cmdOffset, Epoch: cmdEpoch}, reply.Options.HistoryMetaTTL, reply.Options.RecoveryMaxPublicationLimit)
 				if err != nil {
 					if errors.Is(err, ErrorUnrecoverablePosition) {
 						if req.Flag&subscriptionFlagRejectUnrecovered != 0 {
@@ -5795,8 +5852,9 @@ func (c *Client) writePublicationUpdatePosition(
 	return c.writeEncodedPushData(data, ch, pub.Key, protocol.FrameTypePushPublication, batchConfig)
 }
 
-// publicationDataUpdatePositionLocked checks a publication with offset against
-// the subscription to ch and advances its position. It returns the data to write
+// publicationDataUpdatePositionLocked checks a publication against the
+// subscription to ch and advances its position (a publication without offset,
+// queued while the client subscribed, has none to advance). It returns the data to write
 // to the client, ok is false if nothing must be written. c.mu must be held.
 //
 // nowUnix is the time the position counts as checked at, read once per broadcast
@@ -5810,8 +5868,9 @@ func (c *Client) publicationDataUpdatePositionLocked(
 		return nil, false
 	}
 	deltaAllowed := channelHasFlag(channelContext.flags, flagDeltaAllowed)
-	if !channelHasFlag(channelContext.flags, flagPositioning) {
-		// Publication with Offset, but client does not use positioning.
+	if pub.Offset == 0 || !channelHasFlag(channelContext.flags, flagPositioning) {
+		// Publication without offset (queued while the client subscribed), or
+		// with offset, but client does not use positioning.
 		if hasFlag(c.transport.DisabledPushFlags(), PushFlagPublication) {
 			return nil, false
 		}
@@ -5928,7 +5987,7 @@ func (c *Client) writePublication(ch string, pub *protocol.Publication, prep pre
 	if c.pubSubSync.Buffering() {
 		// The client may be subscribing to ch: the publication goes to its recovery
 		// buffer, or is queued until the subscription's result is written (or, without
-		// offset, dropped till then).
+		// offset, dropped before the sync point).
 		syncPub := pub
 		if prep.wasFiltered {
 			syncPub = prep.filteredPub

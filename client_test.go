@@ -1427,6 +1427,48 @@ func TestClientSubscribeReceivePublication(t *testing.T) {
 	}
 }
 
+// A publication without offset which comes after the subscribe reply was written
+// reaches the client: it is published here while the reply is written, before
+// the subscription's buffer is stopped.
+func TestClientSubscribeReceivePublicationWithoutOffsetAfterReply(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"plain", "positioning"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			node := defaultTestNode()
+			defer func() { _ = node.Shutdown(context.Background()) }()
+			transport := newTestTransport(func() {})
+			transport.sink = make(chan []byte, 100)
+			newCtx := SetCredentials(context.Background(), &Credentials{UserID: "42"})
+			client, _ := newClient(newCtx, node, transport)
+			connectClientV2(t, client)
+
+			rw := &replyWriter{write: func(rep *protocol.Reply) {
+				_, err := node.Publish("test", []byte(`{"text": "after reply"}`))
+				require.NoError(t, err)
+			}}
+			client.channels["test"] = ChannelContext{}
+			subCtx := client.subscribeCmd(&protocol.SubscribeRequest{
+				Channel: "test",
+			}, SubscribeReply{Options: SubscribeOptions{EnablePositioning: name == "positioning"}}, &protocol.Command{}, false, time.Now(), rw)
+			require.Nil(t, subCtx.disconnect)
+			require.Nil(t, subCtx.err)
+
+			timeout := time.After(time.Second)
+			for {
+				select {
+				case data := <-transport.sink:
+					if strings.Contains(string(data), "after reply") {
+						return
+					}
+				case <-timeout:
+					require.Fail(t, "publication published after the subscribe reply was lost")
+				}
+			}
+		})
+	}
+}
+
 func TestClientSubscribeReceivePublicationWithOffset(t *testing.T) {
 	t.Parallel()
 	node := defaultTestNode()
@@ -3330,6 +3372,49 @@ func TestClientHistoryTakeover(t *testing.T) {
 	require.Equal(t, 3, len(result.Publications))
 	require.Equal(t, uint64(10), result.Offset)
 	require.NotZero(t, result.Epoch)
+}
+
+// HistoryReply.MaxPublicationLimit caps the limit the client asked for
+// instead of Config.HistoryMaxPublicationLimit, raising or lowering it.
+func TestClientHistoryReplyMaxPublicationLimit(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name         string
+		configLimit  int
+		replyLimit   int
+		requested    int32
+		numPublished int
+	}{
+		{"config limit", 2, 0, 8, 2},
+		{"reply limit raises it", 2, 6, 8, 6},
+		{"reply limit above the request", 2, 20, 8, 8},
+		{"reply limit for all publications", 2, 6, -1, 6},
+		{"reply limit lowers it", 0, 3, 8, 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			node := defaultTestNode()
+			node.config.HistoryMaxPublicationLimit = tt.configLimit
+			defer func() { _ = node.Shutdown(context.Background()) }()
+
+			client := newTestClient(t, node, "42")
+			client.OnHistory(func(e HistoryEvent, cb HistoryCallback) {
+				cb(HistoryReply{MaxPublicationLimit: tt.replyLimit}, nil)
+			})
+			for range 10 {
+				_, err := node.Publish("test", []byte(`{}`), WithHistory(10, time.Minute))
+				require.NoError(t, err)
+			}
+			connectClientV2(t, client)
+			subscribeClientV2(t, client, "test")
+
+			rw := testReplyWriterWrapper()
+			require.NoError(t, client.handleHistory(&protocol.HistoryRequest{Channel: "test", Limit: tt.requested}, &protocol.Command{}, time.Now(), rw.rw))
+			require.Len(t, rw.replies, 1)
+			require.Nil(t, rw.replies[0].Error)
+			require.Len(t, rw.replies[0].History.Publications, tt.numPublished)
+		})
+	}
 }
 
 func TestClientHistoryUnrecoverablePositionEpoch(t *testing.T) {
@@ -9019,9 +9104,10 @@ func TestClientRecoveryEmptyEpochRead(t *testing.T) {
 }
 
 // A publication without offset (published without history) into a channel which a
-// client subscribes to with recovery can't be synced with the recovery: it is dropped
-// until the subscribe result is written, so nothing of the channel comes before it.
-// After that such publications are delivered as usual.
+// client subscribes to with recovery can't be merged into the recovery: it is
+// dropped before the sync point. After the sync point it is queued with the other
+// publications and written after the subscribe result, so nothing of the channel
+// comes before the result, and nothing which comes after the result is lost.
 func TestClientRecoveryPublicationsWithoutOffsetDuringSubscribe(t *testing.T) {
 	setIsInTest(t)
 
@@ -9114,7 +9200,7 @@ func TestClientRecoveryPublicationsWithoutOffsetDuringSubscribe(t *testing.T) {
 				}
 				return slices.Contains(got, `{"n":"after_subscribe"}`)
 			}, 2*time.Second, 10*time.Millisecond)
-			require.Equal(t, []string{"result", `{"n":"after_subscribe"}`}, got)
+			require.Equal(t, []string{"result", `{"n":"at_sync_point"}`, `{"n":"after_subscribe"}`}, got)
 			require.True(t, client.IsSubscribed(ch))
 		})
 	}
@@ -9133,20 +9219,21 @@ func (b *subscribeHookMapBroker) Subscribe(channels ...string) error {
 	return b.MemoryMapBroker.Subscribe(channels...)
 }
 
-// Publications into an ephemeral (streamless) map channel have no offset, so they
-// can't be synced with a subscribe in progress. They must not reach the client before
-// its subscribe result (clients drop them then): they are dropped until the result is
-// written, and the following ones are delivered as usual.
-func TestClientMapEphemeralDropsPublicationsDuringSubscribe(t *testing.T) {
+// Publications into an ephemeral (streamless) map channel have no offset, so there
+// is nothing to sync them with. They must not reach the client before its subscribe
+// result (clients drop them then), and must not be lost: the client has no stream
+// to recover an update it missed. They are queued from before the subscription is in
+// the hub and written after the result, in order.
+func TestClientMapEphemeralQueuesPublicationsDuringSubscribe(t *testing.T) {
 	setIsInTest(t)
 	for _, route := range []string{"live", "state_then_live"} {
 		t.Run(route, func(t *testing.T) {
-			testMapEphemeralDropsPublicationsDuringSubscribe(t, route)
+			testMapEphemeralQueuesPublicationsDuringSubscribe(t, route)
 		})
 	}
 }
 
-func testMapEphemeralDropsPublicationsDuringSubscribe(t *testing.T, route string) {
+func testMapEphemeralQueuesPublicationsDuringSubscribe(t *testing.T, route string) {
 	ch := testChannelRecoveryOrderingPrefix + "_ephemeral_" + route
 	node, err := New(Config{
 		LogLevel:   LogLevelTrace,
@@ -9226,7 +9313,7 @@ func testMapEphemeralDropsPublicationsDuringSubscribe(t *testing.T, route string
 		}
 		return slices.Contains(got, `{"n":"after"}`)
 	}, 2*time.Second, 10*time.Millisecond)
-	require.Equal(t, []string{"result", `{"n":"after"}`}, got)
+	require.Equal(t, []string{"result", `{"n":"collected"}`, `{"n":"during"}`, `{"n":"after"}`}, got)
 }
 
 // holdJoinBroker holds PublishJoin until released and records the order of
@@ -9407,6 +9494,75 @@ func TestJoinLeaveOrder_UnsubscribeBeforeJoinPublished(t *testing.T) {
 			clients, err := node.MapStateRead(context.Background(), "clients:"+ch, MapReadStateOptions{Limit: -1})
 			require.NoError(t, err)
 			require.Empty(t, clients.Publications, "map client presence left behind")
+		})
+	}
+}
+
+// noSubscribePushTransport is a test transport with the subscribe push disabled.
+type noSubscribePushTransport struct {
+	*testTransport
+}
+
+func (t *noSubscribePushTransport) DisabledPushFlags() uint64 {
+	return t.testTransport.DisabledPushFlags() | PushFlagSubscribe
+}
+
+// A server-side subscription which is committed publishes its join, as it
+// publishes its leave when it ends: also when its subscribe push overflows the
+// client queue (the client is closed after the commit) and when the transport
+// disables the subscribe push.
+func TestJoinLeaveOrder_ServerSideSubscribeWithoutPush(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"queue_overflow", "push_disabled"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			node, err := New(Config{
+				LogLevel:           LogLevelError,
+				LogHandler:         func(entry LogEntry) {},
+				ClientQueueMaxSize: 1000,
+			})
+			require.NoError(t, err)
+			memBroker, err := NewMemoryBroker(node, MemoryBrokerConfig{})
+			require.NoError(t, err)
+			broker := &holdJoinBroker{
+				MemoryBroker: memBroker,
+				joinEntered:  make(chan struct{}, 1),
+				releaseJoin:  make(chan struct{}),
+			}
+			close(broker.releaseJoin)
+			node.SetBroker(broker)
+			require.NoError(t, node.Run())
+			t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
+
+			ctx, cancelFn := context.WithCancel(context.Background())
+			transport := newTestTransport(cancelFn)
+			transport.setProtocolVersion(ProtocolVersion2)
+			var tr Transport = transport
+			subscribeOpts := []SubscribeOption{WithEmitJoinLeave(true), WithEmitPresence(true)}
+			if name == "push_disabled" {
+				tr = &noSubscribePushTransport{testTransport: transport}
+			} else {
+				// The push alone is over ClientQueueMaxSize.
+				subscribeOpts = append(subscribeOpts, WithSubscribeData([]byte(`"`+strings.Repeat("x", 2000)+`"`)))
+			}
+			client := newTestConnectedClientWithTransport(t, ctx, node, tr, "user1")
+
+			err = client.Subscribe("ch", subscribeOpts...)
+			if name == "push_disabled" {
+				require.NoError(t, err)
+				require.Equal(t, []string{"join"}, broker.recorded())
+				client.Unsubscribe("ch")
+			} else {
+				require.Error(t, err)
+			}
+			require.Eventually(t, func() bool {
+				return len(broker.recorded()) == 2
+			}, 5*time.Second, 10*time.Millisecond)
+			require.Equal(t, []string{"join", "leave"}, broker.recorded())
+			presence, err := node.Presence("ch")
+			require.NoError(t, err)
+			require.Empty(t, presence.Presence)
 		})
 	}
 }
