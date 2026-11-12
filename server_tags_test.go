@@ -60,6 +60,19 @@ func serverTagsRequireNoKeys(t *testing.T, frames []string) {
 	}
 }
 
+// pubToProto never copies server tags into the protocol publication, whatever the
+// public tags are.
+func TestServerTags_PubToProtoDropsServerTags(t *testing.T) {
+	t.Parallel()
+	pub := pubToProto(&Publication{
+		Tags:       map[string]string{"team": "eng"},
+		ServerTags: map[string]string{"tenant": "t-17"},
+	})
+	require.Equal(t, map[string]string{"team": "eng"}, pub.Tags)
+	require.Nil(t, pub.ServerTags)
+	require.Nil(t, pub.GetServerTags())
+}
+
 func TestServerTags_FilterTagsReturnsTagsWithoutCopy(t *testing.T) {
 	t.Parallel()
 	tags := map[string]string{"team": "eng"}
@@ -282,9 +295,9 @@ func TestServerTags_ClientTagsFilterNeverMatchesServerKeys(t *testing.T) {
 	_, err = node.Publish("test", []byte(`{"text":"second"}`), WithTags(map[string]string{"team": "eng"}))
 	require.NoError(t, err)
 
-	// The public filter on a public key still delivers.
-	publicFrames := serverTagsWaitFrame(t, publicTransport.sink, "second")
-	require.Contains(t, strings.Join(publicFrames, ""), "first")
+	// The public filter on a public key still delivers. Publications arrive in order.
+	require.True(t, waitForPayload(t, publicTransport.sink, "first", 5*time.Second))
+	require.True(t, waitForPayload(t, publicTransport.sink, "second", 5*time.Second))
 
 	// The client filter on a server-only key matches nothing: the client filter
 	// sees public tags only. The sink also holds the connect and subscribe
