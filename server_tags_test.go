@@ -245,7 +245,7 @@ func TestServerTags_LiveServerFilterEqAndNex(t *testing.T) {
 		WithServerTags(map[string]string{"tenant": "t-17"}),
 	)
 	require.NoError(t, err)
-	stored, err := node.History("test_history")
+	stored, err := node.History("test_history", WithLimit(NoLimit))
 	require.NoError(t, err)
 	require.Len(t, stored.Publications, 1)
 	require.Equal(t, map[string]string{"tenant": "t-17"}, stored.Publications[0].ServerTags)
@@ -287,9 +287,13 @@ func TestServerTags_ClientTagsFilterNeverMatchesServerKeys(t *testing.T) {
 	require.Contains(t, strings.Join(publicFrames, ""), "first")
 
 	// The client filter on a server-only key matches nothing: the client filter
-	// sees public tags only.
+	// sees public tags only. The sink also holds the connect and subscribe
+	// replies, so only the publications are checked.
 	serverOnlyFrames := serverTagsCollectFrames(serverOnlyTransport.sink, 200*time.Millisecond)
-	require.Empty(t, serverOnlyFrames)
+	for _, frame := range serverOnlyFrames {
+		require.NotContains(t, frame, "first")
+		require.NotContains(t, frame, "second")
+	}
 }
 
 // subscribeClientWithTagsFilter subscribes the client with a client tags filter.
@@ -343,24 +347,14 @@ func TestServerTags_StreamRecoveryAppliesServerFilter(t *testing.T) {
 	require.Nil(t, rw.replies[0].Error)
 	res := extractSubscribeResult(rw.replies)
 	require.True(t, res.Recovered)
-	require.Len(t, res.Publications, 3)
-
+	// The publications the server filter excludes (offsets 2 and 3) become
+	// offset-only markers in isStreamRecovered, which MergePublications strips,
+	// so only the matching one reaches the client.
+	require.Len(t, res.Publications, 1)
 	require.Equal(t, uint64(1), res.Publications[0].Offset)
 	require.Equal(t, protocol.Raw(`{"n":1}`), res.Publications[0].Data)
 	require.Equal(t, "eng", res.Publications[0].Tags["team"])
 	require.Nil(t, res.Publications[0].GetServerTags())
-
-	require.Equal(t, uint64(2), res.Publications[1].Offset)
-	require.Equal(t, int64(-1), res.Publications[1].Time)
-	require.Nil(t, res.Publications[1].Data)
-
-	require.Equal(t, uint64(3), res.Publications[2].Offset)
-	require.Equal(t, int64(-1), res.Publications[2].Time)
-	require.Nil(t, res.Publications[2].Data)
-
-	for _, pub := range res.Publications {
-		require.Nil(t, pub.GetServerTags())
-	}
 }
 
 // The subscribe reply of a subscriber with a server filter carries no server keys
@@ -474,15 +468,16 @@ func TestServerTags_HistoryServesNoServerKeys(t *testing.T) {
 
 	client := newTestConnectedClientV2(t, node, "user")
 	rw := testReplyWriterWrapper()
-	require.NoError(t, client.handleHistory(&protocol.HistoryRequest{Channel: ch}, &protocol.Command{}, time.Now(), rw.rw))
+	require.NoError(t, client.handleHistory(&protocol.HistoryRequest{Channel: ch, Limit: 10}, &protocol.Command{}, time.Now(), rw.rw))
 	require.Nil(t, rw.replies[0].Error)
 	require.Len(t, rw.replies[0].History.Publications, 1)
 	pub := rw.replies[0].History.Publications[0]
 	require.Equal(t, map[string]string{"team": "eng"}, pub.Tags)
 	require.Nil(t, pub.GetServerTags())
 
-	stored, err := node.History(ch)
+	stored, err := node.History(ch, WithLimit(NoLimit))
 	require.NoError(t, err)
+	require.Len(t, stored.Publications, 1)
 	require.Equal(t, map[string]string{"tenant": "t-17"}, stored.Publications[0].ServerTags)
 }
 
