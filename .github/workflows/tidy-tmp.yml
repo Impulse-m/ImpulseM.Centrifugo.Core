@@ -1,0 +1,32 @@
+# Temporary. Runs go mod tidy on the feature branch and uploads go.mod and go.sum.
+# It is removed from the branch before the branch is merged.
+name: tidy-tmp
+on:
+  push:
+    branches:
+      - 'feature/server-tags'
+
+permissions:
+  contents: read
+
+jobs:
+  tidy:
+    name: go mod tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Tidy
+        run: go mod tidy
+      - name: Show the change
+        run: git diff --stat
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gomod
+          path: |
+            go.mod
+            go.sum
+          if-no-files-found: error

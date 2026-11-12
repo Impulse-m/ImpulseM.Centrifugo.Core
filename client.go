@@ -4952,7 +4952,7 @@ func isStreamRecovered(
 		// dropped, so MergePublications can account for the missing offset in its
 		// gap check instead of treating it as lost — again mirroring how the live
 		// path buffers filtered publications.
-		if publicationFiltered(pub.Tags, serverTf) || publicationFiltered(pub.Tags, tf) {
+		if serverPublicationFiltered(pub, serverTf) || publicationFiltered(pub.Tags, tf) {
 			recoveredPubs = append(recoveredPubs, &protocol.Publication{Offset: pub.Offset, Time: -1})
 			continue
 		}

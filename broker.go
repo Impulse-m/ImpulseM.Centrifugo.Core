@@ -25,6 +25,11 @@ type Publication struct {
 	// Tags contains a map with custom key-values attached to a Publication. Tags map
 	// will be delivered to a client.
 	Tags map[string]string
+	// ServerTags contains key-values attached to a Publication which are visible only
+	// to server-side subscription filters. They are never copied into the protocol
+	// Publication sent to clients, nor returned by client history and recovery.
+	// Server filters match against Tags merged with ServerTags. Nothing mutates it.
+	ServerTags map[string]string
 	// Optional time of publication as Unix timestamp milliseconds. At this point
 	// we use it for calculating PUB/SUB time lag, it's not exposed to the client
 	// protocol.
@@ -128,6 +133,8 @@ type PublishOptions struct {
 	ClientInfo *ClientInfo
 	// Tags to set Publication.Tags.
 	Tags map[string]string
+	// ServerTags to set Publication.ServerTags. See Publication.ServerTags.
+	ServerTags map[string]string
 	// IdempotencyKey is an optional key for idempotent publish. Broker implementation
 	// may cache these keys for some time to prevent duplicate publications. In this case
 	// the returned result is the same as from the previous publication with the same key.

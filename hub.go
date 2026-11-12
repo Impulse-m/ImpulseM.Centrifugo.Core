@@ -1158,6 +1158,13 @@ func (s *subShard) broadcastPublication(
 	}
 
 	fullPub := pubToProto(pub)
+	// Built at most once per publication, and only when a server-filtered
+	// subscriber is met (no copy when the publication has no server tags).
+	// Client filters use pub.Tags.
+	var (
+		serverTagsForFilter map[string]string
+		serverTagsBuilt     bool
+	)
 	// Deliver the channel epoch in the first publication (offset==1) so clients
 	// learn it. Stamped on this per-broadcast copy rather than on the source pub,
 	// which the MemoryBroker shares with concurrent recovery readers (see
@@ -1226,7 +1233,11 @@ func (s *subShard) broadcastPublication(
 
 		wasFiltered := false
 		if sub.serverTagsFilter != nil {
-			match, _ := filter.Match(sub.serverTagsFilter.filter, pub.Tags)
+			if !serverTagsBuilt {
+				serverTagsForFilter = serverFilterTags(pub)
+				serverTagsBuilt = true
+			}
+			match, _ := filter.Match(sub.serverTagsFilter.filter, serverTagsForFilter)
 			if !match {
 				wasFiltered = true
 				tagsFilterDropped++

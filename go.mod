@@ -26,4 +26,4 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 )
 
-replace github.com/centrifugal/protocol => github.com/Impulse-m/ImpulseM.Centrifugo.Protocol v0.23.2-0.20261013130323-70f37c2667eb
+replace github.com/centrifugal/protocol => github.com/Impulse-m/ImpulseM.Centrifugo.Protocol v0.23.2-0.20261112155214-bd6d09ab89fd

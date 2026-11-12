@@ -66,6 +66,14 @@ func WithTags(tags map[string]string) PublishOption {
 	}
 }
 
+// WithServerTags allows setting Publication.ServerTags. Server tags are visible
+// only to server-side subscription filters and never reach clients.
+func WithServerTags(tags map[string]string) PublishOption {
+	return func(opts *PublishOptions) {
+		opts.ServerTags = tags
+	}
+}
+
 // WithVersion allows application to provide a tip for Centrifuge about
 // internal application version of Publication. This is helpful to drop
 // non-actual publications on Centrifuge Broker level. Publications may be

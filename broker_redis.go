@@ -123,11 +123,11 @@ type brokerPubSubRunner interface {
 // By default, Redis >= 5 required (due to the fact RedisBroker uses STREAM data
 // structure to keep publication history for a channel).
 type RedisBroker struct {
-	controlRound            uint64
-	node                    *Node
-	sharding                bool
-	config                  RedisBrokerConfig
-	shards                  []*shardWrapper
+	controlRound uint64
+	node         *Node
+	sharding     bool
+	config       RedisBrokerConfig
+	shards       []*shardWrapper
 	// partitionTags is non-nil when UsePrecomputedPartitionTags is enabled;
 	// indexed by partition index, returns the hash tag string. Read-only
 	// after construction (shared with the package-level precomputed table).
@@ -824,17 +824,18 @@ func (b *RedisBroker) Publish(ch string, data []byte, opts PublishOptions) (Publ
 
 func (b *RedisBroker) publish(s *shardWrapper, ch string, data []byte, opts PublishOptions) (PublishResult, error) {
 	protoPub := &protocol.Publication{
-		Data:     data,
-		Info:     infoToProto(opts.ClientInfo),
-		Tags:     opts.Tags,
-		Time:     time.Now().UnixMilli(),
-		Key:      opts.Key,
-		Removed:  opts.Removed,
-		Score:    opts.score,
-		Offset:   opts.Offset,
-		Epoch:    opts.Epoch,
-		PrevData: opts.PrevData,
-		Version:  opts.Version,
+		Data:       data,
+		Info:       infoToProto(opts.ClientInfo),
+		Tags:       opts.Tags,
+		ServerTags: opts.ServerTags,
+		Time:       time.Now().UnixMilli(),
+		Key:        opts.Key,
+		Removed:    opts.Removed,
+		Score:      opts.score,
+		Offset:     opts.Offset,
+		Epoch:      opts.Epoch,
+		PrevData:   opts.PrevData,
+		Version:    opts.Version,
 	}
 	if opts.HistorySize <= 0 || opts.HistoryTTL <= 0 {
 		// In no history case we communicate delta flag over Publication field. This field is then

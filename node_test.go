@@ -1033,6 +1033,15 @@ func Test_pubToProto(t *testing.T) {
 	require.Equal(t, protocol.Raw("data"), pub.Data)
 	require.NotNil(t, pub.Info)
 	require.Equal(t, pub.Info.Client, "client_id")
+
+	// Server tags never reach the protocol publication, whatever the public tags are.
+	pub = pubToProto(&Publication{
+		Tags:       map[string]string{"team": "eng"},
+		ServerTags: map[string]string{"tenant": "t-17"},
+	})
+	require.Equal(t, map[string]string{"team": "eng"}, pub.Tags)
+	require.Nil(t, pub.ServerTags)
+	require.Nil(t, pub.GetServerTags())
 }
 
 func Test_pubFromProto(t *testing.T) {

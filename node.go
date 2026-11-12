@@ -1629,17 +1629,18 @@ func pubFromProto(pub *protocol.Publication) *Publication {
 		return nil
 	}
 	return &Publication{
-		Offset:  pub.GetOffset(),
-		Epoch:   pub.GetEpoch(),
-		Data:    pub.Data,
-		Info:    infoFromProto(pub.GetInfo()),
-		Tags:    pub.GetTags(),
-		Time:    pub.Time,
-		Channel: pub.GetChannel(),
-		Key:     pub.GetKey(),
-		Removed: pub.GetRemoved(),
-		Score:   pub.GetScore(),
-		Version: pub.GetVersion(),
+		Offset:     pub.GetOffset(),
+		Epoch:      pub.GetEpoch(),
+		Data:       pub.Data,
+		Info:       infoFromProto(pub.GetInfo()),
+		Tags:       pub.GetTags(),
+		ServerTags: pub.GetServerTags(),
+		Time:       pub.Time,
+		Channel:    pub.GetChannel(),
+		Key:        pub.GetKey(),
+		Removed:    pub.GetRemoved(),
+		Score:      pub.GetScore(),
+		Version:    pub.GetVersion(),
 	}
 }
 
@@ -1836,7 +1837,7 @@ func (n *Node) recoverCache(ch string, historyMetaTTL time.Duration, maxPublicat
 	// path. Applying only the client filter here would leak a server-filtered
 	// latest publication on cache recovery.
 	for _, pub := range hr.Publications {
-		if publicationFiltered(pub.Tags, serverTf) || publicationFiltered(pub.Tags, tf) {
+		if serverPublicationFiltered(pub, serverTf) || publicationFiltered(pub.Tags, tf) {
 			continue
 		}
 		return latestPublication, pub, hr.StreamPosition, nil
