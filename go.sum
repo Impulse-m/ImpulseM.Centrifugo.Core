@@ -1,5 +1,5 @@
-github.com/Impulse-m/ImpulseM.Centrifugo.Protocol v0.23.2-0.20261013130323-70f37c2667eb h1:Ukpszi/UGUshu10vHiHLu0nVLKjOXE9ZZwZTKJMBrw8=
-github.com/Impulse-m/ImpulseM.Centrifugo.Protocol v0.23.2-0.20261013130323-70f37c2667eb/go.mod h1:K8qKv/y8ujLbYYN/orINUBaKDMmjTrpE9++vFT6x68E=
+github.com/Impulse-m/ImpulseM.Centrifugo.Protocol v0.23.2-0.20261112155214-bd6d09ab89fd h1:9JwidpbQd0jnek95FIDmtua7SJPpugwRX/3C9jRkVKg=
+github.com/Impulse-m/ImpulseM.Centrifugo.Protocol v0.23.2-0.20261112155214-bd6d09ab89fd/go.mod h1:K8qKv/y8ujLbYYN/orINUBaKDMmjTrpE9++vFT6x68E=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/centrifugal/fdelta v0.0.3 h1:sYD/zCXH2xYDcELPPztXsF7VCZb6vtiRBEVCYjgzHj4=
